@@ -1,21 +1,24 @@
 //------------------------------------------------------------------------------------------------
 // EEF_PatrolComponent.c
 // Enfusion Extended Framework - Patrol Zone Module
-// Attaches to a trigger entity in the World Editor.
-// On trigger activation, spawns AI groups that patrol within the trigger bounds.
+//
+// Attach to a SCR_BaseTriggerEntity inside a world editor layer.
+// Set the trigger sphere radius in the editor to define the patrol zone size.
+// When the layer activates, OnPostInit fires and defers patrol start until
+// the world is fully initialised.
 //------------------------------------------------------------------------------------------------
 
 //------------------------------------------------------------------------------------------------
 //! Patrol behaviour mode
 enum EEF_EPatrolMode
 {
-	RANDOM_CONTINUOUS,	//! AI continuously generate new random waypoints within the zone
-	CLOCKWISE,			//! AI cycle through 4 generated points in clockwise order
-	COUNTER_CLOCKWISE	//! AI cycle through 4 generated points in counter-clockwise order
+	RANDOM_CONTINUOUS,		//! AI continuously generate new random waypoints within the zone
+	//CLOCKWISE,			//! TODO: CW/CCW loop needs further design - disabled for now
+	//COUNTER_CLOCKWISE	//! TODO: CW/CCW loop needs further design - disabled for now
 }
 
 //------------------------------------------------------------------------------------------------
-[ComponentEditorProps(category: "EEF/Patrol", description: "EEF Patrol Zone - attach to a trigger entity to define an AI patrol area.")]
+[ComponentEditorProps(category: "EEF/Patrol", description: "EEF Patrol Zone - attach to a SCR_BaseTriggerEntity inside a layer. Layer activation starts the patrol.")]
 class EEF_PatrolComponentClass : ScriptComponentClass {}
 
 //------------------------------------------------------------------------------------------------
@@ -33,13 +36,14 @@ class EEF_PatrolGroupState
 {
 	SCR_AIGroup m_Group;						//! The spawned group
 	ref array<AIWaypoint> m_aWaypoints = {};	//! Currently queued waypoints
-	int m_iCurrentLoopIndex;					//! Current index in CW/CCW loop
+	int m_iCurrentLoopIndex;					//! Current index in CW/CCW loop (reserved)
 }
 
 //------------------------------------------------------------------------------------------------
 //! EEF Patrol Zone Component
-//! Place on a resizable, rotatable trigger entity in the World Editor.
-//! Trigger activation drives spawn - handle activation via layer/trigger hierarchy in editor.
+//! Attach to a SCR_BaseTriggerEntity inside a world editor layer.
+//! Set the trigger sphere radius to define the patrol area.
+//! Layer activation drives spawn - deferred until world is fully initialised.
 class EEF_PatrolComponent : ScriptComponent
 {
 	//--- Patrol behaviour
@@ -50,25 +54,28 @@ class EEF_PatrolComponent : ScriptComponent
 	[Attribute("", UIWidgets.Object, "Patrol groups to spawn. Each entry defines one group prefab.")]
 	protected ref array<ref EEF_PatrolGroupSlot> m_aGroupSlots;
 
-	//--- CW/CCW loop point constraints
-	[Attribute("10.0", UIWidgets.Slider, "Minimum distance between generated loop points (CW/CCW modes)", "1 200 1")]
-	protected float m_fLoopPointMinDistance;
+	//--- Waypoint prefab
+	[Attribute("", UIWidgets.ResourcePickerThumbnail, "Waypoint prefab used for all patrol groups. Select AIWaypoint_Move from Prefabs/AI/Waypoints/.", "et")]
+	protected ResourceName m_sWaypointPrefab;
 
-	[Attribute("50.0", UIWidgets.Slider, "Maximum distance between generated loop points (CW/CCW modes)", "1 500 1")]
-	protected float m_fLoopPointMaxDistance;
+	//--- Movement speed - applied as a waypoint setting on every spawned waypoint
+	[Attribute("1", UIWidgets.ComboBox, "Patrol movement speed.", "", ParamEnumArray.FromEnum(EMovementType))]
+	protected EMovementType m_eMaxSpeed;
 
-	//--- Navmesh retries
-	[Attribute("10", UIWidgets.Slider, "Maximum attempts to find a valid navmesh position before giving up", "1 50 1")]
-	protected int m_iNavmeshRetryLimit;
+	//--- Formation - applied as a waypoint setting on every spawned waypoint
+	[Attribute(SCR_EAIGroupFormation.StaggeredColumn.ToString(), UIWidgets.ComboBox, "Group formation during patrol.", "", ParamEnumArray.FromEnum(SCR_EAIGroupFormation))]
+	protected SCR_EAIGroupFormation m_eFormation;
+
+	//--- Position finding
+	[Attribute("10", UIWidgets.Slider, "Maximum attempts to find a valid position before giving up.", "1 50 1")]
+	protected int m_iMaxPositionAttempts;
 
 	//--- Debug
-	[Attribute("0", UIWidgets.CheckBox, "Enable debug logging for this patrol zone")]
+	[Attribute("0", UIWidgets.CheckBox, "Enable debug logging for this patrol zone.")]
 	protected bool m_bDebugEnabled;
 
 	//--- Runtime state
 	protected ref array<ref EEF_PatrolGroupState> m_aActiveGroups = {};
-	protected ref array<vector> m_aLoopPoints = {};	//! Locked CW/CCW points, generated once on activation
-	protected bool m_bActivated = false;
 
 	//------------------------------------------------------------------------------------------------
 	// INITIALISATION
@@ -82,32 +89,33 @@ class EEF_PatrolComponent : ScriptComponent
 		if (!Replication.IsServer())
 			return;
 
-		SCR_BaseTriggerEntity trigger = SCR_BaseTriggerEntity.Cast(owner);
-		if (!trigger)
-		{
-			EEF_PatrolDebugLog("EEF_PatrolComponent: Owner is not a trigger entity. Component will not function.");
-			return;
-		}
+		EEF_PatrolDebugLog("EEF_PatrolComponent: Registered - deferring patrol start until world is ready.");
 
-		trigger.GetOnActivate().Insert(OnTriggerActivated);
+		// Defer until world is fully initialised
+		GetGame().GetCallqueue().CallLater(StartPatrol, 1000, false, owner);
 	}
 
 	//------------------------------------------------------------------------------------------------
-	// TRIGGER ACTIVATION
-	//------------------------------------------------------------------------------------------------
-
-	//------------------------------------------------------------------------------------------------
-	protected void OnTriggerActivated(IEntity triggerEntity)
+	//! Deferred start - called 1 second after world init to ensure all systems are ready
+	protected void StartPatrol(IEntity owner)
 	{
-		if (m_bActivated)
+		EEF_PatrolDebugLog("EEF_PatrolComponent: Starting patrol zone.");
+		EEF_PatrolDebugLog(string.Format("EEF_PatrolComponent: Group slots: %1, Mode: %2", m_aGroupSlots.Count(), m_ePatrolMode));
+
+		SCR_BaseTriggerEntity trigger = SCR_BaseTriggerEntity.Cast(owner);
+		if (!trigger)
+		{
+			EEF_PatrolDebugLog("EEF_PatrolComponent: Owner is not a SCR_BaseTriggerEntity. Attach this component to a trigger entity.");
 			return;
+		}
 
-		m_bActivated = true;
-		EEF_PatrolDebugLog("EEF_PatrolComponent: Trigger activated - beginning patrol spawn.");
+		EEF_PatrolDebugLog(string.Format("EEF_PatrolComponent: Sphere radius: %1", trigger.GetSphereRadius()));
 
-		// Pre-generate loop points once if in CW/CCW mode
-		if (m_ePatrolMode == EEF_EPatrolMode.CLOCKWISE || m_ePatrolMode == EEF_EPatrolMode.COUNTER_CLOCKWISE)
-			GenerateLoopPoints(triggerEntity);
+		if (trigger.GetSphereRadius() <= 0)
+		{
+			EEF_PatrolDebugLog("EEF_PatrolComponent: Sphere radius is 0. Set a radius on the trigger entity in the editor.");
+			return;
+		}
 
 		// Spawn each configured group
 		foreach (EEF_PatrolGroupSlot slot : m_aGroupSlots)
@@ -118,7 +126,7 @@ class EEF_PatrolComponent : ScriptComponent
 				continue;
 			}
 
-			SpawnPatrolGroup(triggerEntity, slot);
+			SpawnPatrolGroup(owner, slot);
 		}
 	}
 
@@ -127,147 +135,47 @@ class EEF_PatrolComponent : ScriptComponent
 	//------------------------------------------------------------------------------------------------
 
 	//------------------------------------------------------------------------------------------------
-	//! Attempt to find a random navmesh-valid position within the rotated trigger bounds
-	protected bool GetRandomPositionInTrigger(IEntity triggerEntity, out vector outPosition)
+	//! Find a random surface position within the trigger sphere
+	protected bool GetRandomPositionInArea(IEntity areaEntity, out vector outPosition)
 	{
-		vector mins, maxs;
-		triggerEntity.GetWorldBounds(mins, maxs);
-
-		vector halfExtents = (maxs - mins) * 0.5;
-		vector center = triggerEntity.GetOrigin();
-		vector transform[4];
-		triggerEntity.GetWorldTransform(transform);
-
-		NavmeshWorldComponent navmesh = GetNavmeshWorldComponent();
-		if (!navmesh)
-		{
-			EEF_PatrolDebugLog("EEF_PatrolComponent: Could not retrieve NavmeshWorldComponent.");
+		SCR_BaseTriggerEntity trigger = SCR_BaseTriggerEntity.Cast(areaEntity);
+		if (!trigger)
 			return false;
-		}
 
-		for (int attempt = 0; attempt < m_iNavmeshRetryLimit; attempt++)
-		{
-			// Random offset in local space
-			float randX = Math.RandomFloat(-halfExtents[0], halfExtents[0]);
-			float randZ = Math.RandomFloat(-halfExtents[2], halfExtents[2]);
-			vector localOffset = Vector(randX, 0, randZ);
+		float radius = trigger.GetSphereRadius();
+		vector center = areaEntity.GetOrigin();
+		BaseWorld world = GetOwner().GetWorld();
 
-			// Transform into world space respecting trigger rotation
-			vector worldPos = center + localOffset.Multiply3(transform);
-			worldPos[1] = center[1];
+		for (int attempt = 0; attempt < m_iMaxPositionAttempts; attempt++)
+	    {
+	        float angle = Math.RandomFloat(0, Math.PI2);
+	        float dist = Math.RandomFloat(0, radius);
+	
+	        float worldX = center[0] + dist * Math.Cos(angle);
+	        float worldZ = center[2] + dist * Math.Sin(angle);
+	
+	        float surfaceY = world.GetSurfaceY(worldX, worldZ);
+	
+	        // Skip positions off the map
+	        if (surfaceY < -100)
+	            continue;
+	
+	        vector candidate = Vector(worldX, surfaceY, worldZ);
+	
+	        // Skip positions in or over water
+	        vector waterSurfacePoint;
+	        EWaterSurfaceType waterSurfaceType;
+	        vector waterTransform[4];
+	        vector waterObbExtents;
+	        if (ChimeraWorldUtils.TryGetWaterSurface(GetGame().GetWorld(), candidate, waterSurfacePoint, waterSurfaceType, waterTransform, waterObbExtents))
+	            continue;
+	
+	        outPosition = candidate;
+	        return true;
+	    }
 
-			// Snap to nearest navmesh position within 5m
-			vector snappedPos;
-			if (navmesh.SamplePosition(worldPos, 5.0, snappedPos))
-			{
-				outPosition = snappedPos;
-				return true;
-			}
-		}
-
-		EEF_PatrolDebugLog(string.Format("EEF_PatrolComponent: Failed to find navmesh position after %1 attempts.", m_iNavmeshRetryLimit));
+		EEF_PatrolDebugLog(string.Format("EEF_PatrolComponent: Failed to find valid position after %1 attempts.", m_iMaxPositionAttempts));
 		return false;
-	}
-
-	//------------------------------------------------------------------------------------------------
-	//! Generate 4 loop points for CW/CCW mode, sorted by angle around the trigger center
-	protected void GenerateLoopPoints(IEntity triggerEntity)
-	{
-		m_aLoopPoints.Clear();
-		vector center = triggerEntity.GetOrigin();
-		int retryBudget = m_iNavmeshRetryLimit * 4;
-		int attempts = 0;
-
-		while (m_aLoopPoints.Count() < 4 && attempts < retryBudget)
-		{
-			attempts++;
-
-			vector candidate;
-			if (!GetRandomPositionInTrigger(triggerEntity, candidate))
-				continue;
-
-			// Check min/max distance against already accepted points
-			bool valid = true;
-			foreach (vector existing : m_aLoopPoints)
-			{
-				float dist = vector.Distance(candidate, existing);
-				if (dist < m_fLoopPointMinDistance || dist > m_fLoopPointMaxDistance)
-				{
-					valid = false;
-					break;
-				}
-			}
-
-			if (valid)
-				m_aLoopPoints.Insert(candidate);
-		}
-
-		// Distance constraints could not be satisfied within budget
-		// Box is the hard limit - fill remaining slots without distance constraint
-		if (m_aLoopPoints.Count() < 4)
-		{
-			EEF_PatrolDebugLog(string.Format(
-				"EEF_PatrolComponent: Could only generate %1/4 loop points satisfying distance constraints. Filling remaining slots without distance constraint.",
-				m_aLoopPoints.Count()
-			));
-
-			while (m_aLoopPoints.Count() < 4)
-			{
-				vector fallback;
-				if (GetRandomPositionInTrigger(triggerEntity, fallback))
-					m_aLoopPoints.Insert(fallback);
-				else
-					break;
-			}
-		}
-
-		if (m_aLoopPoints.Count() < 2)
-		{
-			EEF_PatrolDebugLog("EEF_PatrolComponent: Insufficient loop points generated. CW/CCW patrol will not function.");
-			return;
-		}
-
-		// Sort points by angle around center for clean CW/CCW ordering
-		SortPointsByAngle(center);
-
-		// Reverse order for counter-clockwise
-		if (m_ePatrolMode == EEF_EPatrolMode.COUNTER_CLOCKWISE)
-			// Manual Reverse for m_aLoopPoints
-			int count = m_aLoopPoints.Count();
-			for (int i = 0; i < count / 2; i++)
-			{
-			    vector temp = m_aLoopPoints[i];
-			    m_aLoopPoints[i] = m_aLoopPoints[count - i - 1];
-			    m_aLoopPoints[count - i - 1] = temp;
-			}
-
-		EEF_PatrolDebugLog(string.Format("EEF_PatrolComponent: Generated %1 loop points.", m_aLoopPoints.Count()));
-	}
-
-	//------------------------------------------------------------------------------------------------
-	//! Sort m_aLoopPoints by angle around a center point (XZ plane) for geometric CW ordering
-	protected void SortPointsByAngle(vector center)
-	{
-		int count = m_aLoopPoints.Count();
-		for (int i = 1; i < count; i++)
-		{
-			vector key = m_aLoopPoints[i];
-			float keyAngle = Math.Atan2(key[2] - center[2], key[0] - center[0]);
-			int j = i - 1;
-
-			while (j >= 0)
-			{
-				vector comp = m_aLoopPoints[j];
-				float compAngle = Math.Atan2(comp[2] - center[2], comp[0] - center[0]);
-				if (compAngle <= keyAngle)
-					break;
-
-				m_aLoopPoints[j + 1] = m_aLoopPoints[j];
-				j--;
-			}
-
-			m_aLoopPoints[j + 1] = key;
-		}
 	}
 
 	//------------------------------------------------------------------------------------------------
@@ -275,12 +183,12 @@ class EEF_PatrolComponent : ScriptComponent
 	//------------------------------------------------------------------------------------------------
 
 	//------------------------------------------------------------------------------------------------
-	protected void SpawnPatrolGroup(IEntity triggerEntity, EEF_PatrolGroupSlot slot)
+	protected void SpawnPatrolGroup(IEntity areaEntity, EEF_PatrolGroupSlot slot)
 	{
 		vector spawnPos;
-		if (!GetRandomPositionInTrigger(triggerEntity, spawnPos))
+		if (!GetRandomPositionInArea(areaEntity, spawnPos))
 		{
-			EEF_PatrolDebugLog("EEF_PatrolComponent: Could not find valid spawn position for group. Group will not spawn.");
+			EEF_PatrolDebugLog("EEF_PatrolComponent: Could not find valid spawn position for group.");
 			return;
 		}
 
@@ -305,19 +213,15 @@ class EEF_PatrolComponent : ScriptComponent
 
 		EEF_PatrolDebugLog(string.Format("EEF_PatrolComponent: Spawned group at %1.", spawnPos.ToString()));
 
-		// Register state and subscribe to waypoint completion
 		EEF_PatrolGroupState state = new EEF_PatrolGroupState();
 		state.m_Group = group;
 		state.m_iCurrentLoopIndex = 0;
 		m_aActiveGroups.Insert(state);
 
 		group.GetOnWaypointCompleted().Insert(OnWaypointCompleted);
+		group.GetOnCurrentWaypointChanged().Insert(OnCurrentWaypointChanged);
 
-		// Issue initial waypoints
-		if (m_ePatrolMode == EEF_EPatrolMode.RANDOM_CONTINUOUS)
-			InitRandomContinuousPatrol(triggerEntity, state);
-		else
-			InitLoopPatrol(state);
+		InitRandomContinuousPatrol(areaEntity, state);
 	}
 
 	//------------------------------------------------------------------------------------------------
@@ -326,21 +230,21 @@ class EEF_PatrolComponent : ScriptComponent
 
 	//------------------------------------------------------------------------------------------------
 	//! Seed the rolling 2-waypoint queue for a group
-	protected void InitRandomContinuousPatrol(IEntity triggerEntity, EEF_PatrolGroupState state)
+	protected void InitRandomContinuousPatrol(IEntity areaEntity, EEF_PatrolGroupState state)
 	{
-		QueueNextRandomWaypoint(triggerEntity, state);
-		QueueNextRandomWaypoint(triggerEntity, state);
+		QueueNextRandomWaypoint(areaEntity, state);
+		QueueNextRandomWaypoint(areaEntity, state);
 	}
 
 	//------------------------------------------------------------------------------------------------
 	//! Generate and queue one random waypoint for the group
-	protected void QueueNextRandomWaypoint(IEntity triggerEntity, EEF_PatrolGroupState state)
+	protected void QueueNextRandomWaypoint(IEntity areaEntity, EEF_PatrolGroupState state)
 	{
 		if (!state.m_Group)
 			return;
 
 		vector waypointPos;
-		if (!GetRandomPositionInTrigger(triggerEntity, waypointPos))
+		if (!GetRandomPositionInArea(areaEntity, waypointPos))
 		{
 			EEF_PatrolDebugLog("EEF_PatrolComponent: Could not generate random waypoint position.");
 			return;
@@ -348,7 +252,10 @@ class EEF_PatrolComponent : ScriptComponent
 
 		AIWaypoint waypoint = SpawnWaypoint(waypointPos);
 		if (!waypoint)
+		{
+			EEF_PatrolDebugLog("EEF_PatrolComponent: SpawnWaypoint returned null - waypoint not queued.");
 			return;
+		}
 
 		state.m_Group.AddWaypoint(waypoint);
 		state.m_aWaypoints.Insert(waypoint);
@@ -357,69 +264,47 @@ class EEF_PatrolComponent : ScriptComponent
 	}
 
 	//------------------------------------------------------------------------------------------------
-	// WAYPOINT LOGIC - CW/CCW LOOP
-	//------------------------------------------------------------------------------------------------
-
-	//------------------------------------------------------------------------------------------------
-	//! Seed the loop with the first two waypoints
-	protected void InitLoopPatrol(EEF_PatrolGroupState state)
-	{
-		if (m_aLoopPoints.IsEmpty())
-		{
-			EEF_PatrolDebugLog("EEF_PatrolComponent: No loop points available, cannot init loop patrol.");
-			return;
-		}
-
-		IssueNextLoopWaypoint(state);
-		IssueNextLoopWaypoint(state);
-	}
-
-	//------------------------------------------------------------------------------------------------
-	//! Issue the next waypoint in the loop sequence
-	protected void IssueNextLoopWaypoint(EEF_PatrolGroupState state)
-	{
-		if (!state.m_Group || m_aLoopPoints.IsEmpty())
-			return;
-
-		int index = state.m_iCurrentLoopIndex % m_aLoopPoints.Count();
-		vector waypointPos = m_aLoopPoints[index];
-
-		AIWaypoint waypoint = SpawnWaypoint(waypointPos);
-		if (!waypoint)
-			return;
-
-		state.m_Group.AddWaypoint(waypoint);
-		state.m_aWaypoints.Insert(waypoint);
-		state.m_iCurrentLoopIndex++;
-
-		EEF_PatrolDebugLog(string.Format("EEF_PatrolComponent: Queued loop waypoint index %1 at %2.", index, waypointPos.ToString()));
-	}
-
-	//------------------------------------------------------------------------------------------------
 	// WAYPOINT COMPLETION
 	//------------------------------------------------------------------------------------------------
 
 	//------------------------------------------------------------------------------------------------
-	//! Called when any group completes a waypoint - rolls the queue forward
-	protected void OnWaypointCompleted(AIGroup group, AIWaypoint waypoint)
+	//! Called when the group's current waypoint is completed - queues the next one
+	//! NOTE: Do NOT delete wp here - the group manages completed waypoint cleanup internally
+	protected void OnWaypointCompleted(AIWaypoint wp)
 	{
 		foreach (EEF_PatrolGroupState state : m_aActiveGroups)
 		{
-			if (state.m_Group != group)
+			if (!state.m_aWaypoints.Contains(wp))
 				continue;
 
-			// Clean up completed waypoint
-			state.m_aWaypoints.RemoveItem(waypoint);
-			SCR_EntityHelper.DeleteEntityAndChildren(waypoint);
+			// Remove from our tracking only - do not delete the entity
+			state.m_aWaypoints.RemoveItem(wp);
 
 			// Queue next
-			if (m_ePatrolMode == EEF_EPatrolMode.RANDOM_CONTINUOUS)
-				QueueNextRandomWaypoint(SCR_BaseTriggerEntity.Cast(GetOwner()), state);
-			else
-				IssueNextLoopWaypoint(state);
+			QueueNextRandomWaypoint(GetOwner(), state);
 
 			return;
 		}
+	}
+
+	//------------------------------------------------------------------------------------------------
+	//! Debug - confirms whether OnCurrentWaypointChanged fires and settings are present on the waypoint
+	protected void OnCurrentWaypointChanged(AIWaypoint currentWP, AIWaypoint prevWP)
+	{
+		EEF_PatrolDebugLog(string.Format("EEF_PatrolComponent: OnCurrentWaypointChanged fired. currentWP null: %1", currentWP == null));
+
+		if (!currentWP)
+			return;
+
+		SCR_AIWaypoint scrWP = SCR_AIWaypoint.Cast(currentWP);
+		if (scrWP)
+		{
+			array<SCR_AISettingBase> settings = {};
+			scrWP.GetSettings(settings);
+			EEF_PatrolDebugLog(string.Format("EEF_PatrolComponent: Current waypoint has %1 settings.", settings.Count()));
+		}
+		else
+			EEF_PatrolDebugLog("EEF_PatrolComponent: Current waypoint is not SCR_AIWaypoint.");
 	}
 
 	//------------------------------------------------------------------------------------------------
@@ -427,34 +312,68 @@ class EEF_PatrolComponent : ScriptComponent
 	//------------------------------------------------------------------------------------------------
 
 	//------------------------------------------------------------------------------------------------
-	//! Spawn a move waypoint entity at the given world position
+	//! Spawn a waypoint entity and apply speed and formation settings before handing to the group.
+	//! Settings MUST be added before AddWaypoint() is called - API requirement.
 	protected AIWaypoint SpawnWaypoint(vector position)
 	{
-		// NOTE: Verify this resource GUID against your project's AIWaypoint_Move prefab
-		Resource waypointResource = Resource.Load("{8F0A7F3D4B7D3A1C}Prefabs/AI/Waypoints/AIWaypoint_Move.et");
-		if (!waypointResource.IsValid())
+		if (m_sWaypointPrefab == ResourceName.Empty)
 		{
-			EEF_PatrolDebugLog("EEF_PatrolComponent: Waypoint prefab could not be loaded. Verify the resource GUID.");
+			EEF_PatrolDebugLog("EEF_PatrolComponent: No waypoint prefab set. Select one from Prefabs/AI/Waypoints/ in the component attributes.");
 			return null;
 		}
 
-		EntitySpawnParams spawnParams = new EntitySpawnParams();
-		spawnParams.TransformMode = ETransformMode.WORLD;
-		Math3D.MatrixIdentity4(spawnParams.Transform);
-		spawnParams.Transform[3] = position;
+		AIWaypoint waypoint = AIWaypoint.Cast(
+			GetGame().SpawnEntityPrefab(
+				Resource.Load(m_sWaypointPrefab),
+				GetGame().GetWorld()
+			)
+		);
 
-		return AIWaypoint.Cast(GetGame().SpawnEntityPrefab(waypointResource, GetOwner().GetWorld(), spawnParams));
-	}
-
-	//------------------------------------------------------------------------------------------------
-	//! Retrieve the soldier NavmeshWorldComponent from AIWorld
-	protected NavmeshWorldComponent GetNavmeshWorldComponent()
-	{
-		AIWorld aiWorld = GetGame().GetWorld().GetAIWorld();
-		if (!aiWorld)
+		if (!waypoint)
+		{
+			EEF_PatrolDebugLog("EEF_PatrolComponent: Failed to spawn AIWaypoint entity.");
 			return null;
+		}
 
-		return aiWorld.GetNavmeshWorldComponent("Soldiers");
+		// Apply speed and formation as waypoint settings
+		// Must be added before waypoint is given to the group
+		SCR_AIWaypoint scrWaypoint = SCR_AIWaypoint.Cast(waypoint);
+		if (scrWaypoint)
+		{
+			// Speed - locks AI to exact movement type while this waypoint is active
+			SCR_AIGroupCharactersMovementSpeedSetting speedSetting = SCR_AIGroupCharactersMovementSpeedSetting.Create(
+			    SCR_EAISettingOrigin.WAYPOINT,
+			    m_eMaxSpeed
+			);
+			if (speedSetting)
+			    scrWaypoint.AddSetting(speedSetting);
+
+			// Formation - sets group formation while this waypoint is active
+			SCR_AIGroupFormationSetting formationSetting = SCR_AIGroupFormationSetting.Create(
+				SCR_EAISettingOrigin.WAYPOINT,
+				m_eFormation
+			);
+			if (formationSetting)
+				scrWaypoint.AddSetting(formationSetting);
+			
+			array<SCR_AISettingBase> checkSettings = {};
+			scrWaypoint.GetSettings(checkSettings);
+			EEF_PatrolDebugLog(string.Format("EEF_PatrolComponent: Waypoint has %1 settings after AddSetting calls.", checkSettings.Count()));
+			foreach (SCR_AISettingBase s : checkSettings)
+			{
+			    EEF_PatrolDebugLog(string.Format("EEF_PatrolComponent:  - Setting: %1, Origin: %2, Priority: %3, HasWaypointFlag: %4",
+			        s.ClassName(),
+			        s.GetOrigin(),
+			        s.GetPriority(),
+			        s.HasFlag(SCR_EAISettingFlags.WAYPOINT)
+			    ));
+			}
+		}
+		else
+			EEF_PatrolDebugLog("EEF_PatrolComponent: Waypoint is not SCR_AIWaypoint - speed and formation settings not applied.");
+
+		waypoint.SetOrigin(position);
+		return waypoint;
 	}
 
 	//------------------------------------------------------------------------------------------------
