@@ -172,6 +172,19 @@ class EEF_HelicopterInsertionComponent : ScriptComponent
     protected void SeatAndStartFlight()
     {
         SeatTroops();
+
+        // The LZ entity is the flight destination. Set it as the control component's only
+        // waypoint so StartFlight() has a target and will start the engine.
+        IEntity lzEntity = GetGame().GetWorld().FindEntityByName(m_sLZEntityName);
+        if (!lzEntity)
+        {
+            Print(string.Format("[EEF HelicopterInsertion] ERROR: LZ entity '%1' not found. Cannot start flight.", m_sLZEntityName), LogLevel.ERROR);
+            return;
+        }
+
+        m_ControlComponent.ClearWaypoints();
+        m_ControlComponent.AddWaypoint(lzEntity.GetOrigin());
+
         m_ControlComponent.StartFlight();
     }
 
