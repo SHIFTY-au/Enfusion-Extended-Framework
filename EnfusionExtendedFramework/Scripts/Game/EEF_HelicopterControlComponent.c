@@ -160,7 +160,7 @@ class EEF_HelicopterControlComponent : ScriptComponent
 
         SetEventMask(owner, EntityEvent.FRAME);
 
-        SpawnCrew(owner);
+        GetGame().GetCallqueue().CallLater(SpawnCrew, 1000, false);
 
         DebugLog("Initialised.");
     }
@@ -182,6 +182,60 @@ class EEF_HelicopterControlComponent : ScriptComponent
         }
 
         super.OnDelete(owner);
+    }
+
+    protected void SpawnCrew()
+    {
+        if (!Replication.IsServer())
+            return;
+
+        IEntity owner = GetOwner();
+        if (!owner)
+            return;
+
+        if (!m_sPilotPrefab.IsEmpty())
+            m_PilotEntity = SpawnCrewMember(owner, m_sPilotPrefab, ECompartmentType.PILOT, "pilot");
+
+        if (!m_sCopilotPrefab.IsEmpty())
+            m_CopilotEntity = SpawnCrewMember(owner, m_sCopilotPrefab, ECompartmentType.TURRET, "copilot");
+    }
+
+    protected IEntity SpawnCrewMember(IEntity owner, ResourceName prefab, ECompartmentType compartmentType, string role)
+    {
+        Resource res = Resource.Load(prefab);
+        if (!res || !res.IsValid())
+        {
+            Print(string.Format("[EEF HelicopterControl] WARNING: Could not load %1 prefab: %2", role, prefab), LogLevel.WARNING);
+            return null;
+        }
+
+        EntitySpawnParams spawnParams = new EntitySpawnParams();
+        spawnParams.TransformMode = ETransformMode.WORLD;
+        Math3D.MatrixIdentity4(spawnParams.Transform);
+        spawnParams.Transform[3] = owner.GetOrigin();
+
+        IEntity crew = GetGame().SpawnEntityPrefab(res, GetGame().GetWorld(), spawnParams);
+        if (!crew)
+        {
+            Print(string.Format("[EEF HelicopterControl] WARNING: Failed to spawn %1 entity.", role), LogLevel.WARNING);
+            return null;
+        }
+
+        SCR_CompartmentAccessComponent access = SCR_CompartmentAccessComponent.Cast(
+            crew.FindComponent(SCR_CompartmentAccessComponent)
+        );
+        if (!access)
+        {
+            Print(string.Format("[EEF HelicopterControl] WARNING: %1 entity missing SCR_CompartmentAccessComponent.", role), LogLevel.WARNING);
+            return crew;
+        }
+
+        if (!access.MoveInVehicle(owner, compartmentType))
+            Print(string.Format("[EEF HelicopterControl] WARNING: No %1 compartment slot found on vehicle prefab.", role), LogLevel.WARNING);
+        else
+            DebugLog(string.Format("%1 spawned and seated.", role));
+
+        return crew;
     }
 
     protected void AutoStartFlight(IEntity owner)
