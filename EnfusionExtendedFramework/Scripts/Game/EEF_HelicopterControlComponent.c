@@ -1170,7 +1170,7 @@ class EEF_HelicopterControlComponent : ScriptComponent
         );
         if (!dmg)
             return false;
-        return !dmg.IsAlive();
+        return dmg.GetState() == EDamageState.DESTROYED;
     }
 
     // --------------------------------------------------------
