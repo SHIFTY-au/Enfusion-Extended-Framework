@@ -1128,7 +1128,7 @@ class EEF_HelicopterControlComponent : ScriptComponent
         // so native physics produces a realistic crash.
     }
 
-    protected void OnVehicleDamageStateChanged(EDamageState state)
+    protected void OnVehicleDamageStateChanged(DamageManagerComponent damageManager, EDamageState state)
     {
         if (state == EDamageState.DESTROYED)
             OnRotorFailure(GetOwner(), "vehicle destroyed");
