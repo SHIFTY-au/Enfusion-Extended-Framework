@@ -2,17 +2,33 @@
 // EEF_HelicopterControlComponent.c
 // Enfusion Extended Framework
 //
-// Generic helicopter control layer for EEF. Attach this component
-// to a helicopter entity and use it to steer any helicopter prefab
-// with native `VehicleHelicopterSimulation`.
+// Helicopter flight primitive for EEF. Attach this component
+// (together with EEF_HelicopterInsertionComponent or other
+// sibling modules) to a spawn-point entity in the World Editor
+// at the desired helicopter spawn location.
 //
-// This component is intentionally lightweight: it uses native
-// helicopter throttle and angular steering while providing a
-// reusable waypoint/landing control layer for future modules.
+// Responsibilities:
+//   - Spawns the configured helicopter prefab at the owner
+//     entity's world transform at runtime via SpawnHelicopter().
+//   - Owns all flight logic: takeoff, cruise, approach, landing,
+//     dwell, and optional fly-off/despawn.
+//   - Fires script events so sibling components can react
+//     without polling: OnHelicopterSpawned, OnLanded, OnDeparted.
 //
-// Attach to: a helicopter vehicle entity.
-// Runs on: SERVER (authority) only.
+// Sibling components (e.g. EEF_HelicopterInsertionComponent)
+// subscribe to the events in OnPostInit, call SpawnHelicopter()
+// to start the sequence, and call StartFlight() once their own
+// setup (e.g. seating troops) is complete.
+//
+// Attach to: a spawn-point (empty/helper) entity.
+// Runs on:   SERVER (authority) only.
 // ============================================================
+
+enum EEF_EHelicopterSpawnMode
+{
+    ON_GROUND,  //! Spawns on ground at owner transform. Lifts off on StartFlight().
+    IN_AIR      //! Spawns at cruise altitude AGL. Skips takeoff phases; begins cruise immediately.
+}
 
 enum EEF_EHelicopterControlLandingMode
 {
@@ -35,14 +51,14 @@ enum EEF_EFlightPhase
     TAKEOFF_VERTICAL,    //! Straight up to FLIGHT_TAKEOFF_VERTICAL_AGL.
     TAKEOFF_TRANSITION,  //! Begin forward flight while still climbing.
     CRUISE,              //! Forward flight at cruise altitude and configured speed.
-    APPROACH_BLEED,      //! Within FLIGHT_APPROACH_RANGE of LZ - reduce speed to FLIGHT_APPROACH_SPEED, hold altitude.
+    APPROACH_BLEED,      //! Within FLIGHT_APPROACH_RANGE of LZ - reduce speed, hold altitude.
     APPROACH_DESCENT,    //! Within FLIGHT_DESCENT_RANGE of LZ - begin descent.
-    APPROACH_FLARE,      //! Within m_fPhysicsHandoffAGL of LZ - handoff to physics for natural touchdown.
+    APPROACH_FLARE,      //! Within m_fPhysicsHandoffAGL of LZ - handoff to physics for touchdown.
     LANDED_PHASE,        //! Touchdown confirmed.
-    HOVER_HOLD           //! Hovering at m_fHoverAltitudeAGL indefinitely (HOVER_LANDING mode only).
+    HOVER_HOLD           //! Hovering at m_fHoverAltitudeAGL (HOVER_LANDING mode only).
 }
 
-[ComponentEditorProps(category: "EEF/Helicopter", description: "EEF Helicopter Control - native throttle/steering flight control for any helicopter.")]
+[ComponentEditorProps(category: "EEF/Helicopter", description: "EEF Helicopter Control - attach to a spawn-point entity. Spawns a helicopter prefab at runtime and drives all flight behaviour. Fires OnHelicopterSpawned, OnLanded, OnDeparted events for sibling components.")]
 class EEF_HelicopterControlComponentClass : ScriptComponentClass {}
 
 class EEF_HelicopterControlComponent : ScriptComponent
@@ -51,10 +67,16 @@ class EEF_HelicopterControlComponent : ScriptComponent
     // CONFIGURATION
     // --------------------------------------------------------
 
-    [Attribute("0", UIWidgets.CheckBox, "Start flying automatically when the component is initialised.")]
+    [Attribute("", UIWidgets.ResourceNamePicker, "Helicopter prefab to spawn at runtime at the owner entity's transform.", "et")]
+    protected ResourceName m_sHelicopterPrefab;
+
+    [Attribute(EEF_EHelicopterSpawnMode.ON_GROUND.ToString(), UIWidgets.ComboBox, "ON_GROUND: spawns on ground and lifts off. IN_AIR: spawns at cruise altitude, begins cruise immediately.", "", ParamEnumArray.FromEnum(EEF_EHelicopterSpawnMode))]
+    protected EEF_EHelicopterSpawnMode m_eSpawnMode;
+
+    [Attribute("0", UIWidgets.CheckBox, "Spawn helicopter and start flight automatically on init. Disable when a sibling component (e.g. InsertionComponent) controls the sequence.")]
     protected bool m_bAutoStart;
 
-    [Attribute("", UIWidgets.EditBox, "Optional destination entity name. The helicopter will fly to this entity if provided.")]
+    [Attribute("", UIWidgets.EditBox, "Optional destination entity name. The helicopter flies to this entity.")]
     protected string m_sDestinationEntityName;
 
     [Attribute("", UIWidgets.EditBox, "Optional intermediate waypoint 1 entity name.")]
@@ -72,7 +94,7 @@ class EEF_HelicopterControlComponent : ScriptComponent
     [Attribute("30.0", UIWidgets.EditBox, "Cruise speed in metres per second (m/s).")]
     protected float m_fCruiseSpeed;
 
-    [Attribute(EEF_EHelicopterControlLandingMode.FULL_LANDING.ToString(), UIWidgets.ComboBox, "Landing mode used for the final waypoint.", "", ParamEnumArray.FromEnum(EEF_EHelicopterControlLandingMode))]
+    [Attribute(EEF_EHelicopterControlLandingMode.FULL_LANDING.ToString(), UIWidgets.ComboBox, "Landing mode used at the final waypoint.", "", ParamEnumArray.FromEnum(EEF_EHelicopterControlLandingMode))]
     protected EEF_EHelicopterControlLandingMode m_eLandingMode;
 
     [Attribute("4.0", UIWidgets.EditBox, "Hover altitude in metres AGL for HOVER_LANDING mode.")]
@@ -81,7 +103,7 @@ class EEF_HelicopterControlComponent : ScriptComponent
     [Attribute("8.0", UIWidgets.EditBox, "Distance in metres used to consider a waypoint reached.")]
     protected float m_fWaypointArrivalTolerance;
 
-    [Attribute("2.0", UIWidgets.EditBox, "Altitude AGL in metres at which physics handoff begins for natural landing.")]
+    [Attribute("2.0", UIWidgets.EditBox, "Altitude AGL in metres at which physics handoff begins for natural touchdown.")]
     protected float m_fPhysicsHandoffAGL;
 
     [Attribute("0", UIWidgets.CheckBox, "Print debug flight information to the server log.")]
@@ -90,13 +112,13 @@ class EEF_HelicopterControlComponent : ScriptComponent
     [Attribute("0", UIWidgets.CheckBox, "Enable fly-off and despawn after landing. HOVER_LANDING only; ignored for FULL_LANDING.")]
     protected bool m_bEnableFlyOff;
 
-    [Attribute("180.0", UIWidgets.EditBox, "Seconds to hover at LZ before departing. Set to 0 to disable auto-departure and wait for TriggerFlyOff() instead.")]
+    [Attribute("180.0", UIWidgets.EditBox, "Seconds to hover at LZ before departing. Set to 0 to wait for TriggerFlyOff() instead.")]
     protected float m_fDwellTime;
 
     [Attribute("0.0", UIWidgets.EditBox, "World-space departure heading in degrees (0 = north, 90 = east).")]
     protected float m_fDepartureHeadingDeg;
 
-    [Attribute("1500.0", UIWidgets.EditBox, "Horizontal distance from LZ in metres at which the entity is deleted after fly-off.")]
+    [Attribute("1500.0", UIWidgets.EditBox, "Horizontal distance from LZ in metres at which the helicopter is deleted after fly-off.")]
     protected float m_fDespawnDistance;
 
     [Attribute("", UIWidgets.ResourceNamePicker, "Prefab path for the pilot character. Leave empty to spawn no pilot.", "et")]
@@ -106,47 +128,54 @@ class EEF_HelicopterControlComponent : ScriptComponent
     protected ResourceName m_sCopilotPrefab;
 
     // --------------------------------------------------------
+    // SCRIPT EVENTS
+    // Subscribe via GetOnHelicopterSpawned().Insert(MyCallback).
+    // --------------------------------------------------------
+
+    protected ref ScriptInvoker m_OnHelicopterSpawned = new ScriptInvoker();
+    protected ref ScriptInvoker m_OnLanded = new ScriptInvoker();
+    protected ref ScriptInvoker m_OnDeparted = new ScriptInvoker();
+
+    //! Fired when the helicopter entity has been spawned. Callback signature: void Fn(IEntity heli).
+    ScriptInvoker GetOnHelicopterSpawned() { return m_OnHelicopterSpawned; }
+    //! Fired when the helicopter reaches the LZ (HOVER_HOLD or LANDED_PHASE). No parameters.
+    ScriptInvoker GetOnLanded() { return m_OnLanded; }
+    //! Fired when TriggerFlyOff() transitions the helicopter to DEPARTING state. No parameters.
+    ScriptInvoker GetOnDeparted() { return m_OnDeparted; }
+
+    // --------------------------------------------------------
     // RUNTIME STATE
     // --------------------------------------------------------
 
+    protected IEntity m_HeliEntity;
     protected EEF_EHelicopterControlState m_eState = EEF_EHelicopterControlState.IDLE;
     protected bool m_bFlightTickRunning;
     protected bool m_bEngineStarted;
     protected int m_iCurrentWaypointIndex;
     protected ref array<vector> m_aWaypoints;
     // Densely sampled points along the path between configured waypoints. Built once at
-    // StartFlight from m_aWaypoints. Provides the look-ahead targets that give the helicopter
-    // a smooth bank-into-turn feel rather than aiming straight at the next discrete waypoint.
+    // StartFlight from m_aWaypoints. Provides the look-ahead targets for smooth banking.
     protected ref array<vector> m_aSplinePoints;
     protected VehicleHelicopterSimulation m_HelicopterSim;
     protected SCR_DamageManagerComponent m_DamageManager;
-    //! Highest spline index the helicopter has reached. The look-ahead search will not
-    //! search backwards from this point, preventing the controller from chasing earlier
-    //! waypoints once the helicopter has progressed past them.
+    //! Highest spline index reached. Look-ahead search never goes backwards.
     protected int m_iSplineProgressIndex;
-    //! Throttle for status debug logs (per-second).
     protected float m_fStatusLogTimer;
     protected IEntity m_PilotEntity;
     protected IEntity m_CopilotEntity;
-    protected vector m_vLZOrigin;      //! LZ position recorded on ARRIVING; used for DEPARTING despawn distance.
-    protected float m_fDwellTimer;     //! Remaining dwell seconds; counts down when m_bDwellActive.
-    protected bool m_bDwellActive;     //! True while the dwell countdown is running.
+    protected vector m_vLZOrigin;
+    protected float m_fDwellTimer;
+    protected bool m_bDwellActive;
 
     // --------------------------------------------------------
     // CONSTANTS
     // --------------------------------------------------------
 
     protected const float FLIGHT_VERTICAL_ARRIVAL_TOLERANCE = 1.5;
-
-    // Spline sampling - points are placed every SPLINE_SAMPLE_INTERVAL metres between
-    // consecutive configured waypoints. Smaller = smoother but more memory/compute.
     protected const float SPLINE_SAMPLE_INTERVAL = 20.0;
-    // Look-ahead distance the controller aims at, measured along the spline from the
-    // closest sample point to the helicopter's current position. Tunes how aggressively
-    // the helicopter banks into turns - smaller = sharper, larger = smoother and slower.
     protected const float SPLINE_LOOKAHEAD_DISTANCE = 60.0;
     protected const float FLIGHT_ROTOR_FAILURE_RPM_THRESHOLD = 10.0;
-    protected const float FLIGHT_DAMAGE_RELEASE_THRESHOLD = 0.4; //! Release control at 40% health remaining (60% damage taken).
+    protected const float FLIGHT_DAMAGE_RELEASE_THRESHOLD = 0.4;
 
     // --------------------------------------------------------
     // INITIALISATION
@@ -159,35 +188,13 @@ class EEF_HelicopterControlComponent : ScriptComponent
         if (!Replication.IsServer())
             return;
 
-        m_HelicopterSim = VehicleHelicopterSimulation.Cast(
-            owner.GetRootParent().FindComponent(VehicleHelicopterSimulation)
-        );
-
-        if (!m_HelicopterSim)
-        {
-            Print("[EEF HelicopterControl] WARNING: VehicleHelicopterSimulation not found. Flight control will be disabled.", LogLevel.WARNING);
-            return;
-        }
-
         if (!m_aWaypoints)
             m_aWaypoints = new array<vector>();
 
-        if (m_bAutoStart)
-        {
-            GetGame().GetCallqueue().CallLater(AutoStartFlight, 100, false, owner);
-        }
-
+        // Frame tick runs on the spawn-point owner. TickFlightController acts on m_HeliEntity.
         SetEventMask(owner, EntityEvent.FRAME);
 
-        GetGame().GetCallqueue().CallLater(SpawnCrew, 1000, false);
-
-        m_DamageManager = SCR_DamageManagerComponent.Cast(
-            owner.FindComponent(SCR_DamageManagerComponent)
-        );
-        if (m_DamageManager)
-            m_DamageManager.GetOnDamageStateChanged().Insert(OnVehicleDamageStateChanged);
-
-        DebugLog("Initialised.");
+        DebugLog("Initialised. Call SpawnHelicopter() to begin.");
     }
 
     override void OnDelete(IEntity owner)
@@ -204,78 +211,14 @@ class EEF_HelicopterControlComponent : ScriptComponent
                 SCR_EntityHelper.DeleteEntityAndChildren(m_CopilotEntity);
                 m_CopilotEntity = null;
             }
+            if (m_HeliEntity)
+            {
+                SCR_EntityHelper.DeleteEntityAndChildren(m_HeliEntity);
+                m_HeliEntity = null;
+            }
         }
 
         super.OnDelete(owner);
-    }
-
-    protected void SpawnCrew()
-    {
-        if (!Replication.IsServer())
-            return;
-
-        IEntity owner = GetOwner();
-        if (!owner)
-            return;
-
-        if (!m_sPilotPrefab.IsEmpty())
-            m_PilotEntity = SpawnCrewMember(owner, m_sPilotPrefab, ECompartmentType.PILOT, "pilot");
-
-        if (!m_sCopilotPrefab.IsEmpty())
-            m_CopilotEntity = SpawnCrewMember(owner, m_sCopilotPrefab, ECompartmentType.PILOT, "copilot");
-    }
-
-    protected IEntity SpawnCrewMember(IEntity owner, ResourceName prefab, ECompartmentType compartmentType, string role)
-    {
-        Resource res = Resource.Load(prefab);
-        if (!res || !res.IsValid())
-        {
-            Print(string.Format("[EEF HelicopterControl] WARNING: Could not load %1 prefab: %2", role, prefab), LogLevel.WARNING);
-            return null;
-        }
-
-        EntitySpawnParams spawnParams = new EntitySpawnParams();
-        spawnParams.TransformMode = ETransformMode.WORLD;
-        Math3D.MatrixIdentity4(spawnParams.Transform);
-        spawnParams.Transform[3] = owner.GetOrigin();
-
-        IEntity crew = GetGame().SpawnEntityPrefab(res, GetGame().GetWorld(), spawnParams);
-        if (!crew)
-        {
-            Print(string.Format("[EEF HelicopterControl] WARNING: Failed to spawn %1 entity.", role), LogLevel.WARNING);
-            return null;
-        }
-
-        SCR_CompartmentAccessComponent access = SCR_CompartmentAccessComponent.Cast(
-            crew.FindComponent(SCR_CompartmentAccessComponent)
-        );
-        if (!access)
-        {
-            Print(string.Format("[EEF HelicopterControl] WARNING: %1 entity missing SCR_CompartmentAccessComponent.", role), LogLevel.WARNING);
-            return crew;
-        }
-
-        if (!access.MoveInVehicle(owner, compartmentType))
-            Print(string.Format("[EEF HelicopterControl] WARNING: No %1 compartment slot found on vehicle prefab.", role), LogLevel.WARNING);
-        else
-            DebugLog(string.Format("%1 spawned and seated.", role));
-
-        return crew;
-    }
-
-    protected void AutoStartFlight(IEntity owner)
-    {
-        if (!Replication.IsServer())
-            return;
-
-        if (!GetGame() || !GetGame().GetWorld())
-        {
-            GetGame().GetCallqueue().CallLater(AutoStartFlight, 100, false, owner);
-            return;
-        }
-
-        BuildWaypoints(owner);
-        StartFlight(owner);
     }
 
     override void EOnFrame(IEntity owner, float timeSlice)
@@ -284,14 +227,89 @@ class EEF_HelicopterControlComponent : ScriptComponent
             return;
 
         if (m_bFlightTickRunning)
-            TickFlightController(owner, timeSlice);
+            TickFlightController(timeSlice);
     }
 
     // --------------------------------------------------------
     // PUBLIC API
     // --------------------------------------------------------
 
-    void StartFlight(IEntity owner)
+    //! Spawn the helicopter prefab at the owner entity's world transform.
+    //! Fires OnHelicopterSpawned(IEntity heli) when the entity is ready.
+    //! If m_bAutoStart is true, StartFlight() is called automatically shortly after.
+    //! Otherwise the caller (e.g. EEF_HelicopterInsertionComponent) calls StartFlight()
+    //! once their own setup is complete.
+    void SpawnHelicopter()
+    {
+        if (!Replication.IsServer())
+            return;
+
+        if (m_HeliEntity)
+        {
+            Print("[EEF HelicopterControl] WARNING: SpawnHelicopter called but helicopter already spawned.", LogLevel.WARNING);
+            return;
+        }
+
+        if (m_sHelicopterPrefab.IsEmpty())
+        {
+            Print("[EEF HelicopterControl] ERROR: No helicopter prefab configured.", LogLevel.ERROR);
+            return;
+        }
+
+        Resource res = Resource.Load(m_sHelicopterPrefab);
+        if (!res || !res.IsValid())
+        {
+            Print("[EEF HelicopterControl] ERROR: Could not load helicopter prefab: " + m_sHelicopterPrefab, LogLevel.ERROR);
+            return;
+        }
+
+        IEntity owner = GetOwner();
+        vector mat[4];
+        owner.GetWorldTransform(mat);
+
+        if (m_eSpawnMode == EEF_EHelicopterSpawnMode.IN_AIR)
+        {
+            float groundY = GetSurfaceHeightAt(mat[3][0], mat[3][2]);
+            mat[3][1] = groundY + m_fCruiseAltitudeAGL;
+        }
+
+        EntitySpawnParams spawnParams = new EntitySpawnParams();
+        spawnParams.TransformMode = ETransformMode.WORLD;
+        spawnParams.Transform[0] = mat[0];
+        spawnParams.Transform[1] = mat[1];
+        spawnParams.Transform[2] = mat[2];
+        spawnParams.Transform[3] = mat[3];
+
+        m_HeliEntity = GetGame().SpawnEntityPrefab(res, GetGame().GetWorld(), spawnParams);
+        if (!m_HeliEntity)
+        {
+            Print("[EEF HelicopterControl] ERROR: Failed to spawn helicopter entity.", LogLevel.ERROR);
+            return;
+        }
+
+        m_HelicopterSim = VehicleHelicopterSimulation.Cast(
+            m_HeliEntity.GetRootParent().FindComponent(VehicleHelicopterSimulation)
+        );
+        if (!m_HelicopterSim)
+            Print("[EEF HelicopterControl] WARNING: VehicleHelicopterSimulation not found on spawned helicopter. Flight control disabled.", LogLevel.WARNING);
+
+        m_DamageManager = SCR_DamageManagerComponent.Cast(
+            m_HeliEntity.FindComponent(SCR_DamageManagerComponent)
+        );
+        if (m_DamageManager)
+            m_DamageManager.GetOnDamageStateChanged().Insert(OnVehicleDamageStateChanged);
+
+        // Crew spawned after a short delay to allow the vehicle entity to fully initialise.
+        GetGame().GetCallqueue().CallLater(SpawnCrew, 500, false);
+
+        DebugLog("Helicopter spawned.");
+        m_OnHelicopterSpawned.Invoke(m_HeliEntity);
+
+        if (m_bAutoStart)
+            GetGame().GetCallqueue().CallLater(AutoStartFlight, 100, false);
+    }
+
+    void StartFlight()
     {
         if (!Replication.IsServer())
             return;
@@ -307,26 +325,28 @@ class EEF_HelicopterControlComponent : ScriptComponent
 
         if (m_aWaypoints.IsEmpty())
         {
-            if (!ResolveConfiguredWaypoints(owner) && m_aWaypoints.IsEmpty())
+            if (!ResolveConfiguredWaypoints() && m_aWaypoints.IsEmpty())
             {
-                Print("[EEF Helicopter] ERROR: No waypoint available to begin flight.", LogLevel.ERROR);
+                Print("[EEF HelicopterControl] ERROR: No waypoints available to begin flight.", LogLevel.ERROR);
                 return;
             }
         }
 
         if (m_aWaypoints.IsEmpty())
         {
-            Print("[EEF Helicopter] WARNING: No waypoints configured. Flight will remain idle.", LogLevel.WARNING);
+            Print("[EEF HelicopterControl] WARNING: No waypoints configured. Flight will remain idle.", LogLevel.WARNING);
             return;
         }
 
-        BuildSpline(owner);
+        BuildSpline();
 
         m_iCurrentWaypointIndex = 0;
         m_iSplineProgressIndex = 0;
         m_fStatusLogTimer = 0;
         m_eState = EEF_EHelicopterControlState.FLYING;
-        m_ePhase = EEF_EFlightPhase.TAKEOFF_VERTICAL;
+        m_ePhase = (m_eSpawnMode == EEF_EHelicopterSpawnMode.IN_AIR)
+            ? EEF_EFlightPhase.CRUISE
+            : EEF_EFlightPhase.TAKEOFF_VERTICAL;
         m_vCurrentVelocity = vector.Zero;
         m_bFlightTickRunning = true;
         m_bEngineStarted = true;
@@ -338,17 +358,14 @@ class EEF_HelicopterControlComponent : ScriptComponent
         m_HelicopterSim.EngineStart();
         m_HelicopterSim.SetThrottle(FLIGHT_CONSTANT_THROTTLE);
 
-        // Keep rotor force at 0 until after spool-up. Rotor force is applied in TickFlightController
-        // after the engine RPM reaches target, preventing uncontrolled lift during startup.
-
-        // Startup status: confirms the configured waypoint set actually resolved.
         int splineCount = 0;
         if (m_aSplinePoints)
             splineCount = m_aSplinePoints.Count();
-        DebugLog(string.Format("Flight started. Waypoints: %1, spline samples: %2.", m_aWaypoints.Count(), splineCount));
+        DebugLog(string.Format("Flight started. Phase: %1. Waypoints: %2, spline samples: %3.",
+            m_ePhase, m_aWaypoints.Count(), splineCount));
     }
 
-    void StopFlight(IEntity owner)
+    void StopFlight()
     {
         if (!Replication.IsServer())
             return;
@@ -356,9 +373,6 @@ class EEF_HelicopterControlComponent : ScriptComponent
         if (m_HelicopterSim)
         {
             m_HelicopterSim.SetThrottle(0);
-            // Drop rotor force scaling to zero. Together with throttle 0 this mirrors
-            // Darc's landing approach - the helicopter loses lift cleanly rather than
-            // continuing to push against the ground.
             m_HelicopterSim.RotorSetForceScaleState(0, 0);
             m_HelicopterSim.RotorSetForceScaleState(1, 0);
         }
@@ -384,33 +398,8 @@ class EEF_HelicopterControlComponent : ScriptComponent
         m_aWaypoints.Insert(pos);
     }
 
-    bool StartFlightToPosition(IEntity owner, vector position)
-    {
-        if (!Replication.IsServer())
-            return false;
-
-        ClearWaypoints();
-        AddWaypoint(Vector(position[0], position[1], position[2]));
-        StartFlight(owner);
-        return m_bFlightTickRunning;
-    }
-
-    bool StartFlightToEntity(IEntity owner, string entityName)
-    {
-        if (entityName.IsEmpty())
-            return false;
-
-        IEntity ent = GetGame().GetWorld().FindEntityByName(entityName);
-        if (!ent)
-            return false;
-
-        vector pos = ent.GetOrigin();
-        StartFlightToPosition(owner, pos);
-        return m_bFlightTickRunning;
-    }
-
     //! Trigger an immediate fly-off from the LZ. Only valid when state is ARRIVING (HOVER_LANDING mode).
-    //! Called automatically by the dwell timer, or externally by other modules to signal departure.
+    //! Called automatically by the dwell timer, or externally by sibling modules.
     void TriggerFlyOff()
     {
         if (!Replication.IsServer())
@@ -422,27 +411,93 @@ class EEF_HelicopterControlComponent : ScriptComponent
         m_bDwellActive = false;
         m_eState = EEF_EHelicopterControlState.DEPARTING;
         m_ePhase = EEF_EFlightPhase.TAKEOFF_TRANSITION;
-        DebugLog("TriggerFlyOff: departing LZ, beginning climb-while-turning fly-off.");
+        m_OnDeparted.Invoke();
+        DebugLog("TriggerFlyOff: departing LZ.");
+    }
+
+    // --------------------------------------------------------
+    // CREW
+    // --------------------------------------------------------
+
+    protected void SpawnCrew()
+    {
+        if (!Replication.IsServer() || !m_HeliEntity)
+            return;
+
+        if (!m_sPilotPrefab.IsEmpty())
+            m_PilotEntity = SpawnCrewMember(m_HeliEntity, m_sPilotPrefab, ECompartmentType.PILOT, "pilot");
+
+        if (!m_sCopilotPrefab.IsEmpty())
+            m_CopilotEntity = SpawnCrewMember(m_HeliEntity, m_sCopilotPrefab, ECompartmentType.PILOT, "copilot");
+    }
+
+    protected IEntity SpawnCrewMember(IEntity heli, ResourceName prefab, ECompartmentType compartmentType, string role)
+    {
+        Resource res = Resource.Load(prefab);
+        if (!res || !res.IsValid())
+        {
+            Print(string.Format("[EEF HelicopterControl] WARNING: Could not load %1 prefab: %2", role, prefab), LogLevel.WARNING);
+            return null;
+        }
+
+        EntitySpawnParams spawnParams = new EntitySpawnParams();
+        spawnParams.TransformMode = ETransformMode.WORLD;
+        Math3D.MatrixIdentity4(spawnParams.Transform);
+        spawnParams.Transform[3] = heli.GetOrigin();
+
+        IEntity crew = GetGame().SpawnEntityPrefab(res, GetGame().GetWorld(), spawnParams);
+        if (!crew)
+        {
+            Print(string.Format("[EEF HelicopterControl] WARNING: Failed to spawn %1 entity.", role), LogLevel.WARNING);
+            return null;
+        }
+
+        SCR_CompartmentAccessComponent access = SCR_CompartmentAccessComponent.Cast(
+            crew.FindComponent(SCR_CompartmentAccessComponent)
+        );
+        if (!access)
+        {
+            Print(string.Format("[EEF HelicopterControl] WARNING: %1 entity missing SCR_CompartmentAccessComponent.", role), LogLevel.WARNING);
+            return crew;
+        }
+
+        if (!access.MoveInVehicle(heli, compartmentType))
+            Print(string.Format("[EEF HelicopterControl] WARNING: No %1 compartment slot found on vehicle prefab.", role), LogLevel.WARNING);
+        else
+            DebugLog(string.Format("%1 spawned and seated.", role));
+
+        return crew;
+    }
+
+    protected void AutoStartFlight()
+    {
+        if (!Replication.IsServer())
+            return;
+
+        if (!GetGame() || !GetGame().GetWorld())
+        {
+            GetGame().GetCallqueue().CallLater(AutoStartFlight, 100, false);
+            return;
+        }
+
+        BuildWaypoints();
+        StartFlight();
     }
 
     // --------------------------------------------------------
     // WAYPOINTS
     // --------------------------------------------------------
 
-    protected bool ResolveConfiguredWaypoints(IEntity owner)
+    protected bool ResolveConfiguredWaypoints()
     {
         bool added = false;
 
         if (!m_aWaypoints)
             m_aWaypoints = new array<vector>();
 
-        // Intermediates are inserted FIRST in their declared order. The destination is
-        // appended LAST so the controller correctly treats it as the final waypoint
-        // (which triggers the approach/descent profile - intermediates are flown through
-        // at cruise speed and altitude).
-        added |= ResolveOptionalWaypoint(owner, m_sWaypoint1Name);
-        added |= ResolveOptionalWaypoint(owner, m_sWaypoint2Name);
-        added |= ResolveOptionalWaypoint(owner, m_sWaypoint3Name);
+        added |= ResolveOptionalWaypoint(m_sWaypoint1Name);
+        added |= ResolveOptionalWaypoint(m_sWaypoint2Name);
+        added |= ResolveOptionalWaypoint(m_sWaypoint3Name);
 
         if (!m_sDestinationEntityName.IsEmpty())
         {
@@ -458,7 +513,7 @@ class EEF_HelicopterControlComponent : ScriptComponent
         return added;
     }
 
-    protected bool ResolveOptionalWaypoint(IEntity owner, string entityName)
+    protected bool ResolveOptionalWaypoint(string entityName)
     {
         if (entityName.IsEmpty())
             return false;
@@ -475,9 +530,7 @@ class EEF_HelicopterControlComponent : ScriptComponent
     protected bool ResolveEntityPosition(string entityName, out vector outPos)
     {
         if (!GetGame() || !GetGame().GetWorld())
-        {
             return false;
-        }
 
         IEntity ent = GetGame().GetWorld().FindEntityByName(entityName);
         if (!ent)
@@ -499,27 +552,20 @@ class EEF_HelicopterControlComponent : ScriptComponent
     // SPLINE PATH
     // --------------------------------------------------------
 
-    //! Build a densely sampled point list along the path from helicopter origin through
-    //! all configured waypoints. Linear interpolation - smooth enough for our purposes
-    //! and avoids Catmull-Rom complexity for the typical 1-3 waypoint case.
-    //! Each sample is set to cruise altitude AGL above local terrain.
-    protected void BuildSpline(IEntity owner)
+    protected void BuildSpline()
     {
         if (!m_aSplinePoints)
             m_aSplinePoints = new array<vector>();
         m_aSplinePoints.Clear();
 
-        if (!m_aWaypoints || m_aWaypoints.IsEmpty())
+        if (!m_aWaypoints || m_aWaypoints.IsEmpty() || !m_HeliEntity)
             return;
 
-        // Start the spline at the helicopter's current XZ position so look-ahead immediately
-        // has somewhere to target on the first tick. The Y is set to cruise altitude.
-        vector here = owner.GetOrigin();
+        vector here = m_HeliEntity.GetOrigin();
         float startGroundY = GetSurfaceHeightAt(here[0], here[2]);
         vector prev = Vector(here[0], startGroundY + m_fCruiseAltitudeAGL, here[2]);
         m_aSplinePoints.Insert(prev);
 
-        // Sample between each consecutive pair: prev -> waypoint, prev -> next waypoint, etc.
         foreach (vector wp : m_aWaypoints)
         {
             float wpGroundY = GetSurfaceHeightAt(wp[0], wp[2]);
@@ -533,9 +579,6 @@ class EEF_HelicopterControlComponent : ScriptComponent
                 int sampleCount = Math.Floor(segLen / SPLINE_SAMPLE_INTERVAL);
                 vector segDir = segDelta * (1.0 / segLen);
 
-                // Insert intermediate samples. Each sample's altitude is set against its own
-                // local terrain so the spline follows the ground undulation rather than
-                // cutting through hills.
                 for (int i = 1; i <= sampleCount; i++)
                 {
                     vector sample = prev + segDir * (SPLINE_SAMPLE_INTERVAL * i);
@@ -545,7 +588,6 @@ class EEF_HelicopterControlComponent : ScriptComponent
                 }
             }
 
-            // Always insert the waypoint itself so the spline ends exactly on the configured point.
             m_aSplinePoints.Insert(wpAtCruise);
             prev = wpAtCruise;
         }
@@ -553,26 +595,15 @@ class EEF_HelicopterControlComponent : ScriptComponent
         DebugLog(string.Format("Spline built: %1 sample points across %2 waypoint(s).", m_aSplinePoints.Count(), m_aWaypoints.Count()));
     }
 
-    //! Find a point along the spline ahead of the helicopter, used as the steering target.
-    //! Walks the spline from the closest sample to find one approximately
-    //! SPLINE_LOOKAHEAD_DISTANCE metres further along.
-    //!
-    //! Search is restricted to indices >= m_iSplineProgressIndex - the helicopter never
-    //! looks backwards. This prevents a kinked path (e.g. zig-zag waypoints) from causing
-    //! the helicopter to chase an earlier segment that's geometrically close to its current
-    //! position, which would otherwise produce a cycle between waypoints.
     protected vector GetLookAheadTarget(vector currentPos)
     {
         if (!m_aSplinePoints || m_aSplinePoints.IsEmpty())
         {
-            // Fallback: just aim at the current waypoint at cruise altitude.
             vector wp = m_aWaypoints[m_iCurrentWaypointIndex];
             float gy = GetSurfaceHeightAt(wp[0], wp[2]);
             return Vector(wp[0], gy + m_fCruiseAltitudeAGL, wp[2]);
         }
 
-        // Find the closest spline sample to current position (XZ only), only searching
-        // forward from the highest progress index ever reached.
         int closestIdx = m_iSplineProgressIndex;
         float closestDistSq = float.MAX;
         for (int i = m_iSplineProgressIndex; i < m_aSplinePoints.Count(); i++)
@@ -588,12 +619,8 @@ class EEF_HelicopterControlComponent : ScriptComponent
             }
         }
 
-        // Lock in this progress so future searches won't go backwards.
         m_iSplineProgressIndex = closestIdx;
 
-        // Walk forward along the spline accumulating distance until we've gone LOOKAHEAD,
-        // or we've run out of samples (in which case we return the last one - the helicopter
-        // is near the end of the path).
         float accumulated = 0;
         int targetIdx = closestIdx;
         for (int j = closestIdx; j < m_aSplinePoints.Count() - 1; j++)
@@ -616,67 +643,52 @@ class EEF_HelicopterControlComponent : ScriptComponent
     //   2. Compute desired horizontal direction and speed from phase.
     //   3. Compute desired vertical speed from phase.
     //   4. Smoothly track current velocity toward desired (3s time constant).
-    //   5. Compute desired attitude from acceleration:
-    //        - Pitch: forward when accelerating, neutral at constant velocity.
-    //        - Roll:  bank into turns (lateral acceleration).
-    //        - Yaw:   align with horizontal velocity direction.
+    //   5. Compute desired attitude from acceleration.
     //   6. Smoothly track current attitude toward desired.
     //
-    // Throttle is held constant for engine sound and rotor visuals only - lift comes from
-    // the vertical component of SetVelocity, not from the simulation's lift response.
+    // All physics operations act on m_HeliEntity, not the spawn-point owner.
     // --------------------------------------------------------
 
-    // Flight profile constants. Tuned for cinematic feel; locked for v1.
-    protected const float FLIGHT_TAKEOFF_VERTICAL_AGL = 5.0;     //! Altitude AGL to clear vertically before transitioning.
-    protected const float FLIGHT_TAKEOFF_CLIMB_RATE = 4.0;       //! m/s vertical during takeoff and climb.
-    protected const float FLIGHT_APPROACH_RANGE = 300.0;         //! Horizontal m from LZ at which speed bleed begins.
-    protected const float FLIGHT_APPROACH_SPEED = 22.0;          //! Target speed during approach bleed (~80 km/h).
-    protected const float FLIGHT_DESCENT_RANGE = 100.0;          //! Horizontal m from LZ at which descent begins.
-    protected const float FLIGHT_DESCENT_RATE = 3.0;             //! m/s descent during APPROACH_DESCENT.
-    protected const float FLIGHT_FLARE_RATE = 0.8;               //! m/s descent in final 5m AGL.
-    protected const float FLIGHT_VELOCITY_TIME_CONSTANT = 3.0;   //! Seconds to track 63% toward target velocity.
-    protected const float FLIGHT_ATTITUDE_TIME_CONSTANT = 1.5;   //! Seconds to track 63% toward target attitude. Tighter than velocity for snappier visual response.
-    protected const float FLIGHT_MAX_PITCH_RAD = 0.35;           //! Max forward/back tilt (~20 degrees).
-    protected const float FLIGHT_MAX_ROLL_RAD = 0.4;             //! Max bank angle (~23 degrees).
-    protected const float FLIGHT_PITCH_PER_ACCEL = 0.04;         //! Radians of pitch per m/s^2 acceleration.
-    protected const float FLIGHT_ROLL_PER_LATERAL = 0.06;        //! Radians of roll per m/s^2 lateral accel.
-    protected const float FLIGHT_CONSTANT_THROTTLE = 0.8;        //! Throttle held constant for engine/rotor visuals.
-    protected const float FLIGHT_TOUCHDOWN_AGL = 0.5;             //! AGL below which we consider the helicopter landed.
+    protected const float FLIGHT_TAKEOFF_VERTICAL_AGL = 5.0;
+    protected const float FLIGHT_TAKEOFF_CLIMB_RATE = 4.0;
+    protected const float FLIGHT_APPROACH_RANGE = 300.0;
+    protected const float FLIGHT_APPROACH_SPEED = 22.0;
+    protected const float FLIGHT_DESCENT_RANGE = 100.0;
+    protected const float FLIGHT_DESCENT_RATE = 3.0;
+    protected const float FLIGHT_FLARE_RATE = 0.8;
+    protected const float FLIGHT_VELOCITY_TIME_CONSTANT = 3.0;
+    protected const float FLIGHT_ATTITUDE_TIME_CONSTANT = 1.5;
+    protected const float FLIGHT_MAX_PITCH_RAD = 0.35;
+    protected const float FLIGHT_MAX_ROLL_RAD = 0.4;
+    protected const float FLIGHT_PITCH_PER_ACCEL = 0.04;
+    protected const float FLIGHT_ROLL_PER_LATERAL = 0.06;
+    protected const float FLIGHT_CONSTANT_THROTTLE = 0.8;
+    protected const float FLIGHT_TOUCHDOWN_AGL = 0.5;
 
-    // Persistent state across ticks for smoothing.
     protected EEF_EFlightPhase m_ePhase = EEF_EFlightPhase.TAKEOFF_VERTICAL;
-    protected vector m_vCurrentVelocity = vector.Zero; //! Tracked velocity, lerped toward desired.
-    protected vector m_vDesiredHorizDir = vector.Zero; //! Last stable heading direction used during approach.
-    protected bool m_bRotorForceApplied = false; //! Flag to track if rotor force has been set after spool-up.
-    protected bool m_bLandingShutdown = false; //! Flag to track if we're in the landing shutdown sequence.
+    protected vector m_vCurrentVelocity = vector.Zero;
+    protected vector m_vDesiredHorizDir = vector.Zero;
+    protected bool m_bRotorForceApplied = false;
+    protected bool m_bLandingShutdown = false;
 
-    protected void TickFlightController(IEntity owner, float timeSlice)
+    protected void TickFlightController(float timeSlice)
     {
-        if (!m_HelicopterSim || !m_aWaypoints || m_aWaypoints.IsEmpty())
+        if (!m_HelicopterSim || !m_aWaypoints || m_aWaypoints.IsEmpty() || !m_HeliEntity)
             return;
 
-        Physics phys = owner.GetPhysics();
+        Physics phys = m_HeliEntity.GetPhysics();
         if (!phys)
             return;
 
-        // Hold throttle constant - lift is now driven by SetVelocity, not throttle.
-        // Throttle is commanded even before engine is ready so the spool-up actually progresses.
         m_HelicopterSim.SetThrottle(FLIGHT_CONSTANT_THROTTLE);
 
-        // Wait for engine spool-up before commanding velocity or attitude. EngineIsOn() is
-        // a binary state flag (engine switched on yes/no), not a readiness signal - it
-        // returns true the moment EngineStart is called. The actual readiness condition is
-        // rotor RPM reaching target, which we check via RotorGetRPM vs RotorGetRPMTarget.
         if (!m_HelicopterSim.EngineIsOn())
-        {
             return;
-        }
 
         float rotorTargetRPM = m_HelicopterSim.RotorGetRPMTarget(0);
         float rotorRPM = m_HelicopterSim.RotorGetRPM(0);
         if (rotorTargetRPM > 0 && rotorRPM < rotorTargetRPM * 0.9)
         {
-            // Throttled debug log so we can see spool-up progress.
             m_fStatusLogTimer += timeSlice;
             if (m_bDebugLog && m_fStatusLogTimer >= 1.0)
             {
@@ -686,7 +698,6 @@ class EEF_HelicopterControlComponent : ScriptComponent
             return;
         }
 
-        // Apply rotor force once spool-up is complete. This prevents uncontrolled lift during startup.
         if (!m_bRotorForceApplied)
         {
             m_HelicopterSim.RotorSetForceScaleState(0, 5.0);
@@ -695,60 +706,49 @@ class EEF_HelicopterControlComponent : ScriptComponent
             DebugLog("Rotor force applied - flight control active.");
         }
 
-        // Rotor failure detection: once spool-up is done, a low RPM means the rotor has
-        // been destroyed. Release scripted control so native physics produces a crash.
         if (m_bRotorForceApplied)
         {
             if (m_HelicopterSim.RotorGetRPM(0) < FLIGHT_ROTOR_FAILURE_RPM_THRESHOLD)
             {
-                OnRotorFailure(owner, "main rotor");
+                OnRotorFailure("main rotor");
                 return;
             }
             if (m_HelicopterSim.RotorGetRPM(1) < FLIGHT_ROTOR_FAILURE_RPM_THRESHOLD)
             {
-                OnRotorFailure(owner, "tail rotor");
+                OnRotorFailure("tail rotor");
                 return;
             }
 
             if (m_DamageManager && m_DamageManager.GetHealthScaled() < FLIGHT_DAMAGE_RELEASE_THRESHOLD)
             {
-                OnRotorFailure(owner, "critical damage");
+                OnRotorFailure("critical damage");
                 return;
             }
 
             if (IsAllCrewDead())
             {
-                OnRotorFailure(owner, "crew incapacitated");
+                OnRotorFailure("crew incapacitated");
                 return;
             }
         }
 
-        vector here = owner.GetOrigin();
+        vector here = m_HeliEntity.GetOrigin();
         float groundY = GetSurfaceHeightAt(here[0], here[2]);
         float altAGL = here[1] - groundY;
 
-        // Defensive bounds check. If somehow we've advanced past the last waypoint, treat
-        // as landed. Should not happen with the current advance logic, but guards against
-        // edge cases in re-entrant flight starts.
         if (m_iCurrentWaypointIndex < 0 || m_iCurrentWaypointIndex >= m_aWaypoints.Count())
         {
             DebugLog(string.Format("Waypoint index %1 out of bounds (%2 waypoints). Treating as landed.", m_iCurrentWaypointIndex, m_aWaypoints.Count()));
-            OnFlightArrived(owner);
+            OnFlightArrived();
             return;
         }
 
-        // Resolve current waypoint and final-waypoint flag.
         vector waypoint = m_aWaypoints[m_iCurrentWaypointIndex];
         bool isFinalWaypoint = (m_iCurrentWaypointIndex >= m_aWaypoints.Count() - 1);
 
-        // Horizontal distance to current waypoint. Used for phase detection on the final
-        // waypoint, and for waypoint advance on intermediates.
         vector wpHorizDelta = Vector(waypoint[0] - here[0], 0, waypoint[2] - here[2]);
         float wpHorizDist = wpHorizDelta.Length();
 
-        // Per-second status snapshot: lets us see what the controller is actually doing
-        // when phase transitions and waypoint advances are sparse. Throttled so it doesn't
-        // flood the log on every flight tick.
         m_fStatusLogTimer += timeSlice;
         if (m_bDebugLog && m_fStatusLogTimer >= 1.0)
         {
@@ -762,14 +762,15 @@ class EEF_HelicopterControlComponent : ScriptComponent
                 m_ePhase, m_iCurrentWaypointIndex, m_aWaypoints.Count() - 1, isFinalWaypoint, wpHorizDist, finalDist, altAGL, m_iSplineProgressIndex, splineCount));
         }
 
-        // --- Phase detection ---
-        // Bug 4 fix: track phase before update so we can detect HOVER_HOLD entry and fire OnFlightArrived.
         EEF_EFlightPhase phaseBefore = m_ePhase;
         UpdateFlightPhase(altAGL, wpHorizDist, isFinalWaypoint);
-        if (m_ePhase == EEF_EFlightPhase.HOVER_HOLD && phaseBefore != EEF_EFlightPhase.HOVER_HOLD)
-            OnFlightArrived(owner);
 
-        // Dwell countdown: tick while hovering at the LZ, trigger fly-off on expiry.
+        if (m_ePhase == EEF_EFlightPhase.HOVER_HOLD && phaseBefore != EEF_EFlightPhase.HOVER_HOLD)
+            OnFlightArrived();
+        else if (m_ePhase == EEF_EFlightPhase.LANDED_PHASE && phaseBefore != EEF_EFlightPhase.LANDED_PHASE
+            && m_eLandingMode == EEF_EHelicopterControlLandingMode.FULL_LANDING)
+            OnFlightArrived();
+
         if (m_bDwellActive && m_eState == EEF_EHelicopterControlState.ARRIVING)
         {
             m_fDwellTimer -= timeSlice;
@@ -780,7 +781,6 @@ class EEF_HelicopterControlComponent : ScriptComponent
             }
         }
 
-        // Despawn check: delete entity once far enough from the LZ while departing.
         if (m_eState == EEF_EHelicopterControlState.DEPARTING)
         {
             float dx = here[0] - m_vLZOrigin[0];
@@ -790,12 +790,11 @@ class EEF_HelicopterControlComponent : ScriptComponent
             {
                 DebugLog(string.Format("Despawn distance reached (%.0fm from LZ). Scheduling entity deletion.", distFromLZ));
                 m_bFlightTickRunning = false;
-                GetGame().GetCallqueue().CallLater(DespawnHelicopter, 0, false, owner);
+                GetGame().GetCallqueue().CallLater(DespawnHelicopter, 0, false);
                 return;
             }
         }
 
-        // Check arrival on intermediate waypoints (advance), or on final (land).
         if (!isFinalWaypoint && wpHorizDist < m_fWaypointArrivalTolerance)
         {
             m_iCurrentWaypointIndex++;
@@ -803,8 +802,6 @@ class EEF_HelicopterControlComponent : ScriptComponent
             return;
         }
 
-        // Bug 3 fix: only shut down on LANDED_PHASE for FULL_LANDING. HOVER_LANDING stabilises
-        // into HOVER_HOLD and keeps the engine running.
         if (m_ePhase == EEF_EFlightPhase.LANDED_PHASE && m_eLandingMode != EEF_EHelicopterControlLandingMode.HOVER_LANDING)
         {
             if (!m_bLandingShutdown)
@@ -814,16 +811,13 @@ class EEF_HelicopterControlComponent : ScriptComponent
             }
         }
 
-        // Physics handoff: stop aggressive scripted control and allow a soft natural descent.
         if (m_ePhase == EEF_EFlightPhase.APPROACH_FLARE)
         {
-            // Set minimal rotor force and throttle for stability without full control.
             m_HelicopterSim.RotorSetForceScaleState(0, 0.4);
             m_HelicopterSim.RotorSetForceScaleState(1, 0.4);
             m_HelicopterSim.SetThrottle(0.1);
-            phys.SetAngularVelocity(vector.Zero); // Dampen any rotation.
+            phys.SetAngularVelocity(vector.Zero);
 
-            // Prevent residual scripted downward velocity from forcing the skids through terrain.
             m_vCurrentVelocity[0] = 0;
             m_vCurrentVelocity[2] = 0;
             m_vCurrentVelocity[1] = Math.Max(m_vCurrentVelocity[1], -0.7);
@@ -831,16 +825,12 @@ class EEF_HelicopterControlComponent : ScriptComponent
             return;
         }
 
-        // --- Steering target (horizontal direction) ---
         vector horizDir;
         if (wpHorizDist > 0.5)
             horizDir = wpHorizDelta * (1.0 / wpHorizDist);
         else
             horizDir = vector.Zero;
 
-        // Freeze the heading reference once inside the final approach zone so that if the
-        // helicopter overshoots the waypoint horizontally the reversed direction is never
-        // stored — without this guard the "freeze" below just uses the reversed direction.
         bool isFinalApproachFreeze = isFinalWaypoint
             && (m_ePhase == EEF_EFlightPhase.APPROACH_DESCENT || m_ePhase == EEF_EFlightPhase.HOVER_HOLD)
             && wpHorizDist < 30.0;
@@ -851,7 +841,6 @@ class EEF_HelicopterControlComponent : ScriptComponent
         if (isFinalApproachFreeze && m_vDesiredHorizDir.LengthSq() > 0.0001)
             horizDir = m_vDesiredHorizDir;
 
-        // During departure, ignore waypoint direction and fly the configured departure heading.
         if (m_eState == EEF_EHelicopterControlState.DEPARTING)
         {
             float headingRad = m_fDepartureHeadingDeg * (Math.PI / 180.0);
@@ -865,18 +854,14 @@ class EEF_HelicopterControlComponent : ScriptComponent
         vector desiredVelocity = horizDir * desiredHorizSpeed;
         desiredVelocity[1] = desiredVertSpeed;
 
-        // Landing shutdown: bring velocity and rotor force to zero before stopping control loop.
         if (m_bLandingShutdown)
         {
-            // Force desired velocity to zero during shutdown.
             desiredVelocity = vector.Zero;
-            
-            // Reduce rotor force gradually to prevent sudden loss of lift.
+
             float horiSpeed = Vector(m_vCurrentVelocity[0], 0, m_vCurrentVelocity[2]).Length();
             float vertSpeedSq = m_vCurrentVelocity[1] * m_vCurrentVelocity[1];
-            if (horiSpeed < 0.5 && vertSpeedSq < 0.25)  // 0.5^2 = 0.25
+            if (horiSpeed < 0.5 && vertSpeedSq < 0.25)
             {
-                // Velocity near zero - shut down the engine.
                 m_HelicopterSim.RotorSetForceScaleState(0, 0);
                 m_HelicopterSim.RotorSetForceScaleState(1, 0);
                 m_HelicopterSim.SetThrottle(0.0);
@@ -888,21 +873,10 @@ class EEF_HelicopterControlComponent : ScriptComponent
             }
         }
 
-        // --- Velocity smoothing (3s time constant exponential approach) ---
-        // Velocity smoothing alpha. Linear approximation of (1 - exp(-dt/TC)), accurate
-        // to within ~5% for the dt/TC ratios we deal with (~0.03 typical). Math.Exp is
-        // not available in Enforce script. Clamped to [0, 1] in case dt is unusually
-        // large (e.g. first tick after a long pause) so alpha can't overshoot.
         float velAlpha = Math.Clamp(timeSlice / FLIGHT_VELOCITY_TIME_CONSTANT, 0.0, 1.0);
         vector previousVelocity = m_vCurrentVelocity;
         m_vCurrentVelocity = m_vCurrentVelocity + (desiredVelocity - m_vCurrentVelocity) * velAlpha;
 
-        // Near hover altitude in HOVER_LANDING mode the 3s velocity TC is far too slow —
-        // residual descent momentum would carry the helicopter well below the target (e.g.
-        // through a building roof). Switch to a 0.05s TC for the vertical component so the
-        // helicopter decelerates proportionally to remaining distance and arrives gently.
-        // Then enforce a hard floor: once at or below hover altitude, downward velocity is
-        // zeroed immediately, making the target altitude a physical hard boundary.
         if (m_eLandingMode == EEF_EHelicopterControlLandingMode.HOVER_LANDING
             && altAGL < m_fHoverAltitudeAGL + 4.0
             && (m_ePhase == EEF_EFlightPhase.APPROACH_DESCENT || m_ePhase == EEF_EFlightPhase.HOVER_HOLD))
@@ -913,21 +887,15 @@ class EEF_HelicopterControlComponent : ScriptComponent
                 m_vCurrentVelocity[1] = 0;
         }
 
-        // Apply velocity. SetVelocity overrides the engine's own velocity each tick.
         phys.SetVelocity(m_vCurrentVelocity);
 
-        // --- Compute acceleration this tick (used for attitude) ---
         vector accel = (m_vCurrentVelocity - previousVelocity) * (1.0 / Math.Max(timeSlice, 0.001));
 
-        // --- Apply attitude based on velocity and acceleration ---
-        ApplyAttitude(owner, phys, m_vCurrentVelocity, accel, m_vDesiredHorizDir, timeSlice);
+        ApplyAttitude(phys, m_vCurrentVelocity, accel, m_vDesiredHorizDir, timeSlice);
     }
 
-    //! Determine which flight phase we should be in based on altitude and distance to LZ.
     protected void UpdateFlightPhase(float altAGL, float wpHorizDist, bool isFinalWaypoint)
     {
-        // While departing, only the climb-to-cruise transition is relevant.
-        // Approach/descent phases must not fire — the helicopter is flying away from the LZ.
         if (m_eState == EEF_EHelicopterControlState.DEPARTING)
         {
             if (m_ePhase == EEF_EFlightPhase.TAKEOFF_TRANSITION && altAGL >= m_fCruiseAltitudeAGL - FLIGHT_VERTICAL_ARRIVAL_TOLERANCE)
@@ -984,8 +952,6 @@ class EEF_HelicopterControlComponent : ScriptComponent
             {
                 bool isHover = (m_eLandingMode == EEF_EHelicopterControlLandingMode.HOVER_LANDING);
 
-                // Bug 1 fix: in hover mode the hover altitude is above the physics handoff threshold,
-                // so APPROACH_FLARE would fire first. Skip it entirely and go straight to HOVER_HOLD.
                 if (isHover && m_fHoverAltitudeAGL > m_fPhysicsHandoffAGL)
                 {
                     if (altAGL <= m_fHoverAltitudeAGL + FLIGHT_VERTICAL_ARRIVAL_TOLERANCE && wpHorizDist < m_fWaypointArrivalTolerance)
@@ -996,11 +962,7 @@ class EEF_HelicopterControlComponent : ScriptComponent
                 }
                 else
                 {
-                    float touchdownAGL;
-                    if (isHover)
-                        touchdownAGL = m_fHoverAltitudeAGL;
-                    else
-                        touchdownAGL = FLIGHT_TOUCHDOWN_AGL;
+                    float touchdownAGL = isHover ? m_fHoverAltitudeAGL : FLIGHT_TOUCHDOWN_AGL;
 
                     if (altAGL <= m_fPhysicsHandoffAGL)
                     {
@@ -1019,11 +981,7 @@ class EEF_HelicopterControlComponent : ScriptComponent
             case EEF_EFlightPhase.APPROACH_FLARE:
             {
                 bool isHover = (m_eLandingMode == EEF_EHelicopterControlLandingMode.HOVER_LANDING);
-                float touchdownAGL;
-                if (isHover)
-                    touchdownAGL = m_fHoverAltitudeAGL;
-                else
-                    touchdownAGL = FLIGHT_TOUCHDOWN_AGL;
+                float touchdownAGL = isHover ? m_fHoverAltitudeAGL : FLIGHT_TOUCHDOWN_AGL;
 
                 if (altAGL <= touchdownAGL && wpHorizDist < m_fWaypointArrivalTolerance)
                 {
@@ -1034,18 +992,16 @@ class EEF_HelicopterControlComponent : ScriptComponent
             }
 
             case EEF_EFlightPhase.HOVER_HOLD:
-                // Hover indefinitely. Departure triggered externally via TriggerFlyOff() (#2).
                 return;
         }
     }
 
-    //! Horizontal speed for the current phase.
     protected float ComputeDesiredHorizSpeed(float wpHorizDist)
     {
         switch (m_ePhase)
         {
             case EEF_EFlightPhase.TAKEOFF_VERTICAL:    return 0;
-            case EEF_EFlightPhase.TAKEOFF_TRANSITION:  return m_fCruiseSpeed * 0.4; // Gentle forward as we climb.
+            case EEF_EFlightPhase.TAKEOFF_TRANSITION:  return m_fCruiseSpeed * 0.4;
             case EEF_EFlightPhase.CRUISE:              return m_fCruiseSpeed;
             case EEF_EFlightPhase.APPROACH_BLEED:
             {
@@ -1055,8 +1011,6 @@ class EEF_HelicopterControlComponent : ScriptComponent
             }
             case EEF_EFlightPhase.APPROACH_DESCENT:
             {
-                // For hover landing, stop horizontal movement once over the LZ so the helicopter
-                // drops cleanly without passing through the waypoint and switchbacking.
                 if (m_eLandingMode == EEF_EHelicopterControlLandingMode.HOVER_LANDING && wpHorizDist < m_fWaypointArrivalTolerance)
                     return 0;
                 float descentFactor = Math.Clamp(wpHorizDist / FLIGHT_DESCENT_RANGE, 0.0, 1.0);
@@ -1067,14 +1021,13 @@ class EEF_HelicopterControlComponent : ScriptComponent
                     minSpeed = Math.Max(0.5, m_fCruiseSpeed * 0.05);
                 return Math.Max(minSpeed, FLIGHT_APPROACH_SPEED * 0.35 * descentFactor);
             }
-            case EEF_EFlightPhase.APPROACH_FLARE:           return 0;
-            case EEF_EFlightPhase.LANDED_PHASE:              return 0;
-            case EEF_EFlightPhase.HOVER_HOLD:               return 0;
+            case EEF_EFlightPhase.APPROACH_FLARE:  return 0;
+            case EEF_EFlightPhase.LANDED_PHASE:    return 0;
+            case EEF_EFlightPhase.HOVER_HOLD:      return 0;
         }
         return 0;
     }
 
-    //! Vertical speed for the current phase.
     protected float ComputeDesiredVertSpeed(float altAGL, vector here, vector waypoint, bool isFinalWaypoint, float wpHorizDist)
     {
         switch (m_ePhase)
@@ -1083,15 +1036,12 @@ class EEF_HelicopterControlComponent : ScriptComponent
                 return FLIGHT_TAKEOFF_CLIMB_RATE;
 
             case EEF_EFlightPhase.TAKEOFF_TRANSITION:
-                // Continue climbing, but ease as we approach cruise altitude.
                 if (altAGL >= m_fCruiseAltitudeAGL)
                     return 0;
                 return FLIGHT_TAKEOFF_CLIMB_RATE * Math.Min(1.0, (m_fCruiseAltitudeAGL - altAGL) / 10.0);
 
             case EEF_EFlightPhase.CRUISE:
             {
-                // Hold cruise altitude. Compute correction proportional to altitude error.
-                // While departing the LZ is behind us; use terrain under current position, not LZ.
                 float targetAlt;
                 if (isFinalWaypoint && m_eState != EEF_EHelicopterControlState.DEPARTING)
                     targetAlt = GetSurfaceHeightAt(waypoint[0], waypoint[2]) + m_fCruiseAltitudeAGL;
@@ -1104,11 +1054,6 @@ class EEF_HelicopterControlComponent : ScriptComponent
 
             case EEF_EFlightPhase.APPROACH_BLEED:
             {
-                // Create an exponential descent profile into the LZ.
-                // At FLIGHT_APPROACH_RANGE the helicopter remains at cruise altitude.
-                // As it closes in, altitude target decays rapidly toward a low approach altitude.
-                // For HOVER_LANDING the floor matches the APPROACH_DESCENT entry altitude so there
-                // is no discontinuous target jump at the phase boundary.
                 float wpGroundY = GetSurfaceHeightAt(waypoint[0], waypoint[2]);
                 float approachFloorAGL;
                 if (m_eLandingMode == EEF_EHelicopterControlLandingMode.HOVER_LANDING)
@@ -1124,9 +1069,6 @@ class EEF_HelicopterControlComponent : ScriptComponent
 
             case EEF_EFlightPhase.APPROACH_DESCENT:
             {
-                // Final descent profile. For HOVER_LANDING, approachFloorAGL is set well above
-                // hover altitude so the profile has a real gradient (floor == terminal = zero
-                // gradient, causing an instant dive). For FULL_LANDING the old 4m floor is kept.
                 float wpGroundY = GetSurfaceHeightAt(waypoint[0], waypoint[2]);
                 float terminalAGL;
                 float approachFloorAGL;
@@ -1144,7 +1086,6 @@ class EEF_HelicopterControlComponent : ScriptComponent
                 float targetAltAGL = terminalAGL + factor * (approachFloorAGL - terminalAGL);
                 float targetAlt = wpGroundY + targetAltAGL;
                 float altError = targetAlt - here[1];
-                // Limit descent rate close to hover altitude to prevent blow-through overshoot.
                 float maxDescent = -5.0;
                 if (m_eLandingMode == EEF_EHelicopterControlLandingMode.HOVER_LANDING && altAGL < terminalAGL + 4.0)
                     maxDescent = -1.5;
@@ -1159,7 +1100,6 @@ class EEF_HelicopterControlComponent : ScriptComponent
 
             case EEF_EFlightPhase.HOVER_HOLD:
             {
-                // Hold at configured hover altitude above the final waypoint ground level.
                 float wpGroundY = GetSurfaceHeightAt(waypoint[0], waypoint[2]);
                 float targetAlt = wpGroundY + m_fHoverAltitudeAGL;
                 float altError = targetAlt - here[1];
@@ -1169,12 +1109,8 @@ class EEF_HelicopterControlComponent : ScriptComponent
         return 0;
     }
 
-    //! Compute and apply attitude (pitch/roll/yaw) to match the helicopter's motion.
-    //! Pitch responds to forward acceleration. Roll responds to lateral acceleration.
-    //! Yaw aligns the nose with the desired horizontal direction.
-    protected void ApplyAttitude(IEntity owner, Physics phys, vector velocity, vector accel, vector desiredHorizDir, float timeSlice)
+    protected void ApplyAttitude(Physics phys, vector velocity, vector accel, vector desiredHorizDir, float timeSlice)
     {
-        // During landing shutdown, stop all attitude control to prevent unwanted heading changes.
         if (m_bLandingShutdown)
         {
             phys.SetAngularVelocity(vector.Zero);
@@ -1182,12 +1118,10 @@ class EEF_HelicopterControlComponent : ScriptComponent
         }
 
         vector mat[4];
-        owner.GetWorldTransform(mat);
-        vector heliRight = mat[0];
+        m_HeliEntity.GetWorldTransform(mat);
         vector heliUp = mat[1];
         vector heliForward = mat[2];
 
-        // Horizontal forward direction of helicopter.
         vector heliFwdFlat = Vector(heliForward[0], 0, heliForward[2]);
         if (heliFwdFlat.LengthSq() < 0.0001)
         {
@@ -1196,60 +1130,44 @@ class EEF_HelicopterControlComponent : ScriptComponent
         }
         heliFwdFlat.Normalize();
 
-        // Horizontal velocity direction (where we're going).
         vector horizVel = Vector(velocity[0], 0, velocity[2]);
         float horizSpeed = horizVel.Length();
 
-        // --- Desired yaw: align nose with the waypoint direction when available. ---
         vector desiredFwdFlat = heliFwdFlat;
         if (desiredHorizDir.LengthSq() > 0.0001)
-        {
             desiredFwdFlat = desiredHorizDir;
-        }
         else if (horizSpeed > 1.0)
-        {
             desiredFwdFlat = horizVel * (1.0 / horizSpeed);
-        }
 
-        // --- Desired pitch: tilt forward when accelerating forward ---
-        // Project acceleration onto helicopter forward axis.
         float forwardAccel = accel[0] * heliFwdFlat[0] + accel[2] * heliFwdFlat[2];
         float desiredPitch = Math.Clamp(-forwardAccel * FLIGHT_PITCH_PER_ACCEL, -FLIGHT_MAX_PITCH_RAD, FLIGHT_MAX_PITCH_RAD);
-        // Negative because tilting nose forward is a negative pitch in most conventions.
 
-        // --- Desired roll: bank into the turn ---
-        // Lateral accel = component of accel perpendicular to forward, in horizontal plane.
-        vector heliRightFlat = Vector(heliFwdFlat[2], 0, -heliFwdFlat[0]); // 90 degrees clockwise of forward (in horizontal plane)
+        vector heliRightFlat = Vector(heliFwdFlat[2], 0, -heliFwdFlat[0]);
         float lateralAccel = accel[0] * heliRightFlat[0] + accel[2] * heliRightFlat[2];
         float desiredRoll = Math.Clamp(-lateralAccel * FLIGHT_ROLL_PER_LATERAL, -FLIGHT_MAX_ROLL_RAD, FLIGHT_MAX_ROLL_RAD);
-        // Negative because right-positive lateral accel = bank right = negative roll in most conventions.
 
-        // --- Build desired up vector from desired pitch and roll, around desired yaw ---
-        // Start from world up, apply roll around desired forward, then pitch around desired right.
         vector desiredRight = Vector(desiredFwdFlat[2], 0, -desiredFwdFlat[0]);
         vector desiredUp = vector.Up;
         desiredUp = EEF_RotateAroundAxis(desiredUp, desiredFwdFlat, desiredRoll);
         desiredUp = EEF_RotateAroundAxis(desiredUp, desiredRight, desiredPitch);
         desiredUp.Normalize();
 
-        // --- Combine attitude corrections via angular velocity ---
         vector angVel = vector.Zero;
-        // Yaw correction.
         angVel = angVel + EEF_ComputeAngularVelocity(heliFwdFlat, desiredFwdFlat, FLIGHT_ATTITUDE_TIME_CONSTANT);
-        // Pitch + roll correction (combined into single up-vector tracking).
         angVel = angVel + EEF_ComputeAngularVelocity(heliUp, desiredUp, FLIGHT_ATTITUDE_TIME_CONSTANT);
 
         phys.SetAngularVelocity(angVel);
     }
 
-    protected void OnFlightArrived(IEntity owner)
+    protected void OnFlightArrived()
     {
+        m_eState = EEF_EHelicopterControlState.ARRIVING;
+        m_vLZOrigin = m_HeliEntity.GetOrigin();
+        m_OnLanded.Invoke();
+        DebugLog("Final waypoint reached. Firing OnLanded.");
+
         if (m_eLandingMode == EEF_EHelicopterControlLandingMode.HOVER_LANDING)
         {
-            m_eState = EEF_EHelicopterControlState.ARRIVING;
-            m_vLZOrigin = owner.GetOrigin();
-            DebugLog("Final waypoint reached. Hover landing active.");
-
             if (m_bEnableFlyOff && m_fDwellTime > 0)
             {
                 m_fDwellTimer = m_fDwellTime;
@@ -1267,32 +1185,28 @@ class EEF_HelicopterControlComponent : ScriptComponent
         }
     }
 
-    protected void OnRotorFailure(IEntity owner, string rotorName)
+    protected void OnRotorFailure(string rotorName)
     {
         Print(string.Format("[EEF HelicopterControl] WARNING: Rotor failure detected (%1). Releasing flight control.", rotorName), LogLevel.WARNING);
         m_bFlightTickRunning = false;
         m_bLandingShutdown   = false;
         m_bRotorForceApplied = false;
         m_eState = EEF_EHelicopterControlState.IDLE;
-        // Do NOT zero rotor force or call EngineStop — leave simulation state intact
-        // so native physics produces a realistic crash.
     }
 
     protected void OnVehicleDamageStateChanged(EDamageState state)
     {
         if (state == EDamageState.DESTROYED)
-            OnRotorFailure(GetOwner(), "vehicle destroyed");
+            OnRotorFailure("vehicle destroyed");
     }
 
-    //! Returns true when all spawned crew are dead. Returns false if no crew was configured
-    //! (no crew = no pilot dependency, flight continues normally).
     protected bool IsAllCrewDead()
     {
         bool hasCrew = (m_PilotEntity != null || m_CopilotEntity != null);
         if (!hasCrew)
             return false;
 
-        bool pilotDead  = !m_PilotEntity  || IsCrewMemberDead(m_PilotEntity);
+        bool pilotDead   = !m_PilotEntity   || IsCrewMemberDead(m_PilotEntity);
         bool copilotDead = !m_CopilotEntity || IsCrewMemberDead(m_CopilotEntity);
         return pilotDead && copilotDead;
     }
@@ -1313,34 +1227,45 @@ class EEF_HelicopterControlComponent : ScriptComponent
     // HELPERS
     // --------------------------------------------------------
 
-    protected void BuildWaypoints(IEntity owner)
+    protected void BuildWaypoints()
     {
         if (!m_aWaypoints)
             m_aWaypoints = new array<vector>();
 
         ClearWaypoints();
-        if (!ResolveConfiguredWaypoints(owner))
+        if (!ResolveConfiguredWaypoints())
         {
-            AddDefaultForwardWaypoint(owner);
+            AddDefaultForwardWaypoint();
             DebugLog("No configured waypoints found; added default forward waypoint.");
         }
     }
 
-    protected void AddDefaultForwardWaypoint(IEntity owner)
+    protected void AddDefaultForwardWaypoint()
     {
+        if (!m_HeliEntity)
+            return;
+
         vector mat[4];
-        owner.GetWorldTransform(mat);
+        m_HeliEntity.GetWorldTransform(mat);
         vector forward = Vector(mat[2][0], 0, mat[2][2]);
         if (forward.LengthSq() < 0.0001)
             forward = Vector(0, 0, 1);
         forward.Normalize();
 
-        vector here = owner.GetOrigin();
+        vector here = m_HeliEntity.GetOrigin();
         vector dest = here + forward * 150.0;
         float groundY = GetSurfaceHeightAt(dest[0], dest[2]);
         dest[1] = groundY + m_fCruiseAltitudeAGL;
 
         m_aWaypoints.Insert(dest);
+    }
+
+    protected void DespawnHelicopter()
+    {
+        if (!m_HeliEntity)
+            return;
+        SCR_EntityHelper.DeleteEntityAndChildren(m_HeliEntity);
+        m_HeliEntity = null;
     }
 
     protected static vector EEF_ComputeAngularVelocity(vector fromDir, vector toDir, float time)
@@ -1373,13 +1298,6 @@ class EEF_HelicopterControlComponent : ScriptComponent
             v[1] * c + (axis[2] * v[0] - axis[0] * v[2]) * s + axis[1] * dot * (1.0 - c),
             v[2] * c + (axis[0] * v[1] - axis[1] * v[0]) * s + axis[2] * dot * (1.0 - c)
         );
-    }
-
-    protected void DespawnHelicopter(IEntity owner)
-    {
-        if (!owner)
-            return;
-        SCR_EntityHelper.DeleteEntityAndChildren(owner);
     }
 
     protected void DebugLog(string message)
