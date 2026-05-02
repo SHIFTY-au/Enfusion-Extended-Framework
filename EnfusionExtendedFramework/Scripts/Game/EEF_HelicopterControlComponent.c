@@ -838,10 +838,17 @@ class EEF_HelicopterControlComponent : ScriptComponent
         else
             horizDir = vector.Zero;
 
-        if (horizDir.LengthSq() > 0.0001)
+        // Freeze the heading reference once inside the final approach zone so that if the
+        // helicopter overshoots the waypoint horizontally the reversed direction is never
+        // stored — without this guard the "freeze" below just uses the reversed direction.
+        bool isFinalApproachFreeze = isFinalWaypoint
+            && (m_ePhase == EEF_EFlightPhase.APPROACH_DESCENT || m_ePhase == EEF_EFlightPhase.HOVER_HOLD)
+            && wpHorizDist < 30.0;
+
+        if (horizDir.LengthSq() > 0.0001 && !isFinalApproachFreeze)
             m_vDesiredHorizDir = horizDir;
 
-        if (isFinalWaypoint && m_ePhase == EEF_EFlightPhase.APPROACH_DESCENT && wpHorizDist < 20.0 && m_vDesiredHorizDir.LengthSq() > 0.0001)
+        if (isFinalApproachFreeze && m_vDesiredHorizDir.LengthSq() > 0.0001)
             horizDir = m_vDesiredHorizDir;
 
         // During departure, ignore waypoint direction and fly the configured departure heading.
@@ -1032,6 +1039,10 @@ class EEF_HelicopterControlComponent : ScriptComponent
             }
             case EEF_EFlightPhase.APPROACH_DESCENT:
             {
+                // For hover landing, stop horizontal movement once over the LZ so the helicopter
+                // drops cleanly without passing through the waypoint and switchbacking.
+                if (m_eLandingMode == EEF_EHelicopterControlLandingMode.HOVER_LANDING && wpHorizDist < m_fWaypointArrivalTolerance)
+                    return 0;
                 float descentFactor = Math.Clamp(wpHorizDist / FLIGHT_DESCENT_RANGE, 0.0, 1.0);
                 float minSpeed = Math.Max(5.0, m_fCruiseSpeed * 0.2);
                 if (wpHorizDist < 20.0)
@@ -1086,25 +1097,36 @@ class EEF_HelicopterControlComponent : ScriptComponent
                 float expo = Math.Pow(2.0, -6.0 * progress);
                 float slopeAltitude = wpGroundY + approachFloorAGL + expo * (m_fCruiseAltitudeAGL - approachFloorAGL);
                 float altError = slopeAltitude - here[1];
-                return Math.Clamp(altError * 0.5, -3.0, 2.0);
+                return Math.Clamp(altError * 0.8, -5.0, 2.0);
             }
 
             case EEF_EFlightPhase.APPROACH_DESCENT:
             {
-                // Final descent from the low approach altitude into touchdown.
-                // Bug 2 fix: use hover altitude as terminal target in HOVER_LANDING mode.
+                // Final descent profile. For HOVER_LANDING, approachFloorAGL is set well above
+                // hover altitude so the profile has a real gradient (floor == terminal = zero
+                // gradient, causing an instant dive). For FULL_LANDING the old 4m floor is kept.
                 float wpGroundY = GetSurfaceHeightAt(waypoint[0], waypoint[2]);
-                float approachFloorAGL = 4.0;
-                float factor = Math.Clamp(wpHorizDist / FLIGHT_DESCENT_RANGE, 0.0, 1.0);
                 float terminalAGL;
+                float approachFloorAGL;
                 if (m_eLandingMode == EEF_EHelicopterControlLandingMode.HOVER_LANDING)
+                {
                     terminalAGL = m_fHoverAltitudeAGL;
+                    approachFloorAGL = Math.Max(m_fHoverAltitudeAGL * 3.0, 12.0);
+                }
                 else
+                {
                     terminalAGL = FLIGHT_TOUCHDOWN_AGL;
+                    approachFloorAGL = 4.0;
+                }
+                float factor = Math.Clamp(wpHorizDist / FLIGHT_DESCENT_RANGE, 0.0, 1.0);
                 float targetAltAGL = terminalAGL + factor * (approachFloorAGL - terminalAGL);
                 float targetAlt = wpGroundY + targetAltAGL;
                 float altError = targetAlt - here[1];
-                return Math.Clamp(altError * 0.7, -5.0, 1.0);
+                // Limit descent rate close to hover altitude to prevent blow-through overshoot.
+                float maxDescent = -5.0;
+                if (m_eLandingMode == EEF_EHelicopterControlLandingMode.HOVER_LANDING && altAGL < terminalAGL + 4.0)
+                    maxDescent = -1.5;
+                return Math.Clamp(altError * 0.7, maxDescent, 1.0);
             }
 
             case EEF_EFlightPhase.APPROACH_FLARE:
