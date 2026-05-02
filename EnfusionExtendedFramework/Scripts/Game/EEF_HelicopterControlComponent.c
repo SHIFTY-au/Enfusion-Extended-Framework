@@ -106,6 +106,7 @@ class EEF_HelicopterControlComponent : ScriptComponent
     // a smooth bank-into-turn feel rather than aiming straight at the next discrete waypoint.
     protected ref array<vector> m_aSplinePoints;
     protected VehicleHelicopterSimulation m_HelicopterSim;
+    protected SCR_DamageManagerComponent m_DamageManager;
     //! Highest spline index the helicopter has reached. The look-ahead search will not
     //! search backwards from this point, preventing the controller from chasing earlier
     //! waypoints once the helicopter has progressed past them.
@@ -129,6 +130,7 @@ class EEF_HelicopterControlComponent : ScriptComponent
     // the helicopter banks into turns - smaller = sharper, larger = smoother and slower.
     protected const float SPLINE_LOOKAHEAD_DISTANCE = 60.0;
     protected const float FLIGHT_ROTOR_FAILURE_RPM_THRESHOLD = 10.0;
+    protected const float FLIGHT_DAMAGE_RELEASE_THRESHOLD = 0.4; //! Release control at 40% health remaining (60% damage taken).
 
     // --------------------------------------------------------
     // INITIALISATION
@@ -163,11 +165,11 @@ class EEF_HelicopterControlComponent : ScriptComponent
 
         GetGame().GetCallqueue().CallLater(SpawnCrew, 1000, false);
 
-        SCR_DamageManagerComponent damageManager = SCR_DamageManagerComponent.Cast(
+        m_DamageManager = SCR_DamageManagerComponent.Cast(
             owner.FindComponent(SCR_DamageManagerComponent)
         );
-        if (damageManager)
-            damageManager.GetOnDamageStateChanged().Insert(OnVehicleDamageStateChanged);
+        if (m_DamageManager)
+            m_DamageManager.GetOnDamageStateChanged().Insert(OnVehicleDamageStateChanged);
 
         DebugLog("Initialised.");
     }
@@ -673,6 +675,18 @@ class EEF_HelicopterControlComponent : ScriptComponent
                 OnRotorFailure(owner, "tail rotor");
                 return;
             }
+
+            if (m_DamageManager && m_DamageManager.GetHealthScaled() < FLIGHT_DAMAGE_RELEASE_THRESHOLD)
+            {
+                OnRotorFailure(owner, "critical damage");
+                return;
+            }
+
+            if (IsAllCrewDead())
+            {
+                OnRotorFailure(owner, "crew incapacitated");
+                return;
+            }
         }
 
         vector here = owner.GetOrigin();
@@ -1132,6 +1146,31 @@ class EEF_HelicopterControlComponent : ScriptComponent
     {
         if (state == EDamageState.DESTROYED)
             OnRotorFailure(GetOwner(), "vehicle destroyed");
+    }
+
+    //! Returns true when all spawned crew are dead. Returns false if no crew was configured
+    //! (no crew = no pilot dependency, flight continues normally).
+    protected bool IsAllCrewDead()
+    {
+        bool hasCrew = (m_PilotEntity != null || m_CopilotEntity != null);
+        if (!hasCrew)
+            return false;
+
+        bool pilotDead  = !m_PilotEntity  || IsCrewMemberDead(m_PilotEntity);
+        bool copilotDead = !m_CopilotEntity || IsCrewMemberDead(m_CopilotEntity);
+        return pilotDead && copilotDead;
+    }
+
+    protected bool IsCrewMemberDead(IEntity crew)
+    {
+        if (!crew)
+            return true;
+        SCR_CharacterDamageManagerComponent dmg = SCR_CharacterDamageManagerComponent.Cast(
+            crew.FindComponent(SCR_CharacterDamageManagerComponent)
+        );
+        if (!dmg)
+            return false;
+        return !dmg.IsAlive();
     }
 
     // --------------------------------------------------------
