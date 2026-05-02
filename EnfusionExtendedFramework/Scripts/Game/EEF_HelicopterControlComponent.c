@@ -37,7 +37,8 @@ enum EEF_EFlightPhase
     APPROACH_BLEED,      //! Within FLIGHT_APPROACH_RANGE of LZ - reduce speed to FLIGHT_APPROACH_SPEED, hold altitude.
     APPROACH_DESCENT,    //! Within FLIGHT_DESCENT_RANGE of LZ - begin descent.
     APPROACH_FLARE,      //! Within m_fPhysicsHandoffAGL of LZ - handoff to physics for natural touchdown.
-    LANDED_PHASE         //! Touchdown confirmed.
+    LANDED_PHASE,        //! Touchdown confirmed.
+    HOVER_HOLD           //! Hovering at m_fHoverAltitudeAGL indefinitely (HOVER_LANDING mode only).
 }
 
 [ComponentEditorProps(category: "EEF/Helicopter", description: "EEF Helicopter Control - native throttle/steering flight control for any helicopter.")]
@@ -607,7 +608,11 @@ class EEF_HelicopterControlComponent : ScriptComponent
         }
 
         // --- Phase detection ---
+        // Bug 4 fix: track phase before update so we can detect HOVER_HOLD entry and fire OnFlightArrived.
+        EEF_EFlightPhase phaseBefore = m_ePhase;
         UpdateFlightPhase(altAGL, wpHorizDist, isFinalWaypoint);
+        if (m_ePhase == EEF_EFlightPhase.HOVER_HOLD && phaseBefore != EEF_EFlightPhase.HOVER_HOLD)
+            OnFlightArrived(owner);
 
         // Check arrival on intermediate waypoints (advance), or on final (land).
         if (!isFinalWaypoint && wpHorizDist < m_fWaypointArrivalTolerance)
@@ -617,7 +622,9 @@ class EEF_HelicopterControlComponent : ScriptComponent
             return;
         }
 
-        if (m_ePhase == EEF_EFlightPhase.LANDED_PHASE)
+        // Bug 3 fix: only shut down on LANDED_PHASE for FULL_LANDING. HOVER_LANDING stabilises
+        // into HOVER_HOLD and keeps the engine running.
+        if (m_ePhase == EEF_EFlightPhase.LANDED_PHASE && m_eLandingMode != EEF_EHelicopterControlLandingMode.HOVER_LANDING)
         {
             if (!m_bLandingShutdown)
             {
@@ -752,21 +759,35 @@ class EEF_HelicopterControlComponent : ScriptComponent
             case EEF_EFlightPhase.APPROACH_DESCENT:
             {
                 bool isHover = (m_eLandingMode == EEF_EHelicopterControlLandingMode.HOVER_LANDING);
-                float touchdownAGL;
-                if (isHover)
-                    touchdownAGL = m_fHoverAltitudeAGL;
-                else
-                    touchdownAGL = FLIGHT_TOUCHDOWN_AGL;
 
-                if (altAGL <= m_fPhysicsHandoffAGL)
+                // Bug 1 fix: in hover mode the hover altitude is above the physics handoff threshold,
+                // so APPROACH_FLARE would fire first. Skip it entirely and go straight to HOVER_HOLD.
+                if (isHover && m_fHoverAltitudeAGL > m_fPhysicsHandoffAGL)
                 {
-                    m_ePhase = EEF_EFlightPhase.APPROACH_FLARE;
-                    DebugLog("Phase: APPROACH_DESCENT -> APPROACH_FLARE");
+                    if (altAGL <= m_fHoverAltitudeAGL + FLIGHT_VERTICAL_ARRIVAL_TOLERANCE && wpHorizDist < m_fWaypointArrivalTolerance)
+                    {
+                        m_ePhase = EEF_EFlightPhase.HOVER_HOLD;
+                        DebugLog("Phase: APPROACH_DESCENT -> HOVER_HOLD");
+                    }
                 }
-                else if (altAGL <= touchdownAGL && wpHorizDist < m_fWaypointArrivalTolerance)
+                else
                 {
-                    m_ePhase = EEF_EFlightPhase.LANDED_PHASE;
-                    DebugLog("Phase: APPROACH_DESCENT -> LANDED");
+                    float touchdownAGL;
+                    if (isHover)
+                        touchdownAGL = m_fHoverAltitudeAGL;
+                    else
+                        touchdownAGL = FLIGHT_TOUCHDOWN_AGL;
+
+                    if (altAGL <= m_fPhysicsHandoffAGL)
+                    {
+                        m_ePhase = EEF_EFlightPhase.APPROACH_FLARE;
+                        DebugLog("Phase: APPROACH_DESCENT -> APPROACH_FLARE");
+                    }
+                    else if (altAGL <= touchdownAGL && wpHorizDist < m_fWaypointArrivalTolerance)
+                    {
+                        m_ePhase = EEF_EFlightPhase.LANDED_PHASE;
+                        DebugLog("Phase: APPROACH_DESCENT -> LANDED");
+                    }
                 }
                 return;
             }
@@ -787,6 +808,10 @@ class EEF_HelicopterControlComponent : ScriptComponent
                 }
                 return;
             }
+
+            case EEF_EFlightPhase.HOVER_HOLD:
+                // Hover indefinitely. Departure triggered externally via TriggerFlyOff() (#2).
+                return;
         }
     }
 
@@ -816,6 +841,7 @@ class EEF_HelicopterControlComponent : ScriptComponent
             }
             case EEF_EFlightPhase.APPROACH_FLARE:           return 0;
             case EEF_EFlightPhase.LANDED_PHASE:              return 0;
+            case EEF_EFlightPhase.HOVER_HOLD:               return 0;
         }
         return 0;
     }
@@ -865,11 +891,16 @@ class EEF_HelicopterControlComponent : ScriptComponent
             case EEF_EFlightPhase.APPROACH_DESCENT:
             {
                 // Final descent from the low approach altitude into touchdown.
-                // Steeper profile: target 4m at 100m away, 0.5m at 0m.
+                // Bug 2 fix: use hover altitude as terminal target in HOVER_LANDING mode.
                 float wpGroundY = GetSurfaceHeightAt(waypoint[0], waypoint[2]);
                 float approachFloorAGL = 4.0;
                 float factor = Math.Clamp(wpHorizDist / FLIGHT_DESCENT_RANGE, 0.0, 1.0);
-                float targetAltAGL = FLIGHT_TOUCHDOWN_AGL + factor * (approachFloorAGL - FLIGHT_TOUCHDOWN_AGL);
+                float terminalAGL;
+                if (m_eLandingMode == EEF_EHelicopterControlLandingMode.HOVER_LANDING)
+                    terminalAGL = m_fHoverAltitudeAGL;
+                else
+                    terminalAGL = FLIGHT_TOUCHDOWN_AGL;
+                float targetAltAGL = terminalAGL + factor * (approachFloorAGL - terminalAGL);
                 float targetAlt = wpGroundY + targetAltAGL;
                 float altError = targetAlt - here[1];
                 return Math.Clamp(altError * 0.7, -5.0, 1.0);
@@ -880,6 +911,15 @@ class EEF_HelicopterControlComponent : ScriptComponent
 
             case EEF_EFlightPhase.LANDED_PHASE:
                 return 0;
+
+            case EEF_EFlightPhase.HOVER_HOLD:
+            {
+                // Hold at configured hover altitude above the final waypoint ground level.
+                float wpGroundY = GetSurfaceHeightAt(waypoint[0], waypoint[2]);
+                float targetAlt = wpGroundY + m_fHoverAltitudeAGL;
+                float altError = targetAlt - here[1];
+                return Math.Clamp(altError * 0.7, -2.0, 2.0);
+            }
         }
         return 0;
     }
