@@ -131,7 +131,7 @@ class EEF_HelicopterInsertionComponent : ScriptComponent
         }
         DebugLog("OnHelicopterSpawned - spawning troop group.");
 
-        m_TroopGroup = SpawnTroopGroup(heli);
+        m_TroopGroup = SpawnTroopGroup(m_HeliEntity);
         if (!m_TroopGroup)
         {
             Print("[EEF HelicopterInsertion] ERROR: Failed to spawn troop group. Aborting insertion.", LogLevel.ERROR);
