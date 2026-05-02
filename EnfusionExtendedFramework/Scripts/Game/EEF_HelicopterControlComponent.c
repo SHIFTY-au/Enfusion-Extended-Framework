@@ -197,7 +197,7 @@ class EEF_HelicopterControlComponent : ScriptComponent
             m_PilotEntity = SpawnCrewMember(owner, m_sPilotPrefab, ECompartmentType.PILOT, "pilot");
 
         if (!m_sCopilotPrefab.IsEmpty())
-            m_CopilotEntity = SpawnCrewMember(owner, m_sCopilotPrefab, ECompartmentType.TURRET, "copilot");
+            m_CopilotEntity = SpawnCrewMember(owner, m_sCopilotPrefab, ECompartmentType.PILOT, "copilot");
     }
 
     protected IEntity SpawnCrewMember(IEntity owner, ResourceName prefab, ECompartmentType compartmentType, string role)
