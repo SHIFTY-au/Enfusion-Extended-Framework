@@ -25,6 +25,7 @@ enum EEF_EHelicopterControlState
     IDLE,
     FLYING,
     ARRIVING,
+    DEPARTING,
     LANDED
 }
 
@@ -86,6 +87,18 @@ class EEF_HelicopterControlComponent : ScriptComponent
     [Attribute("0", UIWidgets.CheckBox, "Print debug flight information to the server log.")]
     protected bool m_bDebugLog;
 
+    [Attribute("0", UIWidgets.CheckBox, "Enable fly-off and despawn after landing. HOVER_LANDING only; ignored for FULL_LANDING.")]
+    protected bool m_bEnableFlyOff;
+
+    [Attribute("180.0", UIWidgets.EditBox, "Seconds to hover at LZ before departing. Set to 0 to disable auto-departure and wait for TriggerFlyOff() instead.")]
+    protected float m_fDwellTime;
+
+    [Attribute("0.0", UIWidgets.EditBox, "World-space departure heading in degrees (0 = north, 90 = east).")]
+    protected float m_fDepartureHeadingDeg;
+
+    [Attribute("1500.0", UIWidgets.EditBox, "Horizontal distance from LZ in metres at which the entity is deleted after fly-off.")]
+    protected float m_fDespawnDistance;
+
     [Attribute("", UIWidgets.ResourceNamePicker, "Prefab path for the pilot character. Leave empty to spawn no pilot.", "et")]
     protected ResourceName m_sPilotPrefab;
 
@@ -115,6 +128,9 @@ class EEF_HelicopterControlComponent : ScriptComponent
     protected float m_fStatusLogTimer;
     protected IEntity m_PilotEntity;
     protected IEntity m_CopilotEntity;
+    protected vector m_vLZOrigin;      //! LZ position recorded on ARRIVING; used for DEPARTING despawn distance.
+    protected float m_fDwellTimer;     //! Remaining dwell seconds; counts down when m_bDwellActive.
+    protected bool m_bDwellActive;     //! True while the dwell countdown is running.
 
     // --------------------------------------------------------
     // CONSTANTS
@@ -316,6 +332,8 @@ class EEF_HelicopterControlComponent : ScriptComponent
         m_bEngineStarted = true;
         m_bRotorForceApplied = false;
         m_bLandingShutdown = false;
+        m_bDwellActive = false;
+        m_fDwellTimer = 0;
 
         m_HelicopterSim.EngineStart();
         m_HelicopterSim.SetThrottle(FLIGHT_CONSTANT_THROTTLE);
@@ -389,6 +407,22 @@ class EEF_HelicopterControlComponent : ScriptComponent
         vector pos = ent.GetOrigin();
         StartFlightToPosition(owner, pos);
         return m_bFlightTickRunning;
+    }
+
+    //! Trigger an immediate fly-off from the LZ. Only valid when state is ARRIVING (HOVER_LANDING mode).
+    //! Called automatically by the dwell timer, or externally by other modules to signal departure.
+    void TriggerFlyOff()
+    {
+        if (!Replication.IsServer())
+            return;
+
+        if (m_eState != EEF_EHelicopterControlState.ARRIVING)
+            return;
+
+        m_bDwellActive = false;
+        m_eState = EEF_EHelicopterControlState.DEPARTING;
+        m_ePhase = EEF_EFlightPhase.TAKEOFF_TRANSITION;
+        DebugLog("TriggerFlyOff: departing LZ, beginning climb-while-turning fly-off.");
     }
 
     // --------------------------------------------------------
@@ -735,6 +769,32 @@ class EEF_HelicopterControlComponent : ScriptComponent
         if (m_ePhase == EEF_EFlightPhase.HOVER_HOLD && phaseBefore != EEF_EFlightPhase.HOVER_HOLD)
             OnFlightArrived(owner);
 
+        // Dwell countdown: tick while hovering at the LZ, trigger fly-off on expiry.
+        if (m_bDwellActive && m_eState == EEF_EHelicopterControlState.ARRIVING)
+        {
+            m_fDwellTimer -= timeSlice;
+            if (m_fDwellTimer <= 0)
+            {
+                m_bDwellActive = false;
+                TriggerFlyOff();
+            }
+        }
+
+        // Despawn check: delete entity once far enough from the LZ while departing.
+        if (m_eState == EEF_EHelicopterControlState.DEPARTING)
+        {
+            float dx = here[0] - m_vLZOrigin[0];
+            float dz = here[2] - m_vLZOrigin[2];
+            float distFromLZ = Math.Sqrt(dx * dx + dz * dz);
+            if (distFromLZ >= m_fDespawnDistance)
+            {
+                DebugLog(string.Format("Despawn distance reached (%.0fm from LZ). Scheduling entity deletion.", distFromLZ));
+                m_bFlightTickRunning = false;
+                GetGame().GetCallqueue().CallLater(DespawnHelicopter, 0, false, owner);
+                return;
+            }
+        }
+
         // Check arrival on intermediate waypoints (advance), or on final (land).
         if (!isFinalWaypoint && wpHorizDist < m_fWaypointArrivalTolerance)
         {
@@ -783,6 +843,14 @@ class EEF_HelicopterControlComponent : ScriptComponent
 
         if (isFinalWaypoint && m_ePhase == EEF_EFlightPhase.APPROACH_DESCENT && wpHorizDist < 20.0 && m_vDesiredHorizDir.LengthSq() > 0.0001)
             horizDir = m_vDesiredHorizDir;
+
+        // During departure, ignore waypoint direction and fly the configured departure heading.
+        if (m_eState == EEF_EHelicopterControlState.DEPARTING)
+        {
+            float headingRad = m_fDepartureHeadingDeg * (Math.PI / 180.0);
+            horizDir = Vector(Math.Sin(headingRad), 0, Math.Cos(headingRad));
+            m_vDesiredHorizDir = horizDir;
+        }
 
         float desiredHorizSpeed = ComputeDesiredHorizSpeed(wpHorizDist);
         float desiredVertSpeed = ComputeDesiredVertSpeed(altAGL, here, waypoint, isFinalWaypoint, wpHorizDist);
@@ -835,6 +903,18 @@ class EEF_HelicopterControlComponent : ScriptComponent
     //! Determine which flight phase we should be in based on altitude and distance to LZ.
     protected void UpdateFlightPhase(float altAGL, float wpHorizDist, bool isFinalWaypoint)
     {
+        // While departing, only the climb-to-cruise transition is relevant.
+        // Approach/descent phases must not fire — the helicopter is flying away from the LZ.
+        if (m_eState == EEF_EHelicopterControlState.DEPARTING)
+        {
+            if (m_ePhase == EEF_EFlightPhase.TAKEOFF_TRANSITION && altAGL >= m_fCruiseAltitudeAGL - FLIGHT_VERTICAL_ARRIVAL_TOLERANCE)
+            {
+                m_ePhase = EEF_EFlightPhase.CRUISE;
+                DebugLog("Phase: TAKEOFF_TRANSITION -> CRUISE (departing)");
+            }
+            return;
+        }
+
         switch (m_ePhase)
         {
             case EEF_EFlightPhase.TAKEOFF_VERTICAL:
@@ -984,10 +1064,10 @@ class EEF_HelicopterControlComponent : ScriptComponent
             case EEF_EFlightPhase.CRUISE:
             {
                 // Hold cruise altitude. Compute correction proportional to altitude error.
-                float wpGroundY = GetSurfaceHeightAt(waypoint[0], waypoint[2]);
+                // While departing the LZ is behind us; use terrain under current position, not LZ.
                 float targetAlt;
-                if (isFinalWaypoint)
-                    targetAlt = wpGroundY + m_fCruiseAltitudeAGL;
+                if (isFinalWaypoint && m_eState != EEF_EHelicopterControlState.DEPARTING)
+                    targetAlt = GetSurfaceHeightAt(waypoint[0], waypoint[2]) + m_fCruiseAltitudeAGL;
                 else
                     targetAlt = GetSurfaceHeightAt(here[0], here[2]) + m_fCruiseAltitudeAGL;
 
@@ -1120,14 +1200,26 @@ class EEF_HelicopterControlComponent : ScriptComponent
 
     protected void OnFlightArrived(IEntity owner)
     {
-        // Note: Full landing shutdown is now handled in TickFlightController's landing shutdown sequence.
-        // This method is kept for potential future use (e.g., event callbacks).
-
         if (m_eLandingMode == EEF_EHelicopterControlLandingMode.HOVER_LANDING)
         {
-            // Hover landing: maintain hover altitude on final waypoint indefinitely.
             m_eState = EEF_EHelicopterControlState.ARRIVING;
+            m_vLZOrigin = owner.GetOrigin();
             DebugLog("Final waypoint reached. Hover landing active.");
+
+            if (m_bEnableFlyOff && m_fDwellTime > 0)
+            {
+                m_fDwellTimer = m_fDwellTime;
+                m_bDwellActive = true;
+                DebugLog(string.Format("Dwell timer started: %.0fs before fly-off.", m_fDwellTime));
+            }
+            else if (m_bEnableFlyOff)
+            {
+                DebugLog("Fly-off enabled with dwell 0 — waiting for TriggerFlyOff() call.");
+            }
+        }
+        else if (m_bEnableFlyOff)
+        {
+            Print("[EEF HelicopterControl] WARNING: m_bEnableFlyOff is set but landing mode is FULL_LANDING. Fly-off requires HOVER_LANDING. Ignoring.", LogLevel.WARNING);
         }
     }
 
@@ -1237,6 +1329,13 @@ class EEF_HelicopterControlComponent : ScriptComponent
             v[1] * c + (axis[2] * v[0] - axis[0] * v[2]) * s + axis[1] * dot * (1.0 - c),
             v[2] * c + (axis[0] * v[1] - axis[1] * v[0]) * s + axis[2] * dot * (1.0 - c)
         );
+    }
+
+    protected void DespawnHelicopter(IEntity owner)
+    {
+        if (!owner)
+            return;
+        SCR_EntityHelper.DeleteEntityAndChildren(owner);
     }
 
     protected void DebugLog(string message)
