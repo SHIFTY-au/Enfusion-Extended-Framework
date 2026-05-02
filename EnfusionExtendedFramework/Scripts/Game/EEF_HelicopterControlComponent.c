@@ -513,7 +513,6 @@ class EEF_HelicopterControlComponent : ScriptComponent
     protected const float FLIGHT_MAX_ROLL_RAD = 0.4;             //! Max bank angle (~23 degrees).
     protected const float FLIGHT_PITCH_PER_ACCEL = 0.04;         //! Radians of pitch per m/s^2 acceleration.
     protected const float FLIGHT_ROLL_PER_LATERAL = 0.06;        //! Radians of roll per m/s^2 lateral accel.
-    protected const float FLIGHT_CRUISE_NOSE_DOWN_RAD = 0.12;    //! ~7 degrees nose-down bias at full cruise speed.
     protected const float FLIGHT_CONSTANT_THROTTLE = 0.8;        //! Throttle held constant for engine/rotor visuals.
     protected const float FLIGHT_TOUCHDOWN_AGL = 0.5;             //! AGL below which we consider the helicopter landed.
 
@@ -967,20 +966,11 @@ class EEF_HelicopterControlComponent : ScriptComponent
             desiredFwdFlat = horizVel * (1.0 / horizSpeed);
         }
 
-        // --- Desired pitch: tilt forward when accelerating forward, with speed-proportional cruise bias ---
+        // --- Desired pitch: tilt forward when accelerating forward ---
         // Project acceleration onto helicopter forward axis.
         float forwardAccel = accel[0] * heliFwdFlat[0] + accel[2] * heliFwdFlat[2];
-        // Baseline nose-down only during CRUISE. Applying it during approach phases would cancel
-        // the deceleration-induced nose-up and also tilt the rotor forward (reducing vertical lift),
-        // causing the altitude controller to over-correct upward and produce a too-high approach path.
-        float basePitch = 0;
-        if (m_ePhase == EEF_EFlightPhase.CRUISE)
-        {
-            float speedRatio = Math.Clamp(horizSpeed / m_fCruiseSpeed, 0.0, 1.0);
-            float speedTaper = Math.Clamp(horizSpeed / 3.0, 0.0, 1.0);
-            basePitch = -speedRatio * speedTaper * FLIGHT_CRUISE_NOSE_DOWN_RAD;
-        }
-        float desiredPitch = Math.Clamp(basePitch + (-forwardAccel * FLIGHT_PITCH_PER_ACCEL), -FLIGHT_MAX_PITCH_RAD, FLIGHT_MAX_PITCH_RAD);
+        float desiredPitch = Math.Clamp(-forwardAccel * FLIGHT_PITCH_PER_ACCEL, -FLIGHT_MAX_PITCH_RAD, FLIGHT_MAX_PITCH_RAD);
+        // Negative because tilting nose forward is a negative pitch in most conventions.
 
         // --- Desired roll: bank into the turn ---
         // Lateral accel = component of accel perpendicular to forward, in horizontal plane.
