@@ -772,7 +772,11 @@ class EEF_HelicopterControlComponent : ScriptComponent
                 }
                 else
                 {
-                    float touchdownAGL = isHover ? m_fHoverAltitudeAGL : FLIGHT_TOUCHDOWN_AGL;
+                    float touchdownAGL;
+                    if (isHover)
+                        touchdownAGL = m_fHoverAltitudeAGL;
+                    else
+                        touchdownAGL = FLIGHT_TOUCHDOWN_AGL;
 
                     if (altAGL <= m_fPhysicsHandoffAGL)
                     {
@@ -891,7 +895,11 @@ class EEF_HelicopterControlComponent : ScriptComponent
                 float wpGroundY = GetSurfaceHeightAt(waypoint[0], waypoint[2]);
                 float approachFloorAGL = 4.0;
                 float factor = Math.Clamp(wpHorizDist / FLIGHT_DESCENT_RANGE, 0.0, 1.0);
-                float terminalAGL = (m_eLandingMode == EEF_EHelicopterControlLandingMode.HOVER_LANDING) ? m_fHoverAltitudeAGL : FLIGHT_TOUCHDOWN_AGL;
+                float terminalAGL;
+                if (m_eLandingMode == EEF_EHelicopterControlLandingMode.HOVER_LANDING)
+                    terminalAGL = m_fHoverAltitudeAGL;
+                else
+                    terminalAGL = FLIGHT_TOUCHDOWN_AGL;
                 float targetAltAGL = terminalAGL + factor * (approachFloorAGL - terminalAGL);
                 float targetAlt = wpGroundY + targetAltAGL;
                 float altError = targetAlt - here[1];
