@@ -897,6 +897,22 @@ class EEF_HelicopterControlComponent : ScriptComponent
         vector previousVelocity = m_vCurrentVelocity;
         m_vCurrentVelocity = m_vCurrentVelocity + (desiredVelocity - m_vCurrentVelocity) * velAlpha;
 
+        // Near hover altitude in HOVER_LANDING mode the 3s velocity TC is far too slow —
+        // residual descent momentum would carry the helicopter well below the target (e.g.
+        // through a building roof). Switch to a 0.05s TC for the vertical component so the
+        // helicopter decelerates proportionally to remaining distance and arrives gently.
+        // Then enforce a hard floor: once at or below hover altitude, downward velocity is
+        // zeroed immediately, making the target altitude a physical hard boundary.
+        if (m_eLandingMode == EEF_EHelicopterControlLandingMode.HOVER_LANDING
+            && altAGL < m_fHoverAltitudeAGL + 4.0
+            && (m_ePhase == EEF_EFlightPhase.APPROACH_DESCENT || m_ePhase == EEF_EFlightPhase.HOVER_HOLD))
+        {
+            float fastAlpha = Math.Clamp(timeSlice / 0.05, 0.0, 1.0);
+            m_vCurrentVelocity[1] = m_vCurrentVelocity[1] + (desiredVelocity[1] - m_vCurrentVelocity[1]) * fastAlpha;
+            if (altAGL <= m_fHoverAltitudeAGL && m_vCurrentVelocity[1] < 0)
+                m_vCurrentVelocity[1] = 0;
+        }
+
         // Apply velocity. SetVelocity overrides the engine's own velocity each tick.
         phys.SetVelocity(m_vCurrentVelocity);
 
@@ -1091,8 +1107,14 @@ class EEF_HelicopterControlComponent : ScriptComponent
                 // Create an exponential descent profile into the LZ.
                 // At FLIGHT_APPROACH_RANGE the helicopter remains at cruise altitude.
                 // As it closes in, altitude target decays rapidly toward a low approach altitude.
+                // For HOVER_LANDING the floor matches the APPROACH_DESCENT entry altitude so there
+                // is no discontinuous target jump at the phase boundary.
                 float wpGroundY = GetSurfaceHeightAt(waypoint[0], waypoint[2]);
-                float approachFloorAGL = Math.Max(FLIGHT_TOUCHDOWN_AGL, 8.0);
+                float approachFloorAGL;
+                if (m_eLandingMode == EEF_EHelicopterControlLandingMode.HOVER_LANDING)
+                    approachFloorAGL = Math.Max(m_fHoverAltitudeAGL * 3.0, 12.0);
+                else
+                    approachFloorAGL = Math.Max(FLIGHT_TOUCHDOWN_AGL, 8.0);
                 float progress = Math.Clamp((FLIGHT_APPROACH_RANGE - wpHorizDist) / FLIGHT_APPROACH_RANGE, 0.0, 1.0);
                 float expo = Math.Pow(2.0, -6.0 * progress);
                 float slopeAltitude = wpGroundY + approachFloorAGL + expo * (m_fCruiseAltitudeAGL - approachFloorAGL);
