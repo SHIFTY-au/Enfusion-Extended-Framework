@@ -106,6 +106,7 @@ class EEF_HelicopterControlComponent : ScriptComponent
     // a smooth bank-into-turn feel rather than aiming straight at the next discrete waypoint.
     protected ref array<vector> m_aSplinePoints;
     protected VehicleHelicopterSimulation m_HelicopterSim;
+    protected SCR_DamageManagerComponent m_DamageManager;
     //! Highest spline index the helicopter has reached. The look-ahead search will not
     //! search backwards from this point, preventing the controller from chasing earlier
     //! waypoints once the helicopter has progressed past them.
@@ -128,6 +129,8 @@ class EEF_HelicopterControlComponent : ScriptComponent
     // closest sample point to the helicopter's current position. Tunes how aggressively
     // the helicopter banks into turns - smaller = sharper, larger = smoother and slower.
     protected const float SPLINE_LOOKAHEAD_DISTANCE = 60.0;
+    protected const float FLIGHT_ROTOR_FAILURE_RPM_THRESHOLD = 10.0;
+    protected const float FLIGHT_DAMAGE_RELEASE_THRESHOLD = 0.4; //! Release control at 40% health remaining (60% damage taken).
 
     // --------------------------------------------------------
     // INITIALISATION
@@ -161,6 +164,12 @@ class EEF_HelicopterControlComponent : ScriptComponent
         SetEventMask(owner, EntityEvent.FRAME);
 
         GetGame().GetCallqueue().CallLater(SpawnCrew, 1000, false);
+
+        m_DamageManager = SCR_DamageManagerComponent.Cast(
+            owner.FindComponent(SCR_DamageManagerComponent)
+        );
+        if (m_DamageManager)
+            m_DamageManager.GetOnDamageStateChanged().Insert(OnVehicleDamageStateChanged);
 
         DebugLog("Initialised.");
     }
@@ -652,6 +661,34 @@ class EEF_HelicopterControlComponent : ScriptComponent
             DebugLog("Rotor force applied - flight control active.");
         }
 
+        // Rotor failure detection: once spool-up is done, a low RPM means the rotor has
+        // been destroyed. Release scripted control so native physics produces a crash.
+        if (m_bRotorForceApplied)
+        {
+            if (m_HelicopterSim.RotorGetRPM(0) < FLIGHT_ROTOR_FAILURE_RPM_THRESHOLD)
+            {
+                OnRotorFailure(owner, "main rotor");
+                return;
+            }
+            if (m_HelicopterSim.RotorGetRPM(1) < FLIGHT_ROTOR_FAILURE_RPM_THRESHOLD)
+            {
+                OnRotorFailure(owner, "tail rotor");
+                return;
+            }
+
+            if (m_DamageManager && m_DamageManager.GetHealthScaled() < FLIGHT_DAMAGE_RELEASE_THRESHOLD)
+            {
+                OnRotorFailure(owner, "critical damage");
+                return;
+            }
+
+            if (IsAllCrewDead())
+            {
+                OnRotorFailure(owner, "crew incapacitated");
+                return;
+            }
+        }
+
         vector here = owner.GetOrigin();
         float groundY = GetSurfaceHeightAt(here[0], here[2]);
         float altAGL = here[1] - groundY;
@@ -1085,13 +1122,55 @@ class EEF_HelicopterControlComponent : ScriptComponent
     {
         // Note: Full landing shutdown is now handled in TickFlightController's landing shutdown sequence.
         // This method is kept for potential future use (e.g., event callbacks).
-        
+
         if (m_eLandingMode == EEF_EHelicopterControlLandingMode.HOVER_LANDING)
         {
             // Hover landing: maintain hover altitude on final waypoint indefinitely.
             m_eState = EEF_EHelicopterControlState.ARRIVING;
             DebugLog("Final waypoint reached. Hover landing active.");
         }
+    }
+
+    protected void OnRotorFailure(IEntity owner, string rotorName)
+    {
+        Print(string.Format("[EEF HelicopterControl] WARNING: Rotor failure detected (%1). Releasing flight control.", rotorName), LogLevel.WARNING);
+        m_bFlightTickRunning = false;
+        m_bLandingShutdown   = false;
+        m_bRotorForceApplied = false;
+        m_eState = EEF_EHelicopterControlState.IDLE;
+        // Do NOT zero rotor force or call EngineStop — leave simulation state intact
+        // so native physics produces a realistic crash.
+    }
+
+    protected void OnVehicleDamageStateChanged(EDamageState state)
+    {
+        if (state == EDamageState.DESTROYED)
+            OnRotorFailure(GetOwner(), "vehicle destroyed");
+    }
+
+    //! Returns true when all spawned crew are dead. Returns false if no crew was configured
+    //! (no crew = no pilot dependency, flight continues normally).
+    protected bool IsAllCrewDead()
+    {
+        bool hasCrew = (m_PilotEntity != null || m_CopilotEntity != null);
+        if (!hasCrew)
+            return false;
+
+        bool pilotDead  = !m_PilotEntity  || IsCrewMemberDead(m_PilotEntity);
+        bool copilotDead = !m_CopilotEntity || IsCrewMemberDead(m_CopilotEntity);
+        return pilotDead && copilotDead;
+    }
+
+    protected bool IsCrewMemberDead(IEntity crew)
+    {
+        if (!crew)
+            return true;
+        SCR_CharacterDamageManagerComponent dmg = SCR_CharacterDamageManagerComponent.Cast(
+            crew.FindComponent(SCR_CharacterDamageManagerComponent)
+        );
+        if (!dmg)
+            return false;
+        return dmg.GetState() == EDamageState.DESTROYED;
     }
 
     // --------------------------------------------------------
