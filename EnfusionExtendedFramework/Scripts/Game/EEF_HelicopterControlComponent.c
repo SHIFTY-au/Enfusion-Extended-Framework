@@ -136,7 +136,8 @@ class EEF_HelicopterControlComponent : ScriptComponent
     protected ref ScriptInvoker m_OnLanded = new ScriptInvoker();
     protected ref ScriptInvoker m_OnDeparted = new ScriptInvoker();
 
-    //! Fired when the helicopter entity has been spawned. Callback signature: void Fn(IEntity heli).
+    //! Fired when the helicopter entity has been spawned. No parameters; retrieve entity via GetHelicopterEntity().
+    //! Callback signature: void Fn()
     ScriptInvoker GetOnHelicopterSpawned() { return m_OnHelicopterSpawned; }
     //! Fired when the helicopter reaches the LZ (HOVER_HOLD or LANDED_PHASE). No parameters.
     ScriptInvoker GetOnLanded() { return m_OnLanded; }
@@ -299,14 +300,18 @@ class EEF_HelicopterControlComponent : ScriptComponent
         if (m_DamageManager)
             m_DamageManager.GetOnDamageStateChanged().Insert(OnVehicleDamageStateChanged);
 
-        // Crew spawned after a short delay to allow the vehicle entity to fully initialise.
-        GetGame().GetCallqueue().CallLater(SpawnCrew, 500, false);
-
-        DebugLog("Helicopter spawned.");
-        m_OnHelicopterSpawned.Invoke(m_HeliEntity);
+        // Start engine immediately so rotors spool up while troops are being seated.
+        // Crew and the invoker are also deferred briefly to let the vehicle entity settle.
+        GetGame().GetCallqueue().CallLater(StartEngineAndNotify, 200, false);
 
         if (m_bAutoStart)
-            GetGame().GetCallqueue().CallLater(AutoStartFlight, 100, false);
+            GetGame().GetCallqueue().CallLater(AutoStartFlight, 500, false);
+    }
+
+    //! Returns the spawned helicopter entity, or null if SpawnHelicopter() has not been called yet.
+    IEntity GetHelicopterEntity()
+    {
+        return m_HeliEntity;
     }
 
     void StartFlight()
@@ -356,7 +361,8 @@ class EEF_HelicopterControlComponent : ScriptComponent
         m_bDwellActive = false;
         m_fDwellTimer = 0;
 
-        m_HelicopterSim.EngineStart();
+        if (!m_HelicopterSim.EngineIsOn())
+            m_HelicopterSim.EngineStart();
         m_HelicopterSim.SetThrottle(FLIGHT_CONSTANT_THROTTLE);
 
         int splineCount = 0;
@@ -417,8 +423,33 @@ class EEF_HelicopterControlComponent : ScriptComponent
     }
 
     // --------------------------------------------------------
-    // CREW
+    // CREW / ENGINE INIT
     // --------------------------------------------------------
+
+    //! Called via CallLater after spawn. Starts engine (so rotors spool up during boarding),
+    //! spawns crew, then fires OnHelicopterSpawned with no parameters.
+    //! Sibling components retrieve the entity via GetHelicopterEntity().
+    protected void StartEngineAndNotify()
+    {
+        if (!Replication.IsServer() || !m_HeliEntity)
+            return;
+
+        if (m_HelicopterSim)
+        {
+            m_HelicopterSim.EngineStart();
+            m_HelicopterSim.SetThrottle(FLIGHT_CONSTANT_THROTTLE);
+            // Zero rotor lift forces until StartFlight takes over — engine runs for audio/spool
+            // but the helicopter stays on the ground.
+            m_HelicopterSim.RotorSetForceScaleState(0, 0);
+            m_HelicopterSim.RotorSetForceScaleState(1, 0);
+            DebugLog("Engine started for spool-up.");
+        }
+
+        SpawnCrew();
+
+        DebugLog("Firing OnHelicopterSpawned.");
+        m_OnHelicopterSpawned.Invoke();
+    }
 
     protected void SpawnCrew()
     {

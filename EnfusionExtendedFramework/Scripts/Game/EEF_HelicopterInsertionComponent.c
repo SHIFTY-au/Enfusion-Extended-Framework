@@ -120,10 +120,15 @@ class EEF_HelicopterInsertionComponent : ScriptComponent
     // EVENT CALLBACKS (from EEF_HelicopterControlComponent)
     // --------------------------------------------------------
 
-    //! Fired by control component when the helicopter entity is ready.
-    protected void OnHelicopterSpawned(IEntity heli)
+    //! Fired by control component when the helicopter entity is ready (no parameters).
+    protected void OnHelicopterSpawned()
     {
-        m_HeliEntity = heli;
+        m_HeliEntity = m_ControlComponent.GetHelicopterEntity();
+        if (!m_HeliEntity)
+        {
+            Print("[EEF HelicopterInsertion] ERROR: OnHelicopterSpawned fired but GetHelicopterEntity() returned null.", LogLevel.ERROR);
+            return;
+        }
         DebugLog("OnHelicopterSpawned - spawning troop group.");
 
         m_TroopGroup = SpawnTroopGroup(heli);
