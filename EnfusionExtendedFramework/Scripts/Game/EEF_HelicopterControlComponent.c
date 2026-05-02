@@ -86,6 +86,12 @@ class EEF_HelicopterControlComponent : ScriptComponent
     [Attribute("0", UIWidgets.CheckBox, "Print debug flight information to the server log.")]
     protected bool m_bDebugLog;
 
+    [Attribute("", UIWidgets.ResourceNamePicker, "Prefab path for the pilot character. Leave empty to spawn no pilot.", "et")]
+    protected ResourceName m_sPilotPrefab;
+
+    [Attribute("", UIWidgets.ResourceNamePicker, "Prefab path for the copilot character. Leave empty to spawn no copilot.", "et")]
+    protected ResourceName m_sCopilotPrefab;
+
     // --------------------------------------------------------
     // RUNTIME STATE
     // --------------------------------------------------------
@@ -106,6 +112,8 @@ class EEF_HelicopterControlComponent : ScriptComponent
     protected int m_iSplineProgressIndex;
     //! Throttle for status debug logs (per-second).
     protected float m_fStatusLogTimer;
+    protected IEntity m_PilotEntity;
+    protected IEntity m_CopilotEntity;
 
     // --------------------------------------------------------
     // CONSTANTS
@@ -151,7 +159,29 @@ class EEF_HelicopterControlComponent : ScriptComponent
         }
 
         SetEventMask(owner, EntityEvent.FRAME);
+
+        SpawnCrew(owner);
+
         DebugLog("Initialised.");
+    }
+
+    override void OnDelete(IEntity owner)
+    {
+        if (Replication.IsServer())
+        {
+            if (m_PilotEntity)
+            {
+                SCR_EntityHelper.DeleteEntityAndChildren(m_PilotEntity);
+                m_PilotEntity = null;
+            }
+            if (m_CopilotEntity)
+            {
+                SCR_EntityHelper.DeleteEntityAndChildren(m_CopilotEntity);
+                m_CopilotEntity = null;
+            }
+        }
+
+        super.OnDelete(owner);
     }
 
     protected void AutoStartFlight(IEntity owner)
