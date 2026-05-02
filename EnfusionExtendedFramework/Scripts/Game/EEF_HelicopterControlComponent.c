@@ -344,9 +344,10 @@ class EEF_HelicopterControlComponent : ScriptComponent
         m_iSplineProgressIndex = 0;
         m_fStatusLogTimer = 0;
         m_eState = EEF_EHelicopterControlState.FLYING;
-        m_ePhase = (m_eSpawnMode == EEF_EHelicopterSpawnMode.IN_AIR)
-            ? EEF_EFlightPhase.CRUISE
-            : EEF_EFlightPhase.TAKEOFF_VERTICAL;
+        if (m_eSpawnMode == EEF_EHelicopterSpawnMode.IN_AIR)
+            m_ePhase = EEF_EFlightPhase.CRUISE;
+        else
+            m_ePhase = EEF_EFlightPhase.TAKEOFF_VERTICAL;
         m_vCurrentVelocity = vector.Zero;
         m_bFlightTickRunning = true;
         m_bEngineStarted = true;
@@ -962,7 +963,11 @@ class EEF_HelicopterControlComponent : ScriptComponent
                 }
                 else
                 {
-                    float touchdownAGL = isHover ? m_fHoverAltitudeAGL : FLIGHT_TOUCHDOWN_AGL;
+                    float touchdownAGL;
+                    if (isHover)
+                        touchdownAGL = m_fHoverAltitudeAGL;
+                    else
+                        touchdownAGL = FLIGHT_TOUCHDOWN_AGL;
 
                     if (altAGL <= m_fPhysicsHandoffAGL)
                     {
@@ -981,7 +986,11 @@ class EEF_HelicopterControlComponent : ScriptComponent
             case EEF_EFlightPhase.APPROACH_FLARE:
             {
                 bool isHover = (m_eLandingMode == EEF_EHelicopterControlLandingMode.HOVER_LANDING);
-                float touchdownAGL = isHover ? m_fHoverAltitudeAGL : FLIGHT_TOUCHDOWN_AGL;
+                float touchdownAGL;
+                if (isHover)
+                    touchdownAGL = m_fHoverAltitudeAGL;
+                else
+                    touchdownAGL = FLIGHT_TOUCHDOWN_AGL;
 
                 if (altAGL <= touchdownAGL && wpHorizDist < m_fWaypointArrivalTolerance)
                 {
