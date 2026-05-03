@@ -405,6 +405,14 @@ class EEF_HelicopterControlComponent : ScriptComponent
         m_aWaypoints.Insert(pos);
     }
 
+    //! Set the destination entity name so StartFlight() → ResolveConfiguredWaypoints()
+    //! can build the full waypoint list (intermediates then destination) as designed.
+    //! Call this before StartFlight() instead of ClearWaypoints()/AddWaypoint().
+    void SetDestinationEntityName(string name)
+    {
+        m_sDestinationEntityName = name;
+    }
+
     //! Trigger an immediate fly-off from the LZ. Only valid when state is ARRIVING (HOVER_LANDING mode).
     //! Called automatically by the dwell timer, or externally by sibling modules.
     void TriggerFlyOff()
@@ -438,10 +446,6 @@ class EEF_HelicopterControlComponent : ScriptComponent
         {
             m_HelicopterSim.EngineStart();
             m_HelicopterSim.SetThrottle(FLIGHT_CONSTANT_THROTTLE);
-            // Zero rotor lift forces until StartFlight takes over — engine runs for audio/spool
-            // but the helicopter stays on the ground.
-            m_HelicopterSim.RotorSetForceScaleState(0, 0);
-            m_HelicopterSim.RotorSetForceScaleState(1, 0);
             DebugLog("Engine started for spool-up.");
         }
 
