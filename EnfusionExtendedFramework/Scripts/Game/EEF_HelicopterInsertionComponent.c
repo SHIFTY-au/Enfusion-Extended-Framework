@@ -276,6 +276,7 @@ class EEF_HelicopterInsertionComponent : ScriptComponent
             IEntity character = agent.GetControlledEntity();
             if (character)
                 SCR_EntityHelper.DeleteEntityAndChildren(character);
+            m_TroopGroup.RemoveAgent(agent);
             DebugLog("Deleted overflow troop (no cargo slot available).");
         }
     }

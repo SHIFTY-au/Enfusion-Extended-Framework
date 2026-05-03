@@ -875,7 +875,7 @@ class EEF_HelicopterControlComponent : ScriptComponent
 
         if (m_eState == EEF_EHelicopterControlState.DEPARTING)
         {
-            float headingRad = m_fDepartureHeadingDeg * (Math.PI / 180.0);
+            float headingRad = m_fDepartureHeadingDeg * (Math.PI2 / 360.0);
             horizDir = Vector(Math.Sin(headingRad), 0, Math.Cos(headingRad));
             m_vDesiredHorizDir = horizDir;
         }
