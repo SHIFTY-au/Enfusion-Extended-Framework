@@ -379,7 +379,7 @@ class EEF_HelicopterControlComponent : ScriptComponent
         }
         else
         {
-            DebugLog(string.Format("Engine already on (%.1fs running). Spool-up wait reduced accordingly. RPM=%2, RPMTarget=%3.",
+            DebugLog(string.Format("Engine already on (%1s running). Spool-up wait reduced accordingly. RPM=%2, RPMTarget=%3.",
                 m_fEngineRunTime,
                 m_HelicopterSim.RotorGetRPM(0),
                 m_HelicopterSim.RotorGetRPMTarget(0)));
@@ -528,19 +528,19 @@ class EEF_HelicopterControlComponent : ScriptComponent
             m_HelicopterSim.EngineStart();
             m_HelicopterSim.SetThrottle(FLIGHT_CONSTANT_THROTTLE);
 
-            // Suppress native rotor lift during the pre-flight phase. Without this, the engine
-            // simulation generates rotor forces that lift the helicopter off the ground during
-            // boarding — before scripted flight control begins. Force scale is restored to 5.0
-            // in TickFlightController once rotor RPM reaches target (or the spool-up timeout fires).
-            m_HelicopterSim.RotorSetForceScaleState(0, 0);
-            m_HelicopterSim.RotorSetForceScaleState(1, 0);
+            // Do NOT call RotorSetForceScaleState(0, 0) here. A zero force scale suppresses
+            // the rotor RPM simulation — RPM stays at 0 with the engine on and throttle set.
+            // Leaving the force scale at the prefab default allows RPM to spin up during
+            // boarding, so the RPM check in TickFlightController gates flight correctly.
+            // EOnFrame calls SetVelocity(zero) each frame to prevent any native lift from
+            // moving the helicopter before scripted flight control takes over.
 
             // Nudge physics awake so the vehicle simulation can begin processing rotor dynamics.
             Physics heliPhys = m_HelicopterEntity.GetPhysics();
             if (heliPhys)
                 heliPhys.SetVelocity(vector.Zero);
 
-            DebugLog("Engine started at spawn — audio/visual startup will play during pre-flight. Rotor force suppressed until spool-up.");
+            DebugLog("Engine started at spawn — rotor will spin up during boarding.");
         }
 
         m_DamageManager = SCR_DamageManagerComponent.Cast(
@@ -856,13 +856,13 @@ class EEF_HelicopterControlComponent : ScriptComponent
             if (m_bDebugLog && m_fStatusLogTimer >= 1.0)
             {
                 m_fStatusLogTimer = 0;
-                Print(string.Format("[EEF HelicopterControl] Spooling up: rotor 0 RPM %1 / target %2 (engine on for %.1fs).", rotorRPM, rotorTargetRPM, m_fEngineRunTime));
+                Print(string.Format("[EEF HelicopterControl] Spooling up: rotor 0 RPM %1 / target %2 (engine on for %3s).", rotorRPM, rotorTargetRPM, m_fEngineRunTime));
             }
 
             if (m_fEngineRunTime < SPOOL_UP_TIMEOUT)
                 return;
 
-            DebugLog(string.Format("Spool-up timeout after %.1fs engine on — proceeding with scripted flight (RPM=%2, target=%3).", m_fEngineRunTime, rotorRPM, rotorTargetRPM));
+            DebugLog(string.Format("Spool-up timeout after %1s engine on — proceeding with scripted flight (RPM=%2, target=%3).", m_fEngineRunTime, rotorRPM, rotorTargetRPM));
         }
 
         // Apply rotor force once spool-up is complete (or timed out). Matches original behaviour:
