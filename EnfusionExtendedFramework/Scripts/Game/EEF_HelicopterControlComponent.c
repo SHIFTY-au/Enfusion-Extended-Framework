@@ -528,12 +528,19 @@ class EEF_HelicopterControlComponent : ScriptComponent
             m_HelicopterSim.EngineStart();
             m_HelicopterSim.SetThrottle(FLIGHT_CONSTANT_THROTTLE);
 
+            // Suppress native rotor lift during the pre-flight phase. Without this, the engine
+            // simulation generates rotor forces that lift the helicopter off the ground during
+            // boarding — before scripted flight control begins. Force scale is restored to 5.0
+            // in TickFlightController once rotor RPM reaches target (or the spool-up timeout fires).
+            m_HelicopterSim.RotorSetForceScaleState(0, 0);
+            m_HelicopterSim.RotorSetForceScaleState(1, 0);
+
             // Nudge physics awake so the vehicle simulation can begin processing rotor dynamics.
             Physics heliPhys = m_HelicopterEntity.GetPhysics();
             if (heliPhys)
                 heliPhys.SetVelocity(vector.Zero);
 
-            DebugLog("Engine started at spawn — audio/visual startup will play during pre-flight.");
+            DebugLog("Engine started at spawn — audio/visual startup will play during pre-flight. Rotor force suppressed until spool-up.");
         }
 
         m_DamageManager = SCR_DamageManagerComponent.Cast(
