@@ -797,7 +797,6 @@ class EEF_HelicopterControlComponent : ScriptComponent
     protected const float FLIGHT_ROLL_PER_LATERAL = 0.06;        //! Radians of roll per m/s^2 lateral accel.
     protected const float FLIGHT_CONSTANT_THROTTLE = 0.8;        //! Throttle held constant for engine/rotor visuals.
     protected const float FLIGHT_TOUCHDOWN_AGL = 0.5;             //! AGL below which we consider the helicopter landed.
-    protected const float SPOOL_UP_TIMEOUT = 8.0;                  //! Total engine-on seconds before bypassing RPM wait. Counts from SpawnHelicopter (not StartFlight), so boarding time is included.
 
     // Persistent state across ticks for smoothing.
     protected EEF_EFlightPhase m_ePhase = EEF_EFlightPhase.TAKEOFF_VERTICAL;
@@ -851,13 +850,9 @@ class EEF_HelicopterControlComponent : ScriptComponent
         float rotorRPM = m_HelicopterSim.RotorGetRPM(0);
         if (rotorTargetRPM <= 0 || rotorRPM < rotorTargetRPM * 0.9)
         {
-            // Keep physics awake so the vehicle simulation can process rotor spool-up.
-            // Script-spawned vehicles may sleep without active forces; sleeping physics
-            // won't drive rotor RPM even with EngineIsOn=1 and SetThrottle applied.
+            // Keep physics awake while waiting for spool-up.
             phys.SetVelocity(vector.Zero);
 
-            // m_fEngineRunTime is accumulated in EOnFrame from the moment EngineStart() was
-            // called (in SpawnHelicopter), so boarding time counts toward this budget.
             m_fStatusLogTimer += timeSlice;
             if (m_bDebugLog && m_fStatusLogTimer >= 1.0)
             {
@@ -865,14 +860,10 @@ class EEF_HelicopterControlComponent : ScriptComponent
                 Print(string.Format("[EEF HelicopterControl] Spooling up: rotor 0 RPM %1 / target %2 (engine on for %3s).", rotorRPM, rotorTargetRPM, m_fEngineRunTime));
             }
 
-            if (m_fEngineRunTime < SPOOL_UP_TIMEOUT)
-                return;
-
-            DebugLog(string.Format("Spool-up timeout after %1s engine on — proceeding with scripted flight (RPM=%2, target=%3).", m_fEngineRunTime, rotorRPM, rotorTargetRPM));
+            return;
         }
 
-        // Apply rotor force once spool-up is complete (or timed out). Matches original behaviour:
-        // no rotor force during startup prevents uncontrolled lift while the engine sound ramps up.
+        // Spool-up complete — apply rotor force and begin scripted flight control.
         if (!m_bRotorForceApplied)
         {
             m_HelicopterSim.RotorSetForceScaleState(0, 5.0);
