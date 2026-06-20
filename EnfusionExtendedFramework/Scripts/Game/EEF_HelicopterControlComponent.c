@@ -3,14 +3,17 @@
 // Enfusion Extended Framework
 //
 // Generic helicopter control layer for EEF. Attach this component
-// to a helicopter entity and use it to steer any helicopter prefab
+// to a SPAWN-POINT entity in the World Editor. The component will
+// spawn the configured helicopter prefab at runtime and drive it
 // with native `VehicleHelicopterSimulation`.
 //
 // This component is intentionally lightweight: it uses native
 // helicopter throttle and angular steering while providing a
 // reusable waypoint/landing control layer for future modules.
+// EEF_HelicopterInsertionComponent can attach alongside to manage
+// troop boarding and disembark.
 //
-// Attach to: a helicopter vehicle entity.
+// Attach to: a spawn-point entity (NOT the helicopter itself).
 // Runs on: SERVER (authority) only.
 // ============================================================
 
@@ -42,7 +45,7 @@ enum EEF_EFlightPhase
     HOVER_HOLD           //! Hovering at m_fHoverAltitudeAGL indefinitely (HOVER_LANDING mode only).
 }
 
-[ComponentEditorProps(category: "EEF/Helicopter", description: "EEF Helicopter Control - native throttle/steering flight control for any helicopter.")]
+[ComponentEditorProps(category: "EEF/Helicopter", description: "EEF Helicopter Control - spawns a helicopter prefab at runtime and drives it with native flight simulation. Attach to a spawn-point entity alongside EEF_HelicopterInsertionComponent.")]
 class EEF_HelicopterControlComponentClass : ScriptComponentClass {}
 
 class EEF_HelicopterControlComponent : ScriptComponent
@@ -105,6 +108,9 @@ class EEF_HelicopterControlComponent : ScriptComponent
     [Attribute("", UIWidgets.ResourceNamePicker, "Prefab path for the copilot character. Leave empty to spawn no copilot.", "et")]
     protected ResourceName m_sCopilotPrefab;
 
+    [Attribute("", UIWidgets.ResourcePickerThumbnail, "Helicopter prefab to spawn at runtime. Must have VehicleHelicopterSimulation.", "et")]
+    protected ResourceName m_sHelicopterPrefab;
+
     // --------------------------------------------------------
     // RUNTIME STATE
     // --------------------------------------------------------
@@ -132,6 +138,9 @@ class EEF_HelicopterControlComponent : ScriptComponent
     protected float m_fDwellTimer;     //! Remaining dwell seconds; counts down when m_bDwellActive.
     protected bool m_bDwellActive;     //! True while the dwell countdown is running.
     protected bool m_bEngineOnTracked; //! True once EngineIsOn() has been observed as true this flight; used for one-shot trace log.
+    protected IEntity m_HelicopterEntity;
+    protected ref ScriptInvoker m_OnHelicopterSpawned;
+    protected ref ScriptInvoker m_OnLanded;
 
     // --------------------------------------------------------
     // CONSTANTS
@@ -160,35 +169,18 @@ class EEF_HelicopterControlComponent : ScriptComponent
         if (!Replication.IsServer())
             return;
 
-        m_HelicopterSim = VehicleHelicopterSimulation.Cast(
-            owner.GetRootParent().FindComponent(VehicleHelicopterSimulation)
-        );
-
-        if (!m_HelicopterSim)
-        {
-            Print("[EEF HelicopterControl] WARNING: VehicleHelicopterSimulation not found. Flight control will be disabled.", LogLevel.WARNING);
-            return;
-        }
+        m_OnHelicopterSpawned = new ScriptInvoker();
+        m_OnLanded = new ScriptInvoker();
 
         if (!m_aWaypoints)
             m_aWaypoints = new array<vector>();
 
-        if (m_bAutoStart)
-        {
-            GetGame().GetCallqueue().CallLater(AutoStartFlight, 100, false, owner);
-        }
-
         SetEventMask(owner, EntityEvent.FRAME);
 
-        GetGame().GetCallqueue().CallLater(SpawnCrew, 1000, false);
+        if (m_bAutoStart)
+            GetGame().GetCallqueue().CallLater(AutoStartFlight, 100, false);
 
-        m_DamageManager = SCR_DamageManagerComponent.Cast(
-            owner.FindComponent(SCR_DamageManagerComponent)
-        );
-        if (m_DamageManager)
-            m_DamageManager.GetOnDamageStateChanged().Insert(OnVehicleDamageStateChanged);
-
-        DebugLog("Initialised.");
+        DebugLog("Initialised on spawn-point entity. Call SpawnHelicopter() to begin.");
     }
 
     override void OnDelete(IEntity owner)
@@ -205,6 +197,11 @@ class EEF_HelicopterControlComponent : ScriptComponent
                 SCR_EntityHelper.DeleteEntityAndChildren(m_CopilotEntity);
                 m_CopilotEntity = null;
             }
+            if (m_HelicopterEntity)
+            {
+                SCR_EntityHelper.DeleteEntityAndChildren(m_HelicopterEntity);
+                m_HelicopterEntity = null;
+            }
         }
 
         super.OnDelete(owner);
@@ -215,15 +212,14 @@ class EEF_HelicopterControlComponent : ScriptComponent
         if (!Replication.IsServer())
             return;
 
-        IEntity owner = GetOwner();
-        if (!owner)
+        if (!m_HelicopterEntity)
             return;
 
         if (!m_sPilotPrefab.IsEmpty())
-            m_PilotEntity = SpawnCrewMember(owner, m_sPilotPrefab, ECompartmentType.PILOT, "pilot");
+            m_PilotEntity = SpawnCrewMember(m_HelicopterEntity, m_sPilotPrefab, ECompartmentType.PILOT, "pilot");
 
         if (!m_sCopilotPrefab.IsEmpty())
-            m_CopilotEntity = SpawnCrewMember(owner, m_sCopilotPrefab, ECompartmentType.PILOT, "copilot");
+            m_CopilotEntity = SpawnCrewMember(m_HelicopterEntity, m_sCopilotPrefab, ECompartmentType.PILOT, "copilot");
     }
 
     protected IEntity SpawnCrewMember(IEntity owner, ResourceName prefab, ECompartmentType compartmentType, string role)
@@ -264,19 +260,21 @@ class EEF_HelicopterControlComponent : ScriptComponent
         return crew;
     }
 
-    protected void AutoStartFlight(IEntity owner)
+    protected void AutoStartFlight()
     {
         if (!Replication.IsServer())
             return;
 
         if (!GetGame() || !GetGame().GetWorld())
         {
-            GetGame().GetCallqueue().CallLater(AutoStartFlight, 100, false, owner);
+            GetGame().GetCallqueue().CallLater(AutoStartFlight, 100, false);
             return;
         }
 
-        BuildWaypoints(owner);
-        StartFlight(owner);
+        SpawnHelicopter();
+        if (m_HelicopterEntity)
+            BuildWaypoints(m_HelicopterEntity);
+        StartFlight();
     }
 
     override void EOnFrame(IEntity owner, float timeSlice)
@@ -284,15 +282,15 @@ class EEF_HelicopterControlComponent : ScriptComponent
         if (!Replication.IsServer())
             return;
 
-        if (m_bFlightTickRunning)
-            TickFlightController(owner, timeSlice);
+        if (m_bFlightTickRunning && m_HelicopterEntity)
+            TickFlightController(m_HelicopterEntity, timeSlice);
     }
 
     // --------------------------------------------------------
     // PUBLIC API
     // --------------------------------------------------------
 
-    void StartFlight(IEntity owner)
+    void StartFlight()
     {
         if (!Replication.IsServer())
             return;
@@ -302,13 +300,13 @@ class EEF_HelicopterControlComponent : ScriptComponent
 
         if (!m_HelicopterSim)
         {
-            Print("[EEF HelicopterControl] ERROR: Cannot start flight - no VehicleHelicopterSimulation.", LogLevel.ERROR);
+            Print("[EEF HelicopterControl] ERROR: Cannot start flight - helicopter not spawned or has no VehicleHelicopterSimulation.", LogLevel.ERROR);
             return;
         }
 
         if (m_aWaypoints.IsEmpty())
         {
-            if (!ResolveConfiguredWaypoints(owner) && m_aWaypoints.IsEmpty())
+            if (!ResolveConfiguredWaypoints(m_HelicopterEntity) && m_aWaypoints.IsEmpty())
             {
                 Print("[EEF Helicopter] ERROR: No waypoint available to begin flight.", LogLevel.ERROR);
                 return;
@@ -321,7 +319,7 @@ class EEF_HelicopterControlComponent : ScriptComponent
             return;
         }
 
-        BuildSpline(owner);
+        BuildSpline(m_HelicopterEntity);
 
         m_iCurrentWaypointIndex = 0;
         m_iSplineProgressIndex = 0;
@@ -358,7 +356,7 @@ class EEF_HelicopterControlComponent : ScriptComponent
         DebugLog(string.Format("Flight started. Waypoints: %1, spline samples: %2.", m_aWaypoints.Count(), splineCount));
     }
 
-    void StopFlight(IEntity owner)
+    void StopFlight()
     {
         if (!Replication.IsServer())
             return;
@@ -394,18 +392,18 @@ class EEF_HelicopterControlComponent : ScriptComponent
         m_aWaypoints.Insert(pos);
     }
 
-    bool StartFlightToPosition(IEntity owner, vector position)
+    bool StartFlightToPosition(vector position)
     {
         if (!Replication.IsServer())
             return false;
 
         ClearWaypoints();
         AddWaypoint(Vector(position[0], position[1], position[2]));
-        StartFlight(owner);
+        StartFlight();
         return m_bFlightTickRunning;
     }
 
-    bool StartFlightToEntity(IEntity owner, string entityName)
+    bool StartFlightToEntity(string entityName)
     {
         if (entityName.IsEmpty())
             return false;
@@ -415,7 +413,7 @@ class EEF_HelicopterControlComponent : ScriptComponent
             return false;
 
         vector pos = ent.GetOrigin();
-        StartFlightToPosition(owner, pos);
+        StartFlightToPosition(pos);
         return m_bFlightTickRunning;
     }
 
@@ -433,6 +431,82 @@ class EEF_HelicopterControlComponent : ScriptComponent
         m_eState = EEF_EHelicopterControlState.DEPARTING;
         m_ePhase = EEF_EFlightPhase.TAKEOFF_TRANSITION;
         DebugLog("TriggerFlyOff: departing LZ, beginning climb-while-turning fly-off.");
+    }
+
+    //! Spawn the configured helicopter prefab at this spawn-point entity's world transform.
+    //! Fires GetOnHelicopterSpawned() once the entity is ready. Safe to call only once.
+    void SpawnHelicopter()
+    {
+        if (!Replication.IsServer())
+            return;
+
+        if (m_HelicopterEntity)
+        {
+            DebugLog("SpawnHelicopter: helicopter already spawned, ignoring.");
+            return;
+        }
+
+        if (m_sHelicopterPrefab.IsEmpty())
+        {
+            Print("[EEF HelicopterControl] ERROR: Cannot spawn - no helicopter prefab configured.", LogLevel.ERROR);
+            return;
+        }
+
+        Resource res = Resource.Load(m_sHelicopterPrefab);
+        if (!res || !res.IsValid())
+        {
+            Print("[EEF HelicopterControl] ERROR: Could not load helicopter prefab: " + m_sHelicopterPrefab, LogLevel.ERROR);
+            return;
+        }
+
+        IEntity owner = GetOwner();
+        EntitySpawnParams spawnParams = new EntitySpawnParams();
+        spawnParams.TransformMode = ETransformMode.WORLD;
+        owner.GetWorldTransform(spawnParams.Transform);
+
+        m_HelicopterEntity = GetGame().SpawnEntityPrefab(res, GetGame().GetWorld(), spawnParams);
+        if (!m_HelicopterEntity)
+        {
+            Print("[EEF HelicopterControl] ERROR: Failed to spawn helicopter entity.", LogLevel.ERROR);
+            return;
+        }
+
+        m_HelicopterSim = VehicleHelicopterSimulation.Cast(
+            m_HelicopterEntity.GetRootParent().FindComponent(VehicleHelicopterSimulation)
+        );
+        if (!m_HelicopterSim)
+        {
+            Print("[EEF HelicopterControl] WARNING: Spawned helicopter has no VehicleHelicopterSimulation. Flight control disabled.", LogLevel.WARNING);
+        }
+
+        m_DamageManager = SCR_DamageManagerComponent.Cast(
+            m_HelicopterEntity.FindComponent(SCR_DamageManagerComponent)
+        );
+        if (m_DamageManager)
+            m_DamageManager.GetOnDamageStateChanged().Insert(OnVehicleDamageStateChanged);
+
+        GetGame().GetCallqueue().CallLater(SpawnCrew, 1000, false);
+
+        DebugLog("Helicopter spawned.");
+        m_OnHelicopterSpawned.Invoke();
+    }
+
+    //! Returns the spawned helicopter entity, or null if not yet spawned.
+    IEntity GetHelicopterEntity()
+    {
+        return m_HelicopterEntity;
+    }
+
+    //! ScriptInvoker fired (no parameters) when the helicopter entity has been spawned.
+    ScriptInvoker GetOnHelicopterSpawned()
+    {
+        return m_OnHelicopterSpawned;
+    }
+
+    //! ScriptInvoker fired (no parameters) when the helicopter reaches the landing zone.
+    ScriptInvoker GetOnLanded()
+    {
+        return m_OnLanded;
     }
 
     // --------------------------------------------------------
@@ -819,7 +893,7 @@ class EEF_HelicopterControlComponent : ScriptComponent
             {
                 DebugLog(string.Format("Despawn distance reached (%.0fm from LZ). Scheduling entity deletion.", distFromLZ));
                 m_bFlightTickRunning = false;
-                GetGame().GetCallqueue().CallLater(DespawnHelicopter, 0, false, owner);
+                GetGame().GetCallqueue().CallLater(DespawnHelicopter, 0, false);
                 return;
             }
         }
@@ -1273,6 +1347,9 @@ class EEF_HelicopterControlComponent : ScriptComponent
 
     protected void OnFlightArrived(IEntity owner)
     {
+        DebugLog("Flight arrived at final waypoint.");
+        m_OnLanded.Invoke();
+
         if (m_eLandingMode == EEF_EHelicopterControlLandingMode.HOVER_LANDING)
         {
             m_eState = EEF_EHelicopterControlState.ARRIVING;
@@ -1404,11 +1481,14 @@ class EEF_HelicopterControlComponent : ScriptComponent
         );
     }
 
-    protected void DespawnHelicopter(IEntity owner)
+    protected void DespawnHelicopter()
     {
-        if (!owner)
+        if (!m_HelicopterEntity)
             return;
-        SCR_EntityHelper.DeleteEntityAndChildren(owner);
+        IEntity toDelete = m_HelicopterEntity;
+        m_HelicopterEntity = null;
+        m_HelicopterSim = null;
+        SCR_EntityHelper.DeleteEntityAndChildren(toDelete);
     }
 
     protected void DebugLog(string message)
