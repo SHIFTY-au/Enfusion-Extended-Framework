@@ -138,6 +138,8 @@ class EEF_HelicopterControlComponent : ScriptComponent
     protected float m_fDwellTimer;     //! Remaining dwell seconds; counts down when m_bDwellActive.
     protected bool m_bDwellActive;     //! True while the dwell countdown is running.
     protected bool m_bEngineOnTracked; //! True once EngineIsOn() has been observed as true this flight; used for one-shot trace log.
+    protected bool m_bRotorHasSpunUp;  //! True once RotorGetRPM has been observed >= threshold; gates the rotor-failure check.
+    protected float m_fSpoolUpTimer;   //! Seconds elapsed waiting for rotor spool-up; used for timeout fallback.
     protected IEntity m_HelicopterEntity;
     protected ref ScriptInvoker m_OnHelicopterSpawned;
     protected ref ScriptInvoker m_OnLanded;
@@ -334,6 +336,8 @@ class EEF_HelicopterControlComponent : ScriptComponent
         m_bDwellActive = false;
         m_fDwellTimer = 0;
         m_bEngineOnTracked = false;
+        m_bRotorHasSpunUp = false;
+        m_fSpoolUpTimer = 0;
 
         DebugLog(string.Format("Pre-EngineStart: EngineIsOn=%1, RPM=%2, RPMTarget=%3.",
             m_HelicopterSim.EngineIsOn(),
@@ -346,8 +350,19 @@ class EEF_HelicopterControlComponent : ScriptComponent
             m_HelicopterSim.RotorGetRPM(0),
             m_HelicopterSim.RotorGetRPMTarget(0)));
 
-        // Keep rotor force at 0 until after spool-up. Rotor force is applied in TickFlightController
-        // after the engine RPM reaches target, preventing uncontrolled lift during startup.
+        // Activate the helicopter's physics so the vehicle simulation can process rotor dynamics.
+        // Script-spawned vehicles may enter a physics-sleep state immediately after spawn when
+        // no forces are applied; sleeping physics won't process rotor spool-up even with EngineStart().
+        Physics heliPhys = m_HelicopterEntity.GetPhysics();
+        if (heliPhys)
+            heliPhys.Activate();
+
+        // Apply rotor force scale immediately. We don't wait for RPM to reach target because
+        // on script-spawned helicopters without an AI vehicle driver the simulation may never
+        // drive RPM up — flight is entirely scripted via SetVelocity so native lift is unused.
+        m_HelicopterSim.RotorSetForceScaleState(0, 5.0);
+        m_HelicopterSim.RotorSetForceScaleState(1, 5.0);
+        m_bRotorForceApplied = true;
 
         // Startup status: confirms the configured waypoint set actually resolved.
         int splineCount = 0;
@@ -726,6 +741,7 @@ class EEF_HelicopterControlComponent : ScriptComponent
     protected const float FLIGHT_ROLL_PER_LATERAL = 0.06;        //! Radians of roll per m/s^2 lateral accel.
     protected const float FLIGHT_CONSTANT_THROTTLE = 0.8;        //! Throttle held constant for engine/rotor visuals.
     protected const float FLIGHT_TOUCHDOWN_AGL = 0.5;             //! AGL below which we consider the helicopter landed.
+    protected const float SPOOL_UP_TIMEOUT = 8.0;                  //! Seconds before bypassing spool-up wait; scripted SetVelocity flight doesn't need native RPM.
 
     // Persistent state across ticks for smoothing.
     protected EEF_EFlightPhase m_ePhase = EEF_EFlightPhase.TAKEOFF_VERTICAL;
@@ -779,38 +795,50 @@ class EEF_HelicopterControlComponent : ScriptComponent
         float rotorRPM = m_HelicopterSim.RotorGetRPM(0);
         if (rotorTargetRPM <= 0 || rotorRPM < rotorTargetRPM * 0.9)
         {
-            // Throttled debug log so we can see spool-up progress.
+            // Keep physics awake each tick so the vehicle simulation can process rotor spool-up.
+            // Sleeping physics (common on script-spawned vehicles with no active driver) won't
+            // drive rotor RPM even with EngineIsOn=1 and SetThrottle applied.
+            phys.Activate();
+
+            m_fSpoolUpTimer += timeSlice;
             m_fStatusLogTimer += timeSlice;
             if (m_bDebugLog && m_fStatusLogTimer >= 1.0)
             {
                 m_fStatusLogTimer = 0;
-                Print(string.Format("[EEF HelicopterControl] Spooling up: rotor 0 RPM %1 / target %2.", rotorRPM, rotorTargetRPM));
+                Print(string.Format("[EEF HelicopterControl] Spooling up: rotor 0 RPM %1 / target %2 (%3s elapsed).", rotorRPM, rotorTargetRPM, m_fSpoolUpTimer));
             }
-            return;
+
+            // Timeout: flight is driven by SetVelocity so native RPM isn't required. If the
+            // simulation hasn't driven RPM up after SPOOL_UP_TIMEOUT seconds, proceed anyway.
+            if (m_fSpoolUpTimer < SPOOL_UP_TIMEOUT)
+                return;
+
+            DebugLog(string.Format("Spool-up timeout after %1s — proceeding with scripted flight (RPM=%2, target=%3).", m_fSpoolUpTimer, rotorRPM, rotorTargetRPM));
         }
 
-        // Apply rotor force once spool-up is complete. This prevents uncontrolled lift during startup.
-        if (!m_bRotorForceApplied)
-        {
-            m_HelicopterSim.RotorSetForceScaleState(0, 5.0);
-            m_HelicopterSim.RotorSetForceScaleState(1, 5.0);
-            m_bRotorForceApplied = true;
-            DebugLog("Rotor force applied - flight control active.");
-        }
-
-        // Rotor failure detection: once spool-up is done, a low RPM means the rotor has
-        // been destroyed. Release scripted control so native physics produces a crash.
+        // Rotor failure detection: only active once we've confirmed the rotor was actually spinning
+        // at some point. This guards against false positives on script-spawned helicopters where
+        // RotorGetRPM may always return 0 (simulation not driven by an AI vehicle controller).
         if (m_bRotorForceApplied)
         {
-            if (m_HelicopterSim.RotorGetRPM(0) < FLIGHT_ROTOR_FAILURE_RPM_THRESHOLD)
+            if (!m_bRotorHasSpunUp)
             {
-                OnRotorFailure(owner, "main rotor");
-                return;
+                if (m_HelicopterSim.RotorGetRPM(0) >= FLIGHT_ROTOR_FAILURE_RPM_THRESHOLD)
+                    m_bRotorHasSpunUp = true;
             }
-            if (m_HelicopterSim.RotorGetRPM(1) < FLIGHT_ROTOR_FAILURE_RPM_THRESHOLD)
+
+            if (m_bRotorHasSpunUp)
             {
-                OnRotorFailure(owner, "tail rotor");
-                return;
+                if (m_HelicopterSim.RotorGetRPM(0) < FLIGHT_ROTOR_FAILURE_RPM_THRESHOLD)
+                {
+                    OnRotorFailure(owner, "main rotor");
+                    return;
+                }
+                if (m_HelicopterSim.RotorGetRPM(1) < FLIGHT_ROTOR_FAILURE_RPM_THRESHOLD)
+                {
+                    OnRotorFailure(owner, "tail rotor");
+                    return;
+                }
             }
 
             if (m_DamageManager && m_DamageManager.GetHealthScaled() < FLIGHT_DAMAGE_RELEASE_THRESHOLD)
