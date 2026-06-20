@@ -273,7 +273,10 @@ class EEF_HelicopterControlComponent : ScriptComponent
             return;
         }
 
-        SpawnHelicopter();
+        // Don't fire the OnHelicopterSpawned event — auto-start is for standalone use.
+        // Firing the event would trigger EEF_HelicopterInsertionComponent (if attached),
+        // causing troops to spawn and seat before the zone trigger has even fired.
+        SpawnHelicopter(false);
         if (m_HelicopterEntity)
             BuildWaypoints(m_HelicopterEntity);
         StartFlight();
@@ -355,7 +358,7 @@ class EEF_HelicopterControlComponent : ScriptComponent
         // no forces are applied; sleeping physics won't process rotor spool-up even with EngineStart().
         Physics heliPhys = m_HelicopterEntity.GetPhysics();
         if (heliPhys)
-            heliPhys.Activate();
+            heliPhys.SetVelocity(vector.Zero);
 
         // Apply rotor force scale immediately. We don't wait for RPM to reach target because
         // on script-spawned helicopters without an AI vehicle driver the simulation may never
@@ -449,8 +452,10 @@ class EEF_HelicopterControlComponent : ScriptComponent
     }
 
     //! Spawn the configured helicopter prefab at this spawn-point entity's world transform.
-    //! Fires GetOnHelicopterSpawned() once the entity is ready. Safe to call only once.
-    void SpawnHelicopter()
+    //! Fires GetOnHelicopterSpawned() once the entity is ready (unless fireEvent is false).
+    //! Pass fireEvent=false when spawning for standalone auto-start use so that
+    //! EEF_HelicopterInsertionComponent does not react and spawn troops prematurely.
+    void SpawnHelicopter(bool fireEvent = true)
     {
         if (!Replication.IsServer())
             return;
@@ -503,7 +508,8 @@ class EEF_HelicopterControlComponent : ScriptComponent
         GetGame().GetCallqueue().CallLater(SpawnCrew, 1000, false);
 
         DebugLog("Helicopter spawned.");
-        m_OnHelicopterSpawned.Invoke();
+        if (fireEvent)
+            m_OnHelicopterSpawned.Invoke();
     }
 
     //! Returns the spawned helicopter entity, or null if not yet spawned.
@@ -798,7 +804,7 @@ class EEF_HelicopterControlComponent : ScriptComponent
             // Keep physics awake each tick so the vehicle simulation can process rotor spool-up.
             // Sleeping physics (common on script-spawned vehicles with no active driver) won't
             // drive rotor RPM even with EngineIsOn=1 and SetThrottle applied.
-            phys.Activate();
+            phys.SetVelocity(vector.Zero);
 
             m_fSpoolUpTimer += timeSlice;
             m_fStatusLogTimer += timeSlice;
