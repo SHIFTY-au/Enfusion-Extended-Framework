@@ -300,12 +300,11 @@ class EEF_HelicopterControlComponent : ScriptComponent
         if (m_HelicopterSim && m_HelicopterSim.EngineIsOn() && !m_bLandingShutdown)
             m_fEngineRunTime += timeSlice;
 
-        // Pre-flight: assert engine and throttle state every frame so the AI pilot cannot
-        // override them. The seated AI character issues vehicle commands each frame that
-        // may reset throttle to 0, preventing rotor RPM from rising. Calling EngineStart()
-        // and SetThrottle() here after the AI's update keeps the engine in the correct
-        // state. RotorSetForceScaleState is also re-asserted in case it gets reset.
-        // SetVelocity(zero) holds the helicopter on the ground until spool-up completes.
+        // Pre-flight: assert engine, throttle, and rotor state every frame.
+        // SetVelocity is intentionally NOT called here — native physics (gravity +
+        // ground contact) keeps the helicopter grounded while rotor lift is near zero.
+        // As RPM rises, lift builds naturally and proportionally; the helicopter only
+        // begins to rise when the rotors are genuinely producing enough thrust.
         if (m_HelicopterEntity && !m_bFlightTickRunning && m_HelicopterSim)
         {
             if (!m_HelicopterSim.EngineIsOn())
@@ -313,9 +312,6 @@ class EEF_HelicopterControlComponent : ScriptComponent
             m_HelicopterSim.SetThrottle(FLIGHT_CONSTANT_THROTTLE);
             m_HelicopterSim.RotorSetForceScaleState(0, 5.0);
             m_HelicopterSim.RotorSetForceScaleState(1, 5.0);
-            Physics prePhys = m_HelicopterEntity.GetPhysics();
-            if (prePhys)
-                prePhys.SetVelocity(vector.Zero);
         }
 
         if (m_bFlightTickRunning && m_HelicopterEntity)
@@ -545,10 +541,14 @@ class EEF_HelicopterControlComponent : ScriptComponent
             m_HelicopterSim.RotorSetForceScaleState(0, 5.0);
             m_HelicopterSim.RotorSetForceScaleState(1, 5.0);
 
-            // Nudge physics awake so the vehicle simulation can begin processing rotor dynamics.
+            // Wake the physics body so the vehicle simulation begins processing immediately.
+            // A non-zero velocity is required — zero keeps the body in a frozen state that
+            // prevents rotor RPM from rising. The tiny value is immediately damped by gravity
+            // and ground contact; native physics then keeps the helicopter grounded while
+            // rotor lift builds proportionally with RPM.
             Physics heliPhys = m_HelicopterEntity.GetPhysics();
             if (heliPhys)
-                heliPhys.SetVelocity(vector.Zero);
+                heliPhys.SetVelocity(Vector(0, 0.1, 0));
 
             DebugLog("Engine started at spawn — rotor spinning up during boarding.");
         }
