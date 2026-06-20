@@ -528,19 +528,20 @@ class EEF_HelicopterControlComponent : ScriptComponent
             m_HelicopterSim.EngineStart();
             m_HelicopterSim.SetThrottle(FLIGHT_CONSTANT_THROTTLE);
 
-            // Do NOT call RotorSetForceScaleState(0, 0) here. A zero force scale suppresses
-            // the rotor RPM simulation — RPM stays at 0 with the engine on and throttle set.
-            // Leaving the force scale at the prefab default allows RPM to spin up during
-            // boarding, so the RPM check in TickFlightController gates flight correctly.
-            // EOnFrame calls SetVelocity(zero) each frame to prevent any native lift from
-            // moving the helicopter before scripted flight control takes over.
+            // Script-spawned helicopters default to force scale 0, which prevents the RPM
+            // simulation from running — RPM stays at 0 indefinitely even with engine on.
+            // Setting scale to 5.0 here starts the RPM simulation immediately at spawn so
+            // the rotor spools up during boarding. EOnFrame pins SetVelocity(zero) every
+            // frame while !m_bFlightTickRunning to prevent the helicopter from lifting off.
+            m_HelicopterSim.RotorSetForceScaleState(0, 5.0);
+            m_HelicopterSim.RotorSetForceScaleState(1, 5.0);
 
             // Nudge physics awake so the vehicle simulation can begin processing rotor dynamics.
             Physics heliPhys = m_HelicopterEntity.GetPhysics();
             if (heliPhys)
                 heliPhys.SetVelocity(vector.Zero);
 
-            DebugLog("Engine started at spawn — rotor will spin up during boarding.");
+            DebugLog("Engine started at spawn — rotor spinning up during boarding.");
         }
 
         m_DamageManager = SCR_DamageManagerComponent.Cast(
