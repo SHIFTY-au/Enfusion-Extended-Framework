@@ -1088,6 +1088,17 @@ class EEF_HelicopterControlComponent : ScriptComponent
         vector previousVelocity = m_vCurrentVelocity;
         m_vCurrentVelocity = m_vCurrentVelocity + (desiredVelocity - m_vCurrentVelocity) * velAlpha;
 
+        // During approach descent phases the 3s TC causes severe lag: the helicopter never
+        // ramps up to full descent rate until near the LZ, so it arrives still at cruise
+        // altitude and drops straight down. A 0.5s TC for the vertical component lets the
+        // helicopter start descending promptly and follow a natural glide slope. Horizontal
+        // smoothing keeps the 3s TC for cinematic speed bleed-off.
+        if (m_ePhase == EEF_EFlightPhase.APPROACH_BLEED || m_ePhase == EEF_EFlightPhase.APPROACH_DESCENT)
+        {
+            float approachVertAlpha = Math.Clamp(timeSlice / 0.5, 0.0, 1.0);
+            m_vCurrentVelocity[1] = m_vCurrentVelocity[1] + (desiredVelocity[1] - m_vCurrentVelocity[1]) * approachVertAlpha;
+        }
+
         // Near hover altitude in HOVER_LANDING mode the 3s velocity TC is far too slow —
         // residual descent momentum would carry the helicopter well below the target (e.g.
         // through a building roof). Switch to a 0.05s TC for the vertical component so the
