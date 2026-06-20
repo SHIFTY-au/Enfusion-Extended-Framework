@@ -555,8 +555,6 @@ class EEF_HelicopterControlComponent : ScriptComponent
         if (m_DamageManager)
             m_DamageManager.GetOnDamageStateChanged().Insert(OnVehicleDamageStateChanged);
 
-        GetGame().GetCallqueue().CallLater(SpawnCrew, 1000, false);
-
         DebugLog("Helicopter spawned.");
         if (fireEvent)
             m_OnHelicopterSpawned.Invoke();
@@ -863,13 +861,16 @@ class EEF_HelicopterControlComponent : ScriptComponent
             return;
         }
 
-        // Spool-up complete — apply rotor force and begin scripted flight control.
+        // Spool-up complete — seat crew, apply rotor force, and begin scripted flight control.
+        // Crew is seated here rather than at spawn so the AI pilot does not interfere with
+        // the engine simulation before the rotor reaches operating RPM.
         if (!m_bRotorForceApplied)
         {
+            SpawnCrew();
             m_HelicopterSim.RotorSetForceScaleState(0, 5.0);
             m_HelicopterSim.RotorSetForceScaleState(1, 5.0);
             m_bRotorForceApplied = true;
-            DebugLog("Rotor force applied — flight control active.");
+            DebugLog("Spool-up complete — crew seated, rotor force applied, flight control active.");
         }
 
         // Rotor failure detection: only active once we've confirmed the rotor was actually spinning
