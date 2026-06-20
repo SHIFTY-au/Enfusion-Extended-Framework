@@ -131,6 +131,7 @@ class EEF_HelicopterControlComponent : ScriptComponent
     protected vector m_vLZOrigin;      //! LZ position recorded on ARRIVING; used for DEPARTING despawn distance.
     protected float m_fDwellTimer;     //! Remaining dwell seconds; counts down when m_bDwellActive.
     protected bool m_bDwellActive;     //! True while the dwell countdown is running.
+    protected bool m_bEngineOnTracked; //! True once EngineIsOn() has been observed as true this flight; used for one-shot trace log.
 
     // --------------------------------------------------------
     // CONSTANTS
@@ -334,9 +335,18 @@ class EEF_HelicopterControlComponent : ScriptComponent
         m_bLandingShutdown = false;
         m_bDwellActive = false;
         m_fDwellTimer = 0;
+        m_bEngineOnTracked = false;
 
+        DebugLog(string.Format("Pre-EngineStart: EngineIsOn=%1, RPM=%2, RPMTarget=%3.",
+            m_HelicopterSim.EngineIsOn(),
+            m_HelicopterSim.RotorGetRPM(0),
+            m_HelicopterSim.RotorGetRPMTarget(0)));
         m_HelicopterSim.EngineStart();
         m_HelicopterSim.SetThrottle(FLIGHT_CONSTANT_THROTTLE);
+        DebugLog(string.Format("Post-EngineStart: EngineIsOn=%1, RPM=%2, RPMTarget=%3.",
+            m_HelicopterSim.EngineIsOn(),
+            m_HelicopterSim.RotorGetRPM(0),
+            m_HelicopterSim.RotorGetRPMTarget(0)));
 
         // Keep rotor force at 0 until after spool-up. Rotor force is applied in TickFlightController
         // after the engine RPM reaches target, preventing uncontrolled lift during startup.
@@ -667,14 +677,33 @@ class EEF_HelicopterControlComponent : ScriptComponent
         // a binary state flag (engine switched on yes/no), not a readiness signal - it
         // returns true the moment EngineStart is called. The actual readiness condition is
         // rotor RPM reaching target, which we check via RotorGetRPM vs RotorGetRPMTarget.
+        // If the engine is not yet on, retry EngineStart() each tick in case the initial
+        // call in StartFlight() fired before the simulation was ready to accept it.
         if (!m_HelicopterSim.EngineIsOn())
         {
+            m_HelicopterSim.EngineStart();
+            m_HelicopterSim.SetThrottle(FLIGHT_CONSTANT_THROTTLE);
+            m_fStatusLogTimer += timeSlice;
+            if (m_bDebugLog && m_fStatusLogTimer >= 1.0)
+            {
+                m_fStatusLogTimer = 0;
+                Print(string.Format("[EEF HelicopterControl] Engine not on — retrying EngineStart(). Post-retry: EngineIsOn=%1, RPM=%2, RPMTarget=%3.",
+                    m_HelicopterSim.EngineIsOn(),
+                    m_HelicopterSim.RotorGetRPM(0),
+                    m_HelicopterSim.RotorGetRPMTarget(0)));
+            }
             return;
+        }
+
+        if (!m_bEngineOnTracked)
+        {
+            DebugLog(string.Format("Engine on confirmed. RPM=%1, RPMTarget=%2.", m_HelicopterSim.RotorGetRPM(0), m_HelicopterSim.RotorGetRPMTarget(0)));
+            m_bEngineOnTracked = true;
         }
 
         float rotorTargetRPM = m_HelicopterSim.RotorGetRPMTarget(0);
         float rotorRPM = m_HelicopterSim.RotorGetRPM(0);
-        if (rotorTargetRPM > 0 && rotorRPM < rotorTargetRPM * 0.9)
+        if (rotorTargetRPM <= 0 || rotorRPM < rotorTargetRPM * 0.9)
         {
             // Throttled debug log so we can see spool-up progress.
             m_fStatusLogTimer += timeSlice;
