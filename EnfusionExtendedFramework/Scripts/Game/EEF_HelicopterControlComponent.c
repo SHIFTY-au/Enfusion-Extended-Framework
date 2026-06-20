@@ -300,10 +300,15 @@ class EEF_HelicopterControlComponent : ScriptComponent
         if (m_HelicopterSim && m_HelicopterSim.EngineIsOn() && !m_bLandingShutdown)
             m_fEngineRunTime += timeSlice;
 
-        // Keep helicopter physics awake while engine is on but flight hasn't started.
-        // Without this, script-spawned vehicles can sleep, preventing rotor RPM from rising.
+        // While engine is on but before flight starts: hold the helicopter stationary and
+        // keep the rotor force scale active every frame. The simulation on a script-spawned
+        // entity may not be ready to accept RotorSetForceScaleState immediately at spawn;
+        // repeating it each frame ensures RPM starts rising as soon as the sim is ready.
+        // SetVelocity(zero) prevents any native rotor lift from moving the helicopter.
         if (m_HelicopterEntity && !m_bFlightTickRunning && m_HelicopterSim && m_HelicopterSim.EngineIsOn())
         {
+            m_HelicopterSim.RotorSetForceScaleState(0, 5.0);
+            m_HelicopterSim.RotorSetForceScaleState(1, 5.0);
             Physics prePhys = m_HelicopterEntity.GetPhysics();
             if (prePhys)
                 prePhys.SetVelocity(vector.Zero);
