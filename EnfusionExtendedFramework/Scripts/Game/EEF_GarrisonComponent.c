@@ -28,25 +28,33 @@
 // ------------------------------------------------------------
 // The underlying design (see issue #14) explicitly flags several
 // engine-behaviour questions as "needs research/testing" rather than
-// guessed at blind. Two remain unconfirmed on a live Workbench session:
+// guessed at blind. Several remain unconfirmed on a live Workbench session:
 //
-//   - m_sGroupContainerPrefab can be ANY AI group prefab, not specifically
-//     an empty one - FinishGarrisonSpawn() adds the garrison character via
-//     AddAgent() FIRST, then StripGroupMembers() removes whatever
-//     pre-authored members the container originally had via RemoveAgent().
-//     Deliberately in that order, not the reverse: if some AIGroup
-//     implementation auto-cleans up on hitting zero members, stripping
-//     first would delete the group entity out from under us before we
-//     got to add our own character. AddAgent()'s existence is fairly well
-//     supported (the base game's own agent-removed event passes
-//     (AIGroup, AIAgent) params, implying a symmetric Add/Remove pair),
-//     but neither call - nor the "does empty auto-cleanup" assumption
-//     above - has been exercised against a live Workbench session yet.
+//   - GROUP_CONTAINER_PREFAB is a hardcoded resource, not a mission-maker
+//     field - deliberately so; every AI-spawning module in this codebase
+//     spawns its groups from a prefab resource (no "create a group from
+//     nothing" API was found), so a real resource is unavoidable, but which
+//     one doesn't matter functionally since it gets stripped at runtime
+//     regardless of content (see below). Currently a bare GUID reference
+//     with no path (`{EACD97CF4A702FAE}`) - if Resource.Load() can't
+//     resolve a path-less GUID, swap in the fuller
+//     "{GUID}Prefabs/Path/File.et" string instead.
+//   - FinishGarrisonSpawn() adds the garrison character via AddAgent()
+//     FIRST, then StripGroupMembers() removes whatever pre-authored
+//     members the container originally had via RemoveAgent(). Deliberately
+//     in that order, not the reverse: if some AIGroup implementation
+//     auto-cleans up on hitting zero members, stripping first would delete
+//     the group entity out from under us before we got to add our own
+//     character. AddAgent()'s existence is fairly well supported (the base
+//     game's own agent-removed event passes (AIGroup, AIAgent) params,
+//     implying a symmetric Add/Remove pair), but neither call - nor the
+//     "does empty auto-cleanup" assumption above - has been exercised
+//     against a live Workbench session yet.
 //   - SpawnGarrisonAI() waits out the container's delayed member spawn via
 //     IsInitializing()/GetOnAllDelayedEntitySpawned() before stripping -
 //     the same pattern already proven working in
 //     EEF_HelicopterInsertionComponent's cargo-boarding wait, just applied
-//     to an arbitrary caller-supplied group prefab here instead of one
+//     to an arbitrary hardcoded group prefab here instead of one
 //     purpose-built for cargo.
 //
 // ResolveAIAgent() previously guessed FindComponent(AIAgent) directly,
@@ -130,9 +138,6 @@ class EEF_GarrisonComponent : ScriptComponent
 	[Attribute("", UIWidgets.Object, "Individual character prefabs. One is picked at random per spawn.")]
 	protected ref array<ref EEF_GarrisonCharacterSlot> m_aCharacterPrefabs;
 
-	[Attribute("", UIWidgets.ResourcePickerThumbnail, "Any AI group prefab - used as the container for each spawned AI's standalone 'group of one'. Pre-authored members (if any) are stripped automatically at runtime, so any existing squad/group prefab works as-is.", "et")]
-	protected ResourceName m_sGroupContainerPrefab;
-
 	[Attribute("1", UIWidgets.EditBox, "Minimum number of AI to spawn on activation.")]
 	protected int m_iMinSpawnCount;
 
@@ -179,6 +184,13 @@ class EEF_GarrisonComponent : ScriptComponent
 	protected const float ENGAGED_COOLDOWN_SECONDS = 8.0;		//! Time since last damage before an AI is no longer "personally engaged".
 	protected const float MIN_INVESTIGATE_DWELL_SECONDS = 20.0;	//! Minimum time a pure bystander stays at the investigate point before giving up.
 	protected const float HEALTH_DROP_EPSILON = 0.01;			//! Minimum GetHealthScaled() delta to count as "took damage".
+
+	//! Group prefab used as the container for each spawned AI's standalone "group of one".
+	//! Not mission-maker facing - any pre-authored members it has are stripped automatically at
+	//! runtime (see FinishGarrisonSpawn/StripGroupMembers), so which real group prefab this points
+	//! at doesn't matter functionally. GUID-only reference (no path) - if Resource.Load() can't
+	//! resolve it, replace with the fuller "{GUID}Prefabs/Path/File.et" string instead.
+	protected const ResourceName GROUP_CONTAINER_PREFAB = "{EACD97CF4A702FAE}";
 
 	//------------------------------------------------------------------------------------------------
 	// INITIALISATION
@@ -231,9 +243,10 @@ class EEF_GarrisonComponent : ScriptComponent
 			return;
 		}
 
-		if (m_sGroupContainerPrefab.IsEmpty())
+		Resource groupContainerCheck = Resource.Load(GROUP_CONTAINER_PREFAB);
+		if (!groupContainerCheck || !groupContainerCheck.IsValid())
 		{
-			Print("[EEF Garrison] ERROR: No group container prefab configured (m_sGroupContainerPrefab). Instance will not activate.", LogLevel.ERROR);
+			Print(string.Format("[EEF Garrison] ERROR: Internal group container prefab could not be loaded: %1. This is a hardcoded resource, not mission-maker configurable - see GROUP_CONTAINER_PREFAB in EEF_GarrisonComponent.c.", GROUP_CONTAINER_PREFAB), LogLevel.ERROR);
 			return;
 		}
 
@@ -419,10 +432,10 @@ class EEF_GarrisonComponent : ScriptComponent
 		if (characterPrefab.IsEmpty())
 			return;
 
-		Resource groupRes = Resource.Load(m_sGroupContainerPrefab);
+		Resource groupRes = Resource.Load(GROUP_CONTAINER_PREFAB);
 		if (!groupRes || !groupRes.IsValid())
 		{
-			Print(string.Format("[EEF Garrison] ERROR: Could not load group container prefab: %1", m_sGroupContainerPrefab), LogLevel.ERROR);
+			Print(string.Format("[EEF Garrison] ERROR: Could not load internal group container prefab: %1", GROUP_CONTAINER_PREFAB), LogLevel.ERROR);
 			return;
 		}
 
