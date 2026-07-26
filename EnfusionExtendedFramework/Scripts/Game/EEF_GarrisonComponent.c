@@ -2,13 +2,26 @@
 // EEF_GarrisonComponent.c
 // Enfusion Extended Framework - Interior/Compound AI Population Module
 //
-// Attach to a single "anchor" entity in the World Editor. Place
-// AIWaypoint marker entities anywhere underneath it in the entity
-// hierarchy (any nesting depth, any organisation) - every AIWaypoint
-// found is collected as a possible garrison post. A random subset of
-// those markers is populated with individual, independent AI on
+// Place AIWaypoint marker entities in the World Editor and name each one
+// <m_sMarkerNamePrefix><number>, starting from 1 (e.g. "Compound_1",
+// "Compound_2", ...) - this conveniently matches Reforger's own default
+// auto-naming for duplicated prefabs, so markers often need no renaming
+// at all if the prefix is set to match. A random subset of the markers
+// found this way is populated with individual, independent AI on
 // activation: each AI is spawned as its own standalone single-member
 // AI group so it never coalesces toward a shared leader.
+//
+// NOTE: the original design scoped markers by entity parentage under an
+// "anchor" entity (any AIWaypoint nested anywhere underneath it, no
+// naming convention needed) - confirmed via live Workbench testing (15
+// retries over 30s, identical empty result every time, plus matching
+// official docs: "layers and entity hierarchy are distinct organisational
+// systems") that nesting entities under a World Editor Layer in the
+// Outliner does NOT create real IEntity parent-child links reachable via
+// GetChildren()/GetSibling() - Layers are a purely editor/composition-file
+// grouping. Since Layers are the natural way mission makers organise
+// large marker sets, parent-based discovery doesn't work in practice and
+// this module uses name-based discovery instead.
 //
 // STATIC mode holds each AI at its assigned marker indefinitely.
 // MOVING mode has each AI loiter at a marker for a randomised dwell
@@ -130,13 +143,16 @@ class EEF_GarrisonPendingSpawn
 }
 
 //------------------------------------------------------------------------------------------------
-[ComponentEditorProps(category: "EEF/Garrison", description: "EEF Garrison - attach to an anchor entity with AIWaypoint markers placed anywhere underneath it. Populates a random subset with independent standalone AI.")]
+[ComponentEditorProps(category: "EEF/Garrison", description: "EEF Garrison - attach anywhere in the world. Name marker AIWaypoint entities <Marker Name Prefix><number> starting from 1. Populates a random subset with independent standalone AI.")]
 class EEF_GarrisonComponentClass : ScriptComponentClass {}
 
 //------------------------------------------------------------------------------------------------
 class EEF_GarrisonComponent : ScriptComponent
 {
 	//--- Population
+	[Attribute("", UIWidgets.EditBox, "Marker name prefix. Markers must be named <prefix><number>, starting from 1 (e.g. prefix 'Compound_' matches 'Compound_1', 'Compound_2', ...). Matches Reforger's own default auto-naming for duplicated prefabs, so often no renaming is needed. Numbering gaps are tolerated.")]
+	protected string m_sMarkerNamePrefix;
+
 	[Attribute("", UIWidgets.Object, "Individual character prefabs. One is picked at random per spawn.")]
 	protected ref array<ref EEF_GarrisonCharacterSlot> m_aCharacterPrefabs;
 
@@ -188,8 +204,14 @@ class EEF_GarrisonComponent : ScriptComponent
 	protected const float ENGAGED_COOLDOWN_SECONDS = 8.0;		//! Time since last damage before an AI is no longer "personally engaged".
 	protected const float MIN_INVESTIGATE_DWELL_SECONDS = 20.0;	//! Minimum time a pure bystander stays at the investigate point before giving up.
 	protected const float HEALTH_DROP_EPSILON = 0.01;			//! Minimum GetHealthScaled() delta to count as "took damage".
-	protected const int MARKER_DISCOVERY_MAX_ATTEMPTS = 15;		//! AttemptMarkerDiscovery() retry cap.
+	//! AttemptMarkerDiscovery() retry cap. Modest defensive margin for a layer streaming in late
+	//! behind an "Activate by Parent" proximity gate - not chasing a timing hypothesis anymore
+	//! (that was conclusively ruled out: 15 retries over 30s, identical result every time), just
+	//! covering the case where the whole layer (this component included) hasn't finished
+	//! initialising by the time OnPostInit's deferred CallLater fires.
+	protected const int MARKER_DISCOVERY_MAX_ATTEMPTS = 3;
 	protected const float MARKER_DISCOVERY_RETRY_INTERVAL_S = 2.0;	//! Delay between marker discovery retries.
+	protected const int MARKER_NAME_MAX_INDEX = 300;				//! Upper bound for <prefix><number> name scan. Gaps tolerated - scan doesn't stop at first miss.
 
 	//! Group prefab used as the container for each spawned AI's standalone "group of one".
 	//! Not mission-maker facing - any pre-authored members it has are stripped automatically at
@@ -262,13 +284,10 @@ class EEF_GarrisonComponent : ScriptComponent
 	}
 
 	//------------------------------------------------------------------------------------------------
-	//! Retries marker discovery up to MARKER_DISCOVERY_MAX_ATTEMPTS times, MARKER_DISCOVERY_RETRY_INTERVAL_S
-	//! apart, before giving up. Testing a hypothesis: a single scan right after OnPostInit/StartGarrison
-	//! came back with zero children even for entities visibly nested under the owner in the World Editor
-	//! Outliner - this could mean Outliner nesting isn't real IEntity parentage at all (in which case no
-	//! amount of retrying will ever find anything and every attempt will log identically empty), or it
-	//! could mean those entities (set to "Initialise same as parent") simply haven't finished registering
-	//! into the parent's child list yet on the first attempt. Retrying distinguishes the two empirically.
+	//! Retries the name-based marker scan up to MARKER_DISCOVERY_MAX_ATTEMPTS times,
+	//! MARKER_DISCOVERY_RETRY_INTERVAL_S apart, before giving up - defensive margin for a layer
+	//! streaming in late behind an "Activate by Parent" proximity gate, not a workaround for any
+	//! known issue with FindEntityByName() itself.
 	protected void AttemptMarkerDiscovery()
 	{
 		if (!m_bStarting)
@@ -276,10 +295,8 @@ class EEF_GarrisonComponent : ScriptComponent
 
 		m_iMarkerDiscoveryAttempt++;
 
-		Print(string.Format("[EEF Garrison] DIAG: Marker scan attempt %1/%2 starting from owner class='%3' name='%4'.", m_iMarkerDiscoveryAttempt, MARKER_DISCOVERY_MAX_ATTEMPTS, GetOwner().ClassName(), GetOwner().GetName()), LogLevel.WARNING);
-
 		m_aMarkers.Clear();
-		CollectMarkersRecursive(GetOwner(), m_aMarkers, 0);
+		CollectMarkersByName(m_aMarkers);
 
 		if (!m_aMarkers.IsEmpty())
 		{
@@ -291,7 +308,7 @@ class EEF_GarrisonComponent : ScriptComponent
 		if (m_iMarkerDiscoveryAttempt >= MARKER_DISCOVERY_MAX_ATTEMPTS)
 		{
 			m_bStarting = false;
-			Print(string.Format("[EEF Garrison] ERROR: No AIWaypoint markers found under owner entity after %1 attempts over ~%2s. If every DIAG line above reported the same empty result, markers are not true entity-children of the owner (an editor/Outliner-only grouping issue, not a timing one) - place at least one, or see prior conversation for alternate discovery approaches.", m_iMarkerDiscoveryAttempt, m_iMarkerDiscoveryAttempt * MARKER_DISCOVERY_RETRY_INTERVAL_S), LogLevel.ERROR);
+			Print(string.Format("[EEF Garrison] ERROR: No AIWaypoint markers found with prefix '%1' after %2 attempt(s). Check marker names match '<prefix><number>' starting from 1 (e.g. '%3').", m_sMarkerNamePrefix, m_iMarkerDiscoveryAttempt, string.Format("%1%2", m_sMarkerNamePrefix, 1)), LogLevel.ERROR);
 			return;
 		}
 
@@ -390,33 +407,25 @@ class EEF_GarrisonComponent : ScriptComponent
 	//------------------------------------------------------------------------------------------------
 
 	//------------------------------------------------------------------------------------------------
-	//! Recursively collects every AIWaypoint descendant of node, at any nesting depth.
-	//! No naming/prefix convention - scoping is entirely by parentage under the anchor.
-	//! DIAG: unconditionally logs every node visited (and when GetChildren() finds nothing) -
-	//! temporary instrumentation while confirming whether World Editor "nest under a Layer in the
-	//! Outliner" produces a real IEntity parent-child link reachable via GetChildren()/GetSibling(),
-	//! as opposed to being a purely editor/composition-level grouping with no runtime entity linkage.
-	protected void CollectMarkersRecursive(IEntity node, out array<AIWaypoint> result, int depth)
+	//! Collects every AIWaypoint named <m_sMarkerNamePrefix><n> for n = 1..MARKER_NAME_MAX_INDEX,
+	//! via FindEntityByName() - already proven working elsewhere in this codebase (LZ/waypoint
+	//! resolution in EEF_HelicopterInsertionComponent), so no new API surface here. Scans the full
+	//! range rather than stopping at the first miss, so gaps in numbering (e.g. a deleted marker)
+	//! don't truncate discovery.
+	protected void CollectMarkersByName(out array<AIWaypoint> result)
 	{
-		IEntity child = node.GetChildren();
-
-		if (!child)
+		for (int idx = 1; idx <= MARKER_NAME_MAX_INDEX; idx++)
 		{
-			Print(string.Format("[EEF Garrison] DIAG: [depth %1] node class='%2' name='%3' - GetChildren() returned null (no children).", depth, node.ClassName(), node.GetName()), LogLevel.WARNING);
-			return;
-		}
+			string markerName = string.Format("%1%2", m_sMarkerNamePrefix, idx);
+			IEntity ent = GetGame().GetWorld().FindEntityByName(markerName);
+			if (!ent)
+				continue;
 
-		while (child)
-		{
-			AIWaypoint wp = AIWaypoint.Cast(child);
-
-			Print(string.Format("[EEF Garrison] DIAG: [depth %1] found child class='%2' name='%3' isAIWaypoint=%4", depth, child.ClassName(), child.GetName(), wp != null), LogLevel.WARNING);
-
+			AIWaypoint wp = AIWaypoint.Cast(ent);
 			if (wp)
 				result.Insert(wp);
-
-			CollectMarkersRecursive(child, result, depth + 1);
-			child = child.GetSibling();
+			else
+				DebugLog(string.Format("Entity named '%1' found but is not an AIWaypoint (class '%2') - skipping.", markerName, ent.ClassName()));
 		}
 	}
 
