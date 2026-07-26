@@ -28,15 +28,26 @@
 // ------------------------------------------------------------
 // The underlying design (see issue #14) explicitly flags several
 // engine-behaviour questions as "needs research/testing" rather than
-// guessed at blind. One remains unconfirmed on a live Workbench session:
+// guessed at blind. Two remain unconfirmed on a live Workbench session:
 //
-//   - CreateSoloGroup() spawns a mission-maker-supplied "empty group"
-//     prefab and calls SCR_AIGroup.AddAgent() to place a single
-//     standalone character into it. This is the standard mechanism
-//     for a scripted "group of one", but has not been confirmed
-//     against a live Workbench session in this repo - verify the
-//     empty group prefab you assign actually accepts AddAgent() with
-//     no pre-authored members.
+//   - m_sGroupContainerPrefab can be ANY AI group prefab, not specifically
+//     an empty one - FinishGarrisonSpawn() adds the garrison character via
+//     AddAgent() FIRST, then StripGroupMembers() removes whatever
+//     pre-authored members the container originally had via RemoveAgent().
+//     Deliberately in that order, not the reverse: if some AIGroup
+//     implementation auto-cleans up on hitting zero members, stripping
+//     first would delete the group entity out from under us before we
+//     got to add our own character. AddAgent()'s existence is fairly well
+//     supported (the base game's own agent-removed event passes
+//     (AIGroup, AIAgent) params, implying a symmetric Add/Remove pair),
+//     but neither call - nor the "does empty auto-cleanup" assumption
+//     above - has been exercised against a live Workbench session yet.
+//   - SpawnGarrisonAI() waits out the container's delayed member spawn via
+//     IsInitializing()/GetOnAllDelayedEntitySpawned() before stripping -
+//     the same pattern already proven working in
+//     EEF_HelicopterInsertionComponent's cargo-boarding wait, just applied
+//     to an arbitrary caller-supplied group prefab here instead of one
+//     purpose-built for cargo.
 //
 // ResolveAIAgent() previously guessed FindComponent(AIAgent) directly,
 // which returned null at runtime against a real character prefab
@@ -99,6 +110,16 @@ class EEF_GarrisonAIState
 }
 
 //------------------------------------------------------------------------------------------------
+//! Tracks a group container mid-spawn, waiting on its pre-authored members (if any) to finish
+//! spawning before we strip them and add our own garrison character.
+class EEF_GarrisonPendingSpawn
+{
+	SCR_AIGroup m_Group;
+	ResourceName m_CharacterPrefab;
+	AIWaypoint m_Marker;
+}
+
+//------------------------------------------------------------------------------------------------
 [ComponentEditorProps(category: "EEF/Garrison", description: "EEF Garrison - attach to an anchor entity with AIWaypoint markers placed anywhere underneath it. Populates a random subset with independent standalone AI.")]
 class EEF_GarrisonComponentClass : ScriptComponentClass {}
 
@@ -109,8 +130,8 @@ class EEF_GarrisonComponent : ScriptComponent
 	[Attribute("", UIWidgets.Object, "Individual character prefabs. One is picked at random per spawn.")]
 	protected ref array<ref EEF_GarrisonCharacterSlot> m_aCharacterPrefabs;
 
-	[Attribute("", UIWidgets.ResourcePickerThumbnail, "AI group prefab with no pre-placed members - used as the standalone container for each spawned AI's 'group of one'.", "et")]
-	protected ResourceName m_sEmptyGroupPrefab;
+	[Attribute("", UIWidgets.ResourcePickerThumbnail, "Any AI group prefab - used as the container for each spawned AI's standalone 'group of one'. Pre-authored members (if any) are stripped automatically at runtime, so any existing squad/group prefab works as-is.", "et")]
+	protected ResourceName m_sGroupContainerPrefab;
 
 	[Attribute("1", UIWidgets.EditBox, "Minimum number of AI to spawn on activation.")]
 	protected int m_iMinSpawnCount;
@@ -151,6 +172,7 @@ class EEF_GarrisonComponent : ScriptComponent
 	protected bool m_bTickRunning;
 	protected ref array<AIWaypoint> m_aMarkers = {};
 	protected ref array<ref EEF_GarrisonAIState> m_aActiveAI = {};
+	protected ref array<ref EEF_GarrisonPendingSpawn> m_aPendingSpawns = {};
 
 	//--- Tuning constants (not mission-maker facing - internal behaviour timing)
 	protected const float GARRISON_TICK_INTERVAL_S = 1.0;		//! Poll rate for engagement/move/investigate logic.
@@ -209,9 +231,9 @@ class EEF_GarrisonComponent : ScriptComponent
 			return;
 		}
 
-		if (m_sEmptyGroupPrefab.IsEmpty())
+		if (m_sGroupContainerPrefab.IsEmpty())
 		{
-			Print("[EEF Garrison] ERROR: No empty group prefab configured (m_sEmptyGroupPrefab). Instance will not activate.", LogLevel.ERROR);
+			Print("[EEF Garrison] ERROR: No group container prefab configured (m_sGroupContainerPrefab). Instance will not activate.", LogLevel.ERROR);
 			return;
 		}
 
@@ -235,6 +257,7 @@ class EEF_GarrisonComponent : ScriptComponent
 		ShuffleMarkers(shuffled);
 
 		m_aActiveAI.Clear();
+		m_aPendingSpawns.Clear();
 
 		for (int i = 0; i < spawnCount; i++)
 			SpawnGarrisonAI(shuffled[i]);
@@ -247,7 +270,10 @@ class EEF_GarrisonComponent : ScriptComponent
 			m_bTickRunning = true;
 		}
 
-		DebugLog(string.Format("Garrison started - %1 AI spawned across %2 marker(s).", m_aActiveAI.Count(), m_aMarkers.Count()));
+		// Spawning is async (see SpawnGarrisonAI) - some may still be waiting on a group
+		// container's pre-authored members to finish spawning before we can strip them.
+		// FinishGarrisonSpawn logs each individual arrival; this is just the request count.
+		DebugLog(string.Format("Garrison starting - %1 AI requested across %2 marker(s).", spawnCount, m_aMarkers.Count()));
 	}
 
 	//------------------------------------------------------------------------------------------------
@@ -275,9 +301,19 @@ class EEF_GarrisonComponent : ScriptComponent
 				if (state.m_Character)
 					SCR_EntityHelper.DeleteEntityAndChildren(state.m_Character);
 			}
+
+			// Any spawn still waiting on a group container's delayed member spawn - discard the
+			// container. The pending list is cleared below so a late OnTemplateGroupReady callback
+			// finds no match and is a safe no-op.
+			foreach (EEF_GarrisonPendingSpawn pending : m_aPendingSpawns)
+			{
+				if (pending && pending.m_Group)
+					SCR_EntityHelper.DeleteEntityAndChildren(pending.m_Group);
+			}
 		}
 
 		m_aActiveAI.Clear();
+		m_aPendingSpawns.Clear();
 		DebugLog("Garrison stopped.");
 	}
 
@@ -372,18 +408,88 @@ class EEF_GarrisonComponent : ScriptComponent
 	//------------------------------------------------------------------------------------------------
 
 	//------------------------------------------------------------------------------------------------
-	//! Spawns one garrison AI at marker: picks a random character prefab, spawns it, wraps it in a
-	//! standalone "group of one", and assigns the marker as its first destination/post.
+	//! Spawns the group container for one garrison AI at marker. If the container prefab has
+	//! pre-authored members, SCR_AIGroup spawns them across several frames before it's ready
+	//! (IsInitializing()/GetOnAllDelayedEntitySpawned() - same pattern as
+	//! EEF_HelicopterInsertionComponent's cargo boarding wait) - we wait for that, then strip
+	//! them via FinishGarrisonSpawn. An already-empty container finishes immediately.
 	protected void SpawnGarrisonAI(AIWaypoint marker)
 	{
-		ResourceName prefab = PickRandomCharacterPrefab();
-		if (prefab.IsEmpty())
+		ResourceName characterPrefab = PickRandomCharacterPrefab();
+		if (characterPrefab.IsEmpty())
 			return;
 
-		IEntity character = SpawnCharacterAtMarker(prefab, marker);
+		Resource groupRes = Resource.Load(m_sGroupContainerPrefab);
+		if (!groupRes || !groupRes.IsValid())
+		{
+			Print(string.Format("[EEF Garrison] ERROR: Could not load group container prefab: %1", m_sGroupContainerPrefab), LogLevel.ERROR);
+			return;
+		}
+
+		EntitySpawnParams spawnParams = new EntitySpawnParams();
+		spawnParams.TransformMode = ETransformMode.WORLD;
+		Math3D.MatrixIdentity4(spawnParams.Transform);
+		spawnParams.Transform[3] = marker.GetOrigin();
+
+		SCR_AIGroup group = SCR_AIGroup.Cast(GetGame().SpawnEntityPrefab(groupRes, GetGame().GetWorld(), spawnParams));
+		if (!group)
+		{
+			Print("[EEF Garrison] ERROR: Failed to spawn group container for garrison AI.", LogLevel.ERROR);
+			return;
+		}
+
+		EEF_GarrisonPendingSpawn pending = new EEF_GarrisonPendingSpawn();
+		pending.m_Group = group;
+		pending.m_CharacterPrefab = characterPrefab;
+		pending.m_Marker = marker;
+		m_aPendingSpawns.Insert(pending);
+
+		if (group.IsInitializing())
+			group.GetOnAllDelayedEntitySpawned().Insert(OnTemplateGroupReady);
+		else
+			FinishGarrisonSpawn(pending);
+	}
+
+	//------------------------------------------------------------------------------------------------
+	//! SCR_AIGroup.GetOnAllDelayedEntitySpawned() callback - fires once the container's
+	//! pre-authored members (if any) have finished spawning. Matches by group reference against
+	//! the pending list (mirrors OnWaypointCompleted's lookup pattern below).
+	protected void OnTemplateGroupReady(SCR_AIGroup group)
+	{
+		foreach (EEF_GarrisonPendingSpawn pending : m_aPendingSpawns)
+		{
+			if (pending.m_Group != group)
+				continue;
+
+			FinishGarrisonSpawn(pending);
+			return;
+		}
+
+		// No match - StopGarrison already discarded this pending spawn. Safe no-op.
+	}
+
+	//------------------------------------------------------------------------------------------------
+	//! Spawns the garrison character into the group container FIRST, then strips whatever
+	//! pre-authored members it originally had - never the other way around. Some AIGroup
+	//! implementations may auto-cleanup when membership hits zero, which would delete `group`
+	//! out from under us if we stripped before adding; adding first means it's never transiently
+	//! empty.
+	protected void FinishGarrisonSpawn(EEF_GarrisonPendingSpawn pending)
+	{
+		m_aPendingSpawns.RemoveItem(pending);
+
+		SCR_AIGroup group = pending.m_Group;
+		if (!group)
+			return;
+
+		array<AIAgent> originalAgents = {};
+		group.GetAgents(originalAgents);
+
+		IEntity character = SpawnCharacterAtMarker(pending.m_CharacterPrefab, pending.m_Marker);
 		if (!character)
 		{
-			Print("[EEF Garrison] ERROR: Failed to spawn character for garrison AI.", LogLevel.ERROR);
+			Print("[EEF Garrison] ERROR: Failed to spawn character for garrison AI. Deleting group container.", LogLevel.ERROR);
+			SCR_EntityHelper.DeleteEntityAndChildren(group);
 			return;
 		}
 
@@ -392,25 +498,19 @@ class EEF_GarrisonComponent : ScriptComponent
 		{
 			Print("[EEF Garrison] ERROR: Spawned character has no AIAgent - cannot form group. Deleting.", LogLevel.ERROR);
 			SCR_EntityHelper.DeleteEntityAndChildren(character);
-			return;
-		}
-
-		SCR_AIGroup group = CreateSoloGroup(marker.GetOrigin());
-		if (!group)
-		{
-			Print("[EEF Garrison] ERROR: Failed to create solo group for garrison AI. Deleting character.", LogLevel.ERROR);
-			SCR_EntityHelper.DeleteEntityAndChildren(character);
+			SCR_EntityHelper.DeleteEntityAndChildren(group);
 			return;
 		}
 
 		group.AddAgent(agent);
+		StripGroupMembers(group, originalAgents);
 		group.GetOnWaypointCompleted().Insert(OnWaypointCompleted);
 
 		EEF_GarrisonAIState state = new EEF_GarrisonAIState();
 		state.m_Group = group;
 		state.m_Agent = agent;
 		state.m_Character = character;
-		state.m_HomeMarker = marker;
+		state.m_HomeMarker = pending.m_Marker;
 		state.m_DamageManager = SCR_CharacterDamageManagerComponent.Cast(character.FindComponent(SCR_CharacterDamageManagerComponent));
 
 		if (state.m_DamageManager)
@@ -419,9 +519,30 @@ class EEF_GarrisonComponent : ScriptComponent
 			state.m_fLastHealthScaled = 1.0;
 
 		m_aActiveAI.Insert(state);
-		AssignMove(state, marker);
+		AssignMove(state, pending.m_Marker);
 
-		DebugLog(string.Format("Spawned garrison AI at marker %1.", marker.GetOrigin().ToString()));
+		DebugLog(string.Format("Spawned garrison AI at marker %1.", pending.m_Marker.GetOrigin().ToString()));
+	}
+
+	//------------------------------------------------------------------------------------------------
+	//! Removes and deletes each agent in agentsToRemove from group - the container's original
+	//! members, captured by FinishGarrisonSpawn before our own character was added.
+	protected void StripGroupMembers(SCR_AIGroup group, array<AIAgent> agentsToRemove)
+	{
+		foreach (AIAgent agent : agentsToRemove)
+		{
+			if (!agent)
+				continue;
+
+			IEntity character = agent.GetControlledEntity();
+			group.RemoveAgent(agent);
+
+			if (character)
+				SCR_EntityHelper.DeleteEntityAndChildren(character);
+		}
+
+		if (!agentsToRemove.IsEmpty())
+			DebugLog(string.Format("Stripped %1 pre-authored member(s) from group container.", agentsToRemove.Count()));
 	}
 
 	//------------------------------------------------------------------------------------------------
@@ -466,26 +587,6 @@ class EEF_GarrisonComponent : ScriptComponent
 			return null;
 
 		return AIAgent.Cast(control.GetControlAIAgent());
-	}
-
-	//------------------------------------------------------------------------------------------------
-	//! Spawns an empty group prefab to act as the standalone "group of one" container for a single
-	//! spawned character. See header note - verify m_sEmptyGroupPrefab has no pre-authored members.
-	protected SCR_AIGroup CreateSoloGroup(vector position)
-	{
-		Resource groupRes = Resource.Load(m_sEmptyGroupPrefab);
-		if (!groupRes || !groupRes.IsValid())
-		{
-			Print("[EEF Garrison] ERROR: Could not load empty group prefab: " + m_sEmptyGroupPrefab, LogLevel.ERROR);
-			return null;
-		}
-
-		EntitySpawnParams spawnParams = new EntitySpawnParams();
-		spawnParams.TransformMode = ETransformMode.WORLD;
-		Math3D.MatrixIdentity4(spawnParams.Transform);
-		spawnParams.Transform[3] = position;
-
-		return SCR_AIGroup.Cast(GetGame().SpawnEntityPrefab(groupRes, GetGame().GetWorld(), spawnParams));
 	}
 
 	//------------------------------------------------------------------------------------------------
