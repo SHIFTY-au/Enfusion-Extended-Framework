@@ -396,7 +396,8 @@ class EEF_GarrisonComponent : ScriptComponent
 			}
 
 			bool isGroup = SCR_AIGroup.Cast(testEntity) != null;
-			AIAgent agent = ResolveAIAgent(testEntity);
+			string failureReason;
+			AIAgent agent = ResolveAIAgentDiagnostic(testEntity, failureReason);
 
 			SCR_EntityHelper.DeleteEntityAndChildren(testEntity);
 
@@ -408,7 +409,7 @@ class EEF_GarrisonComponent : ScriptComponent
 
 			if (!agent)
 			{
-				Print(string.Format("[EEF Garrison] ERROR: Character prefab slot %1 does not resolve to a controllable character (no AIAgent found): %2", i, slot.m_sCharacterPrefab), LogLevel.ERROR);
+				Print(string.Format("[EEF Garrison] ERROR: Character prefab slot %1 does not resolve to a controllable character (%2): %3", i, failureReason, slot.m_sCharacterPrefab), LogLevel.ERROR);
 				return false;
 			}
 		}
@@ -589,17 +590,37 @@ class EEF_GarrisonComponent : ScriptComponent
 	}
 
 	//------------------------------------------------------------------------------------------------
-	//! Retrieves the AIAgent for a spawned character via its AIControlComponent. AIAgent is not
-	//! itself a component found directly on the character - AIControlComponent is, and it owns
-	//! the agent via GetControlAIAgent() (confirmed against base-game SCR_SpawnRequestComponent
-	//! usage; an earlier revision guessed FindComponent(AIAgent) directly, which returns null).
+	//! Retrieves the AIAgent for a spawned character via its AIControlComponent.GetControlAIAgent().
+	//! Thin wrapper over ResolveAIAgentDiagnostic() for call sites that don't need the failure detail.
 	protected AIAgent ResolveAIAgent(IEntity character)
+	{
+		string unusedReason;
+		return ResolveAIAgentDiagnostic(character, unusedReason);
+	}
+
+	//------------------------------------------------------------------------------------------------
+	//! Same lookup as ResolveAIAgent(), but reports which specific step failed via failureReason.
+	//! Two prior guesses at this exact call (FindComponent(AIAgent) directly, then
+	//! AIControlComponent.GetControlAIAgent()) have both produced an identical "no AIAgent found"
+	//! error against a real character prefab - this distinguishes "AIControlComponent isn't even
+	//! found on the entity" (wrong component/API entirely) from "it's found but
+	//! GetControlAIAgent() itself returns null" (possible timing issue - the agent may not be
+	//! ready in the same frame the character is spawned, the same way SCR_AIGroup's members need
+	//! IsInitializing()/GetOnAllDelayedEntitySpawned() before they're ready).
+	protected AIAgent ResolveAIAgentDiagnostic(IEntity character, out string failureReason)
 	{
 		AIControlComponent control = AIControlComponent.Cast(character.FindComponent(AIControlComponent));
 		if (!control)
+		{
+			failureReason = "AIControlComponent not found via FindComponent on the spawned entity";
 			return null;
+		}
 
-		return AIAgent.Cast(control.GetControlAIAgent());
+		AIAgent agent = AIAgent.Cast(control.GetControlAIAgent());
+		if (!agent)
+			failureReason = "AIControlComponent found, but GetControlAIAgent() returned null";
+
+		return agent;
 	}
 
 	//------------------------------------------------------------------------------------------------
