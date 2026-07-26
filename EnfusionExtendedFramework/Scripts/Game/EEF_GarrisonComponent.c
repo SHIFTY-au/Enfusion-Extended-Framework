@@ -252,8 +252,10 @@ class EEF_GarrisonComponent : ScriptComponent
 			return;
 		}
 
+		Print(string.Format("[EEF Garrison] DIAG: Marker scan starting from owner class='%1' name='%2'.", GetOwner().ClassName(), GetOwner().GetName()), LogLevel.WARNING);
+
 		m_aMarkers.Clear();
-		CollectMarkersRecursive(GetOwner(), m_aMarkers);
+		CollectMarkersRecursive(GetOwner(), m_aMarkers, 0);
 
 		if (m_aMarkers.IsEmpty())
 		{
@@ -339,16 +341,30 @@ class EEF_GarrisonComponent : ScriptComponent
 	//------------------------------------------------------------------------------------------------
 	//! Recursively collects every AIWaypoint descendant of node, at any nesting depth.
 	//! No naming/prefix convention - scoping is entirely by parentage under the anchor.
-	protected void CollectMarkersRecursive(IEntity node, out array<AIWaypoint> result)
+	//! DIAG: unconditionally logs every node visited (and when GetChildren() finds nothing) -
+	//! temporary instrumentation while confirming whether World Editor "nest under a Layer in the
+	//! Outliner" produces a real IEntity parent-child link reachable via GetChildren()/GetSibling(),
+	//! as opposed to being a purely editor/composition-level grouping with no runtime entity linkage.
+	protected void CollectMarkersRecursive(IEntity node, out array<AIWaypoint> result, int depth)
 	{
 		IEntity child = node.GetChildren();
+
+		if (!child)
+		{
+			Print(string.Format("[EEF Garrison] DIAG: [depth %1] node class='%2' name='%3' - GetChildren() returned null (no children).", depth, node.ClassName(), node.GetName()), LogLevel.WARNING);
+			return;
+		}
+
 		while (child)
 		{
 			AIWaypoint wp = AIWaypoint.Cast(child);
+
+			Print(string.Format("[EEF Garrison] DIAG: [depth %1] found child class='%2' name='%3' isAIWaypoint=%4", depth, child.ClassName(), child.GetName(), wp != null), LogLevel.WARNING);
+
 			if (wp)
 				result.Insert(wp);
 
-			CollectMarkersRecursive(child, result);
+			CollectMarkersRecursive(child, result, depth + 1);
 			child = child.GetSibling();
 		}
 	}
