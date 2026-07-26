@@ -177,6 +177,8 @@ class EEF_GarrisonComponent : ScriptComponent
 	//--- Runtime state
 	protected bool m_bActive;
 	protected bool m_bTickRunning;
+	protected bool m_bStarting;					//! True from StartGarrison() until marker discovery resolves (found or exhausted).
+	protected int m_iMarkerDiscoveryAttempt;		//! Current attempt count for AttemptMarkerDiscovery()'s retry loop.
 	protected ref array<AIWaypoint> m_aMarkers = {};
 	protected ref array<ref EEF_GarrisonAIState> m_aActiveAI = {};
 	protected ref array<ref EEF_GarrisonPendingSpawn> m_aPendingSpawns = {};
@@ -186,6 +188,8 @@ class EEF_GarrisonComponent : ScriptComponent
 	protected const float ENGAGED_COOLDOWN_SECONDS = 8.0;		//! Time since last damage before an AI is no longer "personally engaged".
 	protected const float MIN_INVESTIGATE_DWELL_SECONDS = 20.0;	//! Minimum time a pure bystander stays at the investigate point before giving up.
 	protected const float HEALTH_DROP_EPSILON = 0.01;			//! Minimum GetHealthScaled() delta to count as "took damage".
+	protected const int MARKER_DISCOVERY_MAX_ATTEMPTS = 15;		//! AttemptMarkerDiscovery() retry cap.
+	protected const float MARKER_DISCOVERY_RETRY_INTERVAL_S = 2.0;	//! Delay between marker discovery retries.
 
 	//! Group prefab used as the container for each spawned AI's standalone "group of one".
 	//! Not mission-maker facing - any pre-authored members it has are stripped automatically at
@@ -252,18 +256,57 @@ class EEF_GarrisonComponent : ScriptComponent
 			return;
 		}
 
-		Print(string.Format("[EEF Garrison] DIAG: Marker scan starting from owner class='%1' name='%2'.", GetOwner().ClassName(), GetOwner().GetName()), LogLevel.WARNING);
+		m_bStarting = true;
+		m_iMarkerDiscoveryAttempt = 0;
+		AttemptMarkerDiscovery();
+	}
+
+	//------------------------------------------------------------------------------------------------
+	//! Retries marker discovery up to MARKER_DISCOVERY_MAX_ATTEMPTS times, MARKER_DISCOVERY_RETRY_INTERVAL_S
+	//! apart, before giving up. Testing a hypothesis: a single scan right after OnPostInit/StartGarrison
+	//! came back with zero children even for entities visibly nested under the owner in the World Editor
+	//! Outliner - this could mean Outliner nesting isn't real IEntity parentage at all (in which case no
+	//! amount of retrying will ever find anything and every attempt will log identically empty), or it
+	//! could mean those entities (set to "Initialise same as parent") simply haven't finished registering
+	//! into the parent's child list yet on the first attempt. Retrying distinguishes the two empirically.
+	protected void AttemptMarkerDiscovery()
+	{
+		if (!m_bStarting)
+			return; // StopGarrison cancelled activation while a retry was pending.
+
+		m_iMarkerDiscoveryAttempt++;
+
+		Print(string.Format("[EEF Garrison] DIAG: Marker scan attempt %1/%2 starting from owner class='%3' name='%4'.", m_iMarkerDiscoveryAttempt, MARKER_DISCOVERY_MAX_ATTEMPTS, GetOwner().ClassName(), GetOwner().GetName()), LogLevel.WARNING);
 
 		m_aMarkers.Clear();
 		CollectMarkersRecursive(GetOwner(), m_aMarkers, 0);
 
-		if (m_aMarkers.IsEmpty())
+		if (!m_aMarkers.IsEmpty())
 		{
-			Print("[EEF Garrison] ERROR: No AIWaypoint markers found under owner entity. Place at least one.", LogLevel.ERROR);
+			DebugLog(string.Format("Discovered %1 marker(s) on attempt %2.", m_aMarkers.Count(), m_iMarkerDiscoveryAttempt));
+			ContinueStartGarrisonAfterMarkers();
 			return;
 		}
 
-		DebugLog(string.Format("Discovered %1 marker(s).", m_aMarkers.Count()));
+		if (m_iMarkerDiscoveryAttempt >= MARKER_DISCOVERY_MAX_ATTEMPTS)
+		{
+			m_bStarting = false;
+			Print(string.Format("[EEF Garrison] ERROR: No AIWaypoint markers found under owner entity after %1 attempts over ~%2s. If every DIAG line above reported the same empty result, markers are not true entity-children of the owner (an editor/Outliner-only grouping issue, not a timing one) - place at least one, or see prior conversation for alternate discovery approaches.", m_iMarkerDiscoveryAttempt, m_iMarkerDiscoveryAttempt * MARKER_DISCOVERY_RETRY_INTERVAL_S), LogLevel.ERROR);
+			return;
+		}
+
+		GetGame().GetCallqueue().CallLater(AttemptMarkerDiscovery, MARKER_DISCOVERY_RETRY_INTERVAL_S * 1000, false);
+	}
+
+	//------------------------------------------------------------------------------------------------
+	//! Continuation of StartGarrison() once markers have been found - rolls spawn count, spawns
+	//! the population, and starts the tick loop.
+	protected void ContinueStartGarrisonAfterMarkers()
+	{
+		if (!m_bStarting)
+			return; // StopGarrison cancelled activation before discovery finished.
+
+		m_bStarting = false;
 
 		int spawnCount = Math.RandomInt(m_iMinSpawnCount, m_iMaxSpawnCount + 1);
 		spawnCount = Math.Clamp(spawnCount, 0, m_aMarkers.Count());
@@ -300,6 +343,14 @@ class EEF_GarrisonComponent : ScriptComponent
 	{
 		if (!Replication.IsServer())
 			return;
+
+		if (m_bStarting)
+		{
+			// Cancel a marker-discovery retry loop in flight - AttemptMarkerDiscovery() checks
+			// m_bStarting itself and no-ops if a pending CallLater fires after this.
+			m_bStarting = false;
+			GetGame().GetCallqueue().Remove(AttemptMarkerDiscovery);
+		}
 
 		if (!m_bActive)
 			return;
