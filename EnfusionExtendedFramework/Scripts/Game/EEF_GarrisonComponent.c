@@ -28,7 +28,7 @@
 // ------------------------------------------------------------
 // The underlying design (see issue #14) explicitly flags several
 // engine-behaviour questions as "needs research/testing" rather than
-// guessed at blind. Two of them land on specific calls below:
+// guessed at blind. One remains unconfirmed on a live Workbench session:
 //
 //   - CreateSoloGroup() spawns a mission-maker-supplied "empty group"
 //     prefab and calls SCR_AIGroup.AddAgent() to place a single
@@ -37,10 +37,12 @@
 //     against a live Workbench session in this repo - verify the
 //     empty group prefab you assign actually accepts AddAgent() with
 //     no pre-authored members.
-//   - ResolveAIAgent() looks up the AIAgent directly as a component on
-//     the spawned character entity. If your character prefabs expose
-//     the agent through a different accessor (e.g. via
-//     AIControlComponent) this is the one line to adjust.
+//
+// ResolveAIAgent() previously guessed FindComponent(AIAgent) directly,
+// which returned null at runtime against a real character prefab
+// (Character_US_GL_Guard.et). Fixed to go through AIControlComponent.
+// GetControlAIAgent() instead, matching base-game SCR_SpawnRequestComponent
+// usage - confirmed working pattern, not a guess.
 //
 // Combat/investigate detection deliberately avoids guessing at an
 // unconfirmed "is this AI personally engaged" API (Open Question #1
@@ -453,11 +455,17 @@ class EEF_GarrisonComponent : ScriptComponent
 	}
 
 	//------------------------------------------------------------------------------------------------
-	//! Retrieves the AIAgent for a spawned character. See header note - this is the one accessor
-	//! most likely to need a one-line adjustment once verified against the target Workbench version.
+	//! Retrieves the AIAgent for a spawned character via its AIControlComponent. AIAgent is not
+	//! itself a component found directly on the character - AIControlComponent is, and it owns
+	//! the agent via GetControlAIAgent() (confirmed against base-game SCR_SpawnRequestComponent
+	//! usage; an earlier revision guessed FindComponent(AIAgent) directly, which returns null).
 	protected AIAgent ResolveAIAgent(IEntity character)
 	{
-		return AIAgent.Cast(character.FindComponent(AIAgent));
+		AIControlComponent control = AIControlComponent.Cast(character.FindComponent(AIControlComponent));
+		if (!control)
+			return null;
+
+		return AIAgent.Cast(control.GetControlAIAgent());
 	}
 
 	//------------------------------------------------------------------------------------------------
