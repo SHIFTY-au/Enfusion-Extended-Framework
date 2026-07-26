@@ -57,11 +57,13 @@
 //     to an arbitrary hardcoded group prefab here instead of one
 //     purpose-built for cargo.
 //
-// ResolveAIAgent() previously guessed FindComponent(AIAgent) directly,
-// which returned null at runtime against a real character prefab
-// (Character_US_GL_Guard.et). Fixed to go through AIControlComponent.
-// GetControlAIAgent() instead, matching base-game SCR_SpawnRequestComponent
-// usage - confirmed working pattern, not a guess.
+// ResolveAIAgent() (AIControlComponent.FindComponent -> GetControlAIAgent()) is now CONFIRMED
+// working against a real character prefab (Character_US_GL_Guard.et) via live Workbench
+// testing - not just a reasoned guess anymore. The validation failures seen while chasing this
+// turned out to be a bug in ValidateCharacterPrefabs() itself, not the AI lookup: it checked the
+// live `agent` reference AFTER calling SCR_EntityHelper.DeleteEntityAndChildren() on the entity
+// that owned it, which reads as invalid post-deletion regardless of whether resolution had
+// actually succeeded. Fixed to check a `hasAgent` bool captured before the deletion instead.
 //
 // Combat/investigate detection deliberately avoids guessing at an
 // unconfirmed "is this AI personally engaged" API (Open Question #1
@@ -411,7 +413,10 @@ class EEF_GarrisonComponent : ScriptComponent
 				return false;
 			}
 
-			if (!agent)
+			// Use hasAgent (captured before DeleteEntityAndChildren above), not `agent` itself -
+			// the live reference reads invalid once its owning entity has been deleted, which
+			// previously made this check fail even when resolution had actually succeeded.
+			if (!hasAgent)
 			{
 				Print(string.Format("[EEF Garrison] ERROR: Character prefab slot %1 does not resolve to a controllable character (hasAIControlComponent=%2, agentResolved=%3): %4", i, hasControl, hasAgent, slot.m_sCharacterPrefab), LogLevel.ERROR);
 				return false;
