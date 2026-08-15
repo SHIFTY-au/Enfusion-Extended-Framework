@@ -132,12 +132,18 @@ class EEF_CheckpointComponent : ScriptComponent
 	[Attribute("", UIWidgets.ResourcePickerThumbnail, "Move waypoint prefab used to drive vehicles to the exit. Select AIWaypoint_Move from Prefabs/AI/Waypoints/ (the same one used for Patrol/Hunter).", "et")]
 	protected ResourceName m_sWaypointPrefab;
 
+	[Attribute("1", UIWidgets.ComboBox, "Speed limit for driving vehicles (AI movement speed tier). LIMP/WALK = slow crawl, JOG = moderate, SPRINT = full speed.", "", ParamEnumArray.FromEnum(EMovementType))]
+	protected EMovementType m_eMaxSpeed;
+
 	// --------------------------------------------------------
 	// Spawn cadence
 	// --------------------------------------------------------
 
-	[Attribute("20.0", UIWidgets.EditBox, "How often in seconds to attempt spawning a new vehicle.")]
-	protected float m_fSpawnInterval;
+	[Attribute("15.0", UIWidgets.EditBox, "Minimum seconds between vehicle spawn attempts. The actual gap is randomised between min and max so traffic arrives at varying intervals.")]
+	protected float m_fSpawnIntervalMin;
+
+	[Attribute("30.0", UIWidgets.EditBox, "Maximum seconds between vehicle spawn attempts. The actual gap is randomised between min and max so traffic arrives at varying intervals.")]
+	protected float m_fSpawnIntervalMax;
 
 	[Attribute("3", UIWidgets.EditBox, "Maximum number of vehicles alive at any one time.")]
 	protected int m_iMaxConcurrent;
@@ -227,10 +233,29 @@ class EEF_CheckpointComponent : ScriptComponent
 
 		m_bTickersStarted = true;
 
-		GetGame().GetCallqueue().CallLater(SpawnTick, m_fSpawnInterval * 1000, true);
+		// Spawn timer reschedules itself with a fresh random delay each cycle (see ScheduleNextSpawn),
+		// so the gap between vehicles varies. The arrival poll is a plain fixed-interval repeat.
+		ScheduleNextSpawn();
 		GetGame().GetCallqueue().CallLater(ArrivalTick, m_fArrivalPollInterval * 1000, true);
 
 		DebugLog("Tickers started.");
+	}
+
+	//------------------------------------------------------------------------------------------------
+	//! Queue the next SpawnTick after a random delay in [min, max] seconds. Called once at startup
+	//! and again at the end of every SpawnTick, forming a self-perpetuating chain with a varying gap.
+	protected void ScheduleNextSpawn()
+	{
+		float minSec = m_fSpawnIntervalMin;
+		float maxSec = m_fSpawnIntervalMax;
+
+		if (minSec < 0)
+			minSec = 0;
+		if (maxSec < minSec)
+			maxSec = minSec;
+
+		float delay = Math.RandomFloat(minSec, maxSec);
+		GetGame().GetCallqueue().CallLater(SpawnTick, delay * 1000, false);
 	}
 
 	//------------------------------------------------------------------------------------------------
@@ -275,6 +300,10 @@ class EEF_CheckpointComponent : ScriptComponent
 
 	protected void SpawnTick()
 	{
+		// Always queue the next attempt first so the varying-interval chain keeps running even when
+		// this cycle skips spawning (inactive, at max, or markers unresolved).
+		ScheduleNextSpawn();
+
 		if (!m_bActive)
 			return;
 
@@ -666,6 +695,19 @@ class EEF_CheckpointComponent : ScriptComponent
 		// at a pinpoint - which causes overshoot-and-reverse. It arrives smoothly instead.
 		if (m_fWaypointCompletionRadius > 0)
 			waypoint.SetCompletionRadius(m_fWaypointCompletionRadius);
+
+		// Apply the speed limit as a waypoint movement-speed setting. Settings MUST be added before
+		// AddWaypoint() (API requirement) - same mechanism EEF_PatrolComponent uses.
+		SCR_AIWaypoint scrWaypoint = SCR_AIWaypoint.Cast(waypoint);
+		if (scrWaypoint)
+		{
+			SCR_AIGroupCharactersMovementSpeedSetting speedSetting = SCR_AIGroupCharactersMovementSpeedSetting.Create(
+				SCR_EAISettingOrigin.WAYPOINT,
+				m_eMaxSpeed
+			);
+			if (speedSetting)
+				scrWaypoint.AddSetting(speedSetting);
+		}
 
 		waypoint.SetOrigin(targetPos);
 		group.AddWaypoint(waypoint);
