@@ -725,7 +725,7 @@ class EEF_CheckpointComponent : ScriptComponent
 		return m_OnVehicleDespawned;
 	}
 
-	bool IsActive()
+	bool IsCheckpointActive()
 	{
 		return m_bActive;
 	}
