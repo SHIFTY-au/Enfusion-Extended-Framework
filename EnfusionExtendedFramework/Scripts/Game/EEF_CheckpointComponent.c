@@ -63,7 +63,6 @@ class EEF_CheckpointVehicleState
 	float m_fStateEnterTime;						//! World time (s) the current state was entered
 	bool m_bSeated;									//! True once the driver has been seated and dispatched
 	bool m_bHasContraband;							//! Contraband roll result - population data for #20 (placement) / interaction
-	int m_iLastAgentCount;							//! Agent count seen on the previous seat poll - used to wait for members to stop trickling in
 
 	void EEF_CheckpointVehicleState(IEntity vehicle, SCR_AIGroup group, float spawnTime, bool hasContraband)
 	{
@@ -74,7 +73,6 @@ class EEF_CheckpointVehicleState
 		m_fStateEnterTime = spawnTime;
 		m_bSeated = false;
 		m_bHasContraband = hasContraband;
-		m_iLastAgentCount = -1;
 	}
 }
 
@@ -384,14 +382,14 @@ class EEF_CheckpointComponent : ScriptComponent
 		state.m_OccupantGroup.GetAgents(agents);
 		int agentCount = agents.Count();
 
-		// Wait for the group to be fully present before seating: members spawn across several
-		// frames, so seat only once the count is non-zero AND unchanged since the previous poll.
-		// This teleports the whole crew in one pass - otherwise a late-arriving passenger is left
-		// to board on foot. The retry is still capped so a genuinely empty group can't loop forever.
-		bool countStable = (agentCount > 0 && agentCount == state.m_iLastAgentCount);
-		state.m_iLastAgentCount = agentCount;
+		// Seat only once the WHOLE crew is present. IsInitializing() staying true means the group
+		// is still spawning members across frames; GetAgents() then holds only the ones spawned so
+		// far (often just the driver), and seating now would leave later passengers to board on
+		// foot. Waiting for IsInitializing()==false AND a non-zero agent count teleports everyone
+		// in one pass. The retry is capped so a genuinely empty/misconfigured group can't loop forever.
+		bool ready = !state.m_OccupantGroup.IsInitializing() && agentCount > 0;
 
-		if (!countStable)
+		if (!ready)
 		{
 			if (attempt < CHECKPOINT_MAX_SEAT_ATTEMPTS)
 			{
@@ -405,8 +403,8 @@ class EEF_CheckpointComponent : ScriptComponent
 				DespawnVehicleState(state, true);
 				return;
 			}
-			// Count never settled but we do have members - seat what we have rather than stall.
-			DebugLog(string.Format("Agent count did not settle after %1 attempts - seating %2 present member(s).", attempt + 1, agentCount));
+			// Still flagged initializing but members exist - seat what we have rather than stall.
+			DebugLog(string.Format("Group still initializing after %1 attempts - seating %2 present member(s).", attempt + 1, agentCount));
 		}
 
 		bool driverSeated = false;
@@ -502,8 +500,11 @@ class EEF_CheckpointComponent : ScriptComponent
 			}
 
 			// Despawn once it reaches the exit, regardless of whether the checkpoint passage was
-			// detected (the route may not run exactly over the checkpoint origin).
-			if (HasArrived(vehiclePos, m_DespawnPoint.GetOrigin()))
+			// detected (the route may not run exactly over the checkpoint origin). The vehicle
+			// counts its drive waypoint as complete - and therefore STOPS - up to a full completion
+			// radius short of the exit marker, so the despawn radius must span that gap or the
+			// vehicle halts just outside it and never despawns.
+			if (HasArrivedWithin(vehiclePos, m_DespawnPoint.GetOrigin(), GetExitDespawnRadius()))
 			{
 				DebugLog("Vehicle reached exit point - despawning.");
 				DespawnVehicle(i, true);
@@ -710,9 +711,26 @@ class EEF_CheckpointComponent : ScriptComponent
 	//! Horizontal-only arrival test against m_fArrivalRadius.
 	protected bool HasArrived(vector fromPos, vector targetPos)
 	{
+		return HasArrivedWithin(fromPos, targetPos, m_fArrivalRadius);
+	}
+
+	//! Horizontal-only arrival test against an explicit radius.
+	protected bool HasArrivedWithin(vector fromPos, vector targetPos, float radius)
+	{
 		float dx = fromPos[0] - targetPos[0];
 		float dz = fromPos[2] - targetPos[2];
-		return (dx * dx + dz * dz) <= (m_fArrivalRadius * m_fArrivalRadius);
+		return (dx * dx + dz * dz) <= (radius * radius);
+	}
+
+	//! Radius at which a vehicle counts as arrived at the exit. The vehicle can stop up to a full
+	//! completion radius short of the marker, so span both plus the arrival tolerance.
+	protected float GetExitDespawnRadius()
+	{
+		float radius = m_fArrivalRadius;
+		if (m_fWaypointCompletionRadius > radius)
+			radius = m_fWaypointCompletionRadius;
+
+		return radius + m_fArrivalRadius;
 	}
 
 	protected EEF_CheckpointVehicleState FindStateByGroup(SCR_AIGroup group)
