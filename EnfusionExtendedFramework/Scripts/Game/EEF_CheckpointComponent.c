@@ -96,6 +96,10 @@ class EEF_CheckpointComponentClass : ScriptComponentClass {}
 //------------------------------------------------------------------------------------------------
 class EEF_CheckpointComponent : ScriptComponent
 {
+	// Seating retry tuning - GetAgents() can lag the group-ready signal by a tick or two.
+	protected const int CHECKPOINT_MAX_SEAT_ATTEMPTS = 20;	//! ~5s of retries at the interval below
+	protected const int CHECKPOINT_SEAT_RETRY_MS = 250;
+
 	// --------------------------------------------------------
 	// Route markers (referenced by entity name in the World Editor)
 	// --------------------------------------------------------
@@ -354,7 +358,12 @@ class EEF_CheckpointComponent : ScriptComponent
 	//------------------------------------------------------------------------------------------------
 	//! Seat the group into the vehicle (first member drives, rest ride as cargo) and give the
 	//! group its first move waypoint toward the checkpoint origin.
-	protected void SeatAndDispatch(EEF_CheckpointVehicleState state)
+	//!
+	//! Even after the group reports ready, GetAgents() can stay empty for a tick or two while the
+	//! members finish appearing (same latency the helicopter boarding polls around), so an empty
+	//! result is retried up to CHECKPOINT_MAX_SEAT_ATTEMPTS before giving up rather than despawning
+	//! on the first miss.
+	protected void SeatAndDispatch(EEF_CheckpointVehicleState state, int attempt = 0)
 	{
 		if (!state || !state.m_Vehicle || !state.m_OccupantGroup)
 			return;
@@ -362,12 +371,22 @@ class EEF_CheckpointComponent : ScriptComponent
 		if (state.m_bSeated)
 			return;
 
+		// Bail if the vehicle was cleaned up (e.g. StopCheckpoint) while this retry was pending.
+		if (m_aVehicles.Find(state) == -1)
+			return;
+
 		array<AIAgent> agents = {};
 		state.m_OccupantGroup.GetAgents(agents);
 
 		if (agents.IsEmpty())
 		{
-			DebugLog("Occupant group ready but has no agents - despawning vehicle.");
+			if (attempt < CHECKPOINT_MAX_SEAT_ATTEMPTS)
+			{
+				GetGame().GetCallqueue().CallLater(SeatAndDispatch, CHECKPOINT_SEAT_RETRY_MS, false, state, attempt + 1);
+				return;
+			}
+
+			DebugLog(string.Format("Occupant group still has no agents after %1 attempts - despawning vehicle. Check the group prefab has members with Spawn Immediately enabled.", attempt + 1));
 			DespawnVehicleState(state, true);
 			return;
 		}
