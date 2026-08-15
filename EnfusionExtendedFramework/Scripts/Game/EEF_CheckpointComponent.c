@@ -63,6 +63,7 @@ class EEF_CheckpointVehicleState
 	float m_fStateEnterTime;						//! World time (s) the current state was entered
 	bool m_bSeated;									//! True once the driver has been seated and dispatched
 	bool m_bHasContraband;							//! Contraband roll result - population data for #20 (placement) / interaction
+	int m_iLastAgentCount;							//! Agent count seen on the previous seat poll - used to wait for members to stop trickling in
 
 	void EEF_CheckpointVehicleState(IEntity vehicle, SCR_AIGroup group, float spawnTime, bool hasContraband)
 	{
@@ -73,6 +74,7 @@ class EEF_CheckpointVehicleState
 		m_fStateEnterTime = spawnTime;
 		m_bSeated = false;
 		m_bHasContraband = hasContraband;
+		m_iLastAgentCount = -1;
 	}
 }
 
@@ -144,8 +146,11 @@ class EEF_CheckpointComponent : ScriptComponent
 	// Arrival polling (no native 'arrived' event - poll distance)
 	// --------------------------------------------------------
 
-	[Attribute("8.0", UIWidgets.EditBox, "Distance in metres from a route point at which a vehicle is considered arrived and advanced to its next leg.")]
+	[Attribute("8.0", UIWidgets.EditBox, "Distance in metres from a route point at which a vehicle is considered arrived (checkpoint passage / exit despawn).")]
 	protected float m_fArrivalRadius;
+
+	[Attribute("15.0", UIWidgets.EditBox, "Completion radius in metres applied to drive waypoints. Keep this generous - a tight radius makes the AI overshoot then reverse to nail the exact point.")]
+	protected float m_fWaypointCompletionRadius;
 
 	[Attribute("1.0", UIWidgets.EditBox, "How often in seconds to poll vehicle positions for arrival at their current route point.")]
 	protected float m_fArrivalPollInterval;
@@ -377,8 +382,16 @@ class EEF_CheckpointComponent : ScriptComponent
 
 		array<AIAgent> agents = {};
 		state.m_OccupantGroup.GetAgents(agents);
+		int agentCount = agents.Count();
 
-		if (agents.IsEmpty())
+		// Wait for the group to be fully present before seating: members spawn across several
+		// frames, so seat only once the count is non-zero AND unchanged since the previous poll.
+		// This teleports the whole crew in one pass - otherwise a late-arriving passenger is left
+		// to board on foot. The retry is still capped so a genuinely empty group can't loop forever.
+		bool countStable = (agentCount > 0 && agentCount == state.m_iLastAgentCount);
+		state.m_iLastAgentCount = agentCount;
+
+		if (!countStable)
 		{
 			if (attempt < CHECKPOINT_MAX_SEAT_ATTEMPTS)
 			{
@@ -386,9 +399,14 @@ class EEF_CheckpointComponent : ScriptComponent
 				return;
 			}
 
-			DebugLog(string.Format("Occupant group still has no agents after %1 attempts - despawning vehicle. Check the group prefab has members with Spawn Immediately enabled.", attempt + 1));
-			DespawnVehicleState(state, true);
-			return;
+			if (agentCount == 0)
+			{
+				DebugLog(string.Format("Occupant group still has no agents after %1 attempts - despawning vehicle. Check the group prefab has members with Spawn Immediately enabled.", attempt + 1));
+				DespawnVehicleState(state, true);
+				return;
+			}
+			// Count never settled but we do have members - seat what we have rather than stall.
+			DebugLog(string.Format("Agent count did not settle after %1 attempts - seating %2 present member(s).", attempt + 1, agentCount));
 		}
 
 		bool driverSeated = false;
@@ -430,9 +448,15 @@ class EEF_CheckpointComponent : ScriptComponent
 
 		state.m_bSeated = true;
 		SetState(state, EEF_ECheckpointVehicleState.APPROACHING);
-		AssignMoveWaypoint(state.m_OccupantGroup, GetOwner().GetOrigin());
 
-		DebugLog("Vehicle seated and dispatched toward checkpoint.");
+		// Stage 1 is pure through-traffic: drive straight to the exit with a single waypoint and
+		// simply OBSERVE the checkpoint passage as the vehicle drives past. We deliberately do NOT
+		// place a waypoint at the checkpoint and hand off leg-by-leg - completing a waypoint stops
+		// the vehicle dead, and the AI then reverses / three-point-turns to re-path from a standstill.
+		// Stage 2 (#18) is where the vehicle actually stops at the checkpoint to queue.
+		AssignMoveWaypoint(state.m_OccupantGroup, m_DespawnPoint.GetOrigin());
+
+		DebugLog("Vehicle seated and dispatched through the checkpoint toward the exit.");
 	}
 
 	//------------------------------------------------------------------------------------------------
@@ -468,28 +492,21 @@ class EEF_CheckpointComponent : ScriptComponent
 
 			vector vehiclePos = state.m_Vehicle.GetOrigin();
 
-			switch (state.m_eState)
+			// Observe the checkpoint passage (state only - the waypoint is NOT reassigned here, so
+			// the vehicle keeps flowing straight through toward the exit).
+			if (state.m_eState == EEF_ECheckpointVehicleState.APPROACHING
+				&& HasArrived(vehiclePos, GetOwner().GetOrigin()))
 			{
-				case EEF_ECheckpointVehicleState.APPROACHING:
-				{
-					if (HasArrived(vehiclePos, GetOwner().GetOrigin()))
-					{
-						SetState(state, EEF_ECheckpointVehicleState.DEPARTING);
-						AssignMoveWaypoint(state.m_OccupantGroup, m_DespawnPoint.GetOrigin());
-						DebugLog("Vehicle reached checkpoint - departing toward despawn point.");
-					}
-					break;
-				}
+				SetState(state, EEF_ECheckpointVehicleState.DEPARTING);
+				DebugLog("Vehicle passed through the checkpoint.");
+			}
 
-				case EEF_ECheckpointVehicleState.DEPARTING:
-				{
-					if (HasArrived(vehiclePos, m_DespawnPoint.GetOrigin()))
-					{
-						DebugLog("Vehicle reached despawn point - despawning.");
-						DespawnVehicle(i, true);
-					}
-					break;
-				}
+			// Despawn once it reaches the exit, regardless of whether the checkpoint passage was
+			// detected (the route may not run exactly over the checkpoint origin).
+			if (HasArrived(vehiclePos, m_DespawnPoint.GetOrigin()))
+			{
+				DebugLog("Vehicle reached exit point - despawning.");
+				DespawnVehicle(i, true);
 			}
 		}
 	}
@@ -524,6 +541,11 @@ class EEF_CheckpointComponent : ScriptComponent
 			DebugLog("Failed to spawn move waypoint.");
 			return;
 		}
+
+		// A generous completion radius stops the vehicle counting the waypoint as "reached" only
+		// at a pinpoint - which causes overshoot-and-reverse. It arrives smoothly instead.
+		if (m_fWaypointCompletionRadius > 0)
+			waypoint.SetCompletionRadius(m_fWaypointCompletionRadius);
 
 		waypoint.SetOrigin(targetPos);
 		group.AddWaypoint(waypoint);
