@@ -104,9 +104,10 @@ class EEF_CheckpointComponent : ScriptComponent
 	// first, then the rest), so we poll fast to teleport each member the instant it appears - before
 	// group cohesion makes it walk to the vehicle on foot - and only dispatch once the roster has
 	// stopped growing and everyone is seated.
-	protected const int CHECKPOINT_MAX_SEAT_POLLS = 60;			//! ~9s ceiling at the interval below
+	protected const int CHECKPOINT_MAX_SEAT_POLLS = 80;			//! ~12s ceiling at the interval below
 	protected const int CHECKPOINT_SEAT_POLL_MS = 150;
-	protected const int CHECKPOINT_STABLE_POLLS_REQUIRED = 3;	//! consecutive good polls before dispatch (~450ms)
+	protected const int CHECKPOINT_STABLE_POLLS_REQUIRED = 10;	//! ~1.5s of a complete, seated, unchanged roster before dispatch
+	protected const int CHECKPOINT_MOPUP_STABLE_POLLS = 20;		//! ~3s settled after dispatch before we stop mopping up late members
 
 	// --------------------------------------------------------
 	// Route markers (referenced by entity name in the World Editor)
@@ -128,7 +129,7 @@ class EEF_CheckpointComponent : ScriptComponent
 	[Attribute("", UIWidgets.Object, "Occupant group prefab pool (SCR_AIGroup prefabs). One entry is picked at random per spawn - first member drives, the rest ride as cargo.")]
 	protected ref array<ref EEF_CheckpointPrefabEntry> m_aOccupantGroupPrefabs;
 
-	[Attribute("{E37A00B4AFED7B31}Prefabs/AI/Waypoints/AIWaypoint_Move.et", UIWidgets.ResourcePickerThumbnail, "Move waypoint prefab used to drive vehicles between route points.", "et")]
+	[Attribute("", UIWidgets.ResourcePickerThumbnail, "Move waypoint prefab used to drive vehicles to the exit. Select AIWaypoint_Move from Prefabs/AI/Waypoints/ (the same one used for Patrol/Hunter).", "et")]
 	protected ResourceName m_sWaypointPrefab;
 
 	// --------------------------------------------------------
@@ -365,9 +366,6 @@ class EEF_CheckpointComponent : ScriptComponent
 		if (!state || !state.m_Vehicle || !state.m_OccupantGroup)
 			return;
 
-		if (state.m_bSeated)
-			return;
-
 		// Bail if the vehicle was cleaned up (e.g. StopCheckpoint) while this poll was pending.
 		if (m_aVehicles.Find(state) == -1)
 			return;
@@ -376,50 +374,59 @@ class EEF_CheckpointComponent : ScriptComponent
 		state.m_OccupantGroup.GetAgents(agents);
 		int total = agents.Count();
 
-		// Teleport any member not yet in a seat.
+		// Teleport any member not yet in a seat. Runs on every poll - including after dispatch - so a
+		// member that spawns late (the roster grows slowly and unpredictably) is snapped into a seat
+		// the instant it appears instead of walking to (or chasing) the vehicle on foot.
 		SeatAllAgents(state, agents);
 
 		int seated = CountSeatedAgents(agents);
-		bool doneSpawning = !state.m_OccupantGroup.IsInitializing();
 		bool rosterStable = (total > 0 && total == state.m_iLastAgentTotal);
 		bool everyoneSeated = (total > 0 && seated == total);
 
-		if (doneSpawning && rosterStable && everyoneSeated)
+		if (rosterStable && everyoneSeated)
 			state.m_iStableSeatPolls = state.m_iStableSeatPolls + 1;
 		else
 			state.m_iStableSeatPolls = 0;
 
 		state.m_iLastAgentTotal = total;
 
-		// Crew complete, seated and settled - dispatch.
-		if (state.m_iStableSeatPolls >= CHECKPOINT_STABLE_POLLS_REQUIRED)
-		{
+		// Dispatch once, only after the roster has been complete, seated and UNCHANGED long enough
+		// that late members have almost certainly all arrived. IsInitializing() and the delayed-spawn
+		// event both proved unreliable for these group prefabs (they report "done" with the roster
+		// still growing), so completion is inferred from the count going quiet, not from an event.
+		if (!state.m_bSeated && state.m_iStableSeatPolls >= CHECKPOINT_STABLE_POLLS_REQUIRED)
 			Dispatch(state, seated, total);
-			return;
-		}
 
-		// Keep polling until the ceiling, then make a best-effort call.
+		// Once dispatched AND settled for a good while, stop - no more stragglers are coming.
+		if (state.m_bSeated && state.m_iStableSeatPolls >= CHECKPOINT_MOPUP_STABLE_POLLS)
+			return;
+
+		// Otherwise keep polling (and mopping up late members) until the ceiling.
 		if (attempt < CHECKPOINT_MAX_SEAT_POLLS)
 		{
 			GetGame().GetCallqueue().CallLater(SeatPoll, CHECKPOINT_SEAT_POLL_MS, false, state, attempt + 1);
 			return;
 		}
 
-		if (total == 0)
+		// Ceiling reached without ever dispatching - make a best-effort final call.
+		if (!state.m_bSeated)
 		{
-			DebugLog(string.Format("Occupant group still has no agents after %1 polls - despawning vehicle. Check the group prefab has members with Spawn Immediately enabled.", attempt + 1));
-			DespawnVehicleState(state, true);
-			return;
-		}
+			if (total == 0)
+			{
+				DebugLog(string.Format("Occupant group still has no agents after %1 polls - despawning vehicle. Check the group prefab has members with Spawn Immediately enabled.", attempt + 1));
+				DespawnVehicleState(state, true);
+				return;
+			}
 
-		if (!IsDriverSeated(state.m_Vehicle))
-		{
-			DebugLog("No driver could be seated (no free PILOT compartment?) - despawning vehicle.");
-			DespawnVehicleState(state, true);
-			return;
-		}
+			if (!IsDriverSeated(state.m_Vehicle))
+			{
+				DebugLog("No driver could be seated (no free PILOT compartment?) - despawning vehicle.");
+				DespawnVehicleState(state, true);
+				return;
+			}
 
-		Dispatch(state, seated, total);
+			Dispatch(state, seated, total);
+		}
 	}
 
 	//------------------------------------------------------------------------------------------------
