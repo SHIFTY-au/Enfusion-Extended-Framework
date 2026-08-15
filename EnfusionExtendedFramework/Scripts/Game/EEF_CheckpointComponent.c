@@ -359,8 +359,8 @@ class EEF_CheckpointComponent : ScriptComponent
 	}
 
 	//------------------------------------------------------------------------------------------------
-	//! Seat the group into the vehicle (first member drives, rest ride as cargo) and give the
-	//! group its first move waypoint toward the checkpoint origin.
+	//! Wait until the whole crew has spawned, seat them into the vehicle, then hand off to
+	//! VerifySeatedThenDispatch (which only gives the drive waypoint once occupants are aboard).
 	//!
 	//! Even after the group reports ready, GetAgents() can stay empty for a tick or two while the
 	//! members finish appearing (same latency the helicopter boarding polls around), so an empty
@@ -407,7 +407,34 @@ class EEF_CheckpointComponent : ScriptComponent
 			DebugLog(string.Format("Group still initializing after %1 attempts - seating %2 present member(s).", attempt + 1, agentCount));
 		}
 
+		// Log the vehicle's compartment layout once so a "passenger won't seat" problem is
+		// diagnosable from the console (e.g. no free CARGO slots -> passenger seats are TURRET/FFV).
+		LogCompartmentLayout(state.m_Vehicle);
+
+		if (!SeatAllAgents(state, agents))
+		{
+			DebugLog("Could not seat a driver (no free PILOT compartment?) - despawning vehicle.");
+			DespawnVehicleState(state, true);
+			return;
+		}
+
+		state.m_bSeated = true;
+
+		// Do NOT dispatch yet. MoveInVehicle is RPC-based, so occupants land a tick or two later;
+		// if we hand the group a move waypoint before everyone is actually in a seat, the group
+		// issues a mount order and the not-yet-seated passenger walks to the vehicle on foot -
+		// exactly the behaviour we want to avoid. Verify occupancy first, then dispatch.
+		VerifySeatedThenDispatch(state, 0);
+	}
+
+	//------------------------------------------------------------------------------------------------
+	//! Seat every agent: the first into the driver seat (PILOT), the rest into any free passenger
+	//! compartment (CARGO first, then TURRET as a fallback for vehicles whose passenger seats are
+	//! gunner positions). Returns true if a driver was seated (the minimum needed to drive).
+	protected bool SeatAllAgents(EEF_CheckpointVehicleState state, array<AIAgent> agents)
+	{
 		bool driverSeated = false;
+
 		foreach (AIAgent agent : agents)
 		{
 			if (!agent)
@@ -417,15 +444,20 @@ class EEF_CheckpointComponent : ScriptComponent
 			if (!character)
 				continue;
 
+			// Already seated (e.g. driver on a reseat pass) - leave them be.
+			if (IsInAnyCompartment(character))
+			{
+				if (!driverSeated)
+					driverSeated = true; // assume the first already-seated member is the driver
+				continue;
+			}
+
 			SCR_CompartmentAccessComponent access = SCR_CompartmentAccessComponent.Cast(
 				character.FindComponent(SCR_CompartmentAccessComponent)
 			);
 			if (!access)
 				continue;
 
-			// First seated member takes the driver seat (PILOT is the driver compartment for
-			// ground vehicles too); everyone else rides as cargo. MoveInVehicle teleports them
-			// into the seat - no walk-and-enter.
 			if (!driverSeated)
 			{
 				if (access.MoveInVehicle(state.m_Vehicle, ECompartmentType.PILOT))
@@ -433,18 +465,47 @@ class EEF_CheckpointComponent : ScriptComponent
 			}
 			else
 			{
-				access.MoveInVehicle(state.m_Vehicle, ECompartmentType.CARGO);
+				// Try cargo, then gunner/turret seats if the prefab has no cargo slots.
+				if (!access.MoveInVehicle(state.m_Vehicle, ECompartmentType.CARGO))
+					access.MoveInVehicle(state.m_Vehicle, ECompartmentType.TURRET);
 			}
 		}
 
-		if (!driverSeated)
+		return driverSeated;
+	}
+
+	//------------------------------------------------------------------------------------------------
+	//! Poll until every agent is actually in a seat (RPC latency), re-issuing seat commands for any
+	//! stragglers, then dispatch. Only once the crew is aboard is the drive waypoint assigned, so no
+	//! passenger is ever left to mount on foot. Dispatches anyway after the retry cap so a genuinely
+	//! unseatable member (no free slot) can't stall the whole vehicle forever.
+	protected void VerifySeatedThenDispatch(EEF_CheckpointVehicleState state, int attempt)
+	{
+		if (!state || !state.m_Vehicle || !state.m_OccupantGroup)
+			return;
+
+		if (m_aVehicles.Find(state) == -1)
+			return;
+
+		array<AIAgent> agents = {};
+		state.m_OccupantGroup.GetAgents(agents);
+
+		int seated = CountSeatedAgents(agents);
+		int total = agents.Count();
+
+		if (seated < total && attempt < CHECKPOINT_MAX_SEAT_ATTEMPTS)
 		{
-			DebugLog("Could not seat a driver (no free PILOT compartment?) - despawning vehicle.");
-			DespawnVehicleState(state, true);
+			// Re-issue seat commands for anyone still standing, then check again shortly.
+			SeatAllAgents(state, agents);
+			GetGame().GetCallqueue().CallLater(VerifySeatedThenDispatch, CHECKPOINT_SEAT_RETRY_MS, false, state, attempt + 1);
 			return;
 		}
 
-		state.m_bSeated = true;
+		if (seated < total)
+			DebugLog(string.Format("Dispatching with %1/%2 member(s) seated after %3 attempts - check the vehicle prefab has enough passenger seats.", seated, total, attempt + 1));
+		else
+			DebugLog(string.Format("All %1 member(s) seated - dispatching.", total));
+
 		SetState(state, EEF_ECheckpointVehicleState.APPROACHING);
 
 		// Stage 1 is pure through-traffic: drive straight to the exit with a single waypoint and
@@ -454,7 +515,70 @@ class EEF_CheckpointComponent : ScriptComponent
 		// Stage 2 (#18) is where the vehicle actually stops at the checkpoint to queue.
 		AssignMoveWaypoint(state.m_OccupantGroup, m_DespawnPoint.GetOrigin());
 
-		DebugLog("Vehicle seated and dispatched through the checkpoint toward the exit.");
+		DebugLog("Vehicle dispatched through the checkpoint toward the exit.");
+	}
+
+	//------------------------------------------------------------------------------------------------
+	//! True if the character currently occupies any compartment (is seated in a vehicle).
+	protected bool IsInAnyCompartment(IEntity character)
+	{
+		SCR_CompartmentAccessComponent access = SCR_CompartmentAccessComponent.Cast(
+			character.FindComponent(SCR_CompartmentAccessComponent)
+		);
+		return access && access.GetCompartment() != null;
+	}
+
+	//------------------------------------------------------------------------------------------------
+	//! Count how many of the group's agents are currently seated in a compartment.
+	protected int CountSeatedAgents(array<AIAgent> agents)
+	{
+		int seated = 0;
+		foreach (AIAgent agent : agents)
+		{
+			if (!agent)
+				continue;
+
+			IEntity character = agent.GetControlledEntity();
+			if (character && IsInAnyCompartment(character))
+				seated++;
+		}
+		return seated;
+	}
+
+	//------------------------------------------------------------------------------------------------
+	//! Log the vehicle's total/free compartment counts by type - diagnostics for seating issues.
+	protected void LogCompartmentLayout(IEntity vehicle)
+	{
+		if (!m_bDebugLog)
+			return;
+
+		SCR_BaseCompartmentManagerComponent compMgr = SCR_BaseCompartmentManagerComponent.Cast(
+			vehicle.FindComponent(SCR_BaseCompartmentManagerComponent)
+		);
+		if (!compMgr)
+		{
+			DebugLog("Vehicle has no SCR_BaseCompartmentManagerComponent - cannot seat occupants.");
+			return;
+		}
+
+		DebugLog(string.Format("Vehicle compartments (free/total) - PILOT %1/%2, CARGO %3/%4, TURRET %5/%6",
+			CountFreeCompartments(compMgr, ECompartmentType.PILOT), CountCompartments(compMgr, ECompartmentType.PILOT),
+			CountFreeCompartments(compMgr, ECompartmentType.CARGO), CountCompartments(compMgr, ECompartmentType.CARGO),
+			CountFreeCompartments(compMgr, ECompartmentType.TURRET), CountCompartments(compMgr, ECompartmentType.TURRET)));
+	}
+
+	protected int CountCompartments(SCR_BaseCompartmentManagerComponent compMgr, ECompartmentType type)
+	{
+		array<BaseCompartmentSlot> slots = {};
+		compMgr.GetCompartmentsOfType(slots, type);
+		return slots.Count();
+	}
+
+	protected int CountFreeCompartments(SCR_BaseCompartmentManagerComponent compMgr, ECompartmentType type)
+	{
+		array<BaseCompartmentSlot> slots = {};
+		compMgr.GetFreeCompartmentsOfType(slots, type);
+		return slots.Count();
 	}
 
 	//------------------------------------------------------------------------------------------------
