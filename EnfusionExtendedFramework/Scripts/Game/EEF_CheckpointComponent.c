@@ -5,8 +5,9 @@
 // Single orchestrator component for the whole checkpoint traffic
 // system. Attach to a SCR_BaseTriggerEntity placed in a World
 // Editor layer - that trigger entity's ORIGIN is the checkpoint
-// location itself (its sphere radius is unused in this stage,
-// it only becomes relevant in #18 zone queueing).
+// location itself and its SPHERE RADIUS defines the checkpoint
+// zone: a vehicle that drives inside the radius (Stage 2) joins
+// the queue.
 //
 // One component instance spawns and tracks MANY vehicles via an
 // internal array of EEF_CheckpointVehicleState (a plain data
@@ -19,10 +20,16 @@
 //
 // STAGE 1 (#17): the simplest possible traffic loop -
 //   spawn -> populate -> drive straight through -> despawn.
-// Waypoint sequence per vehicle: spawn point -> checkpoint
-// origin -> despawn point, then despawn. No queueing, holding,
-// zone-enter detection or player interaction - those are added
-// in Stage 2 (#18), built directly on top of this same file.
+//
+// STAGE 2 (#18): real checkpoint behaviour -
+//   spawn -> populate -> approach -> enter zone -> queue behind
+//   any vehicles already waiting -> advance to the front -> hold
+//   at the front until released -> depart -> despawn.
+// A debug auto-release timer stands in for the player-driven
+// permit/deny gate that Stage 3 (#19) will provide, so this stage
+// is fully testable standalone. This stage still has NO opinion on
+// *why* a vehicle is released - GetFrontVehicle() and the
+// vehicle-state-changed event are exposed so #19 can drive it.
 //
 // Runs on SERVER (authority) only.
 // ============================================================
@@ -30,21 +37,31 @@
 // ============================================================
 // Per-vehicle lifecycle state.
 //
-// Stage 1 uses: SPAWNING -> APPROACHING -> DEPARTING -> DESPAWNED.
 //   SPAWNING     - vehicle + occupant group spawned, waiting for
 //                  the group's members to finish delayed spawning
 //                  before they can be seated.
-//   APPROACHING  - driver seated, driving toward the checkpoint origin.
-//   DEPARTING    - driving from the checkpoint toward the despawn point.
+//   APPROACHING  - driver seated, driving toward the checkpoint zone
+//                  (has not yet entered the trigger sphere).
+//   QUEUED       - inside the zone, assigned a queue slot behind other
+//                  vehicles, driving to / waiting at that slot marker.
+//   AT_FRONT     - promoted to the front slot (slot 0), driving up to
+//                  the front stop position.
+//   HELD         - stopped at the front, waiting for a release decision
+//                  (Stage 2: the debug auto-release timer; Stage 3: the
+//                  player's permit/deny).
+//   DEPARTING    - released, driving from the front toward the despawn point.
 //   DESPAWNED    - marked for removal from the active array.
 //
-// Stage 2 (#18) inserts QUEUED / AT_FRONT / HELD / PERMITTED /
-// DENIED between APPROACHING and DEPARTING - do not add them here.
+// Stage 3 (#19) adds the real permit/deny result on top of HELD/DEPARTING;
+// keep any PERMITTED/DENIED distinction out of this file.
 // ============================================================
 enum EEF_ECheckpointVehicleState
 {
 	SPAWNING,
 	APPROACHING,
+	QUEUED,
+	AT_FRONT,
+	HELD,
 	DEPARTING,
 	DESPAWNED
 }
@@ -65,6 +82,8 @@ class EEF_CheckpointVehicleState
 	bool m_bHasContraband;							//! Contraband roll result - population data for #20 (placement) / interaction
 	int m_iLastAgentTotal;							//! Agent count seen on the previous seat poll - detects the roster still growing
 	int m_iStableSeatPolls;							//! Consecutive polls with a full, stable, fully-seated roster
+	int m_iQueueSlot;								//! Queue position: 0 = front, -1 = not in the queue (Stage 2 #18)
+	bool m_bReleasePending;							//! True once a release has been scheduled/requested for this vehicle, so it fires once (Stage 2 #18)
 
 	void EEF_CheckpointVehicleState(IEntity vehicle, SCR_AIGroup group, float spawnTime, bool hasContraband)
 	{
@@ -77,6 +96,8 @@ class EEF_CheckpointVehicleState
 		m_bHasContraband = hasContraband;
 		m_iLastAgentTotal = -1;
 		m_iStableSeatPolls = 0;
+		m_iQueueSlot = -1;
+		m_bReleasePending = false;
 	}
 }
 
@@ -93,8 +114,24 @@ class EEF_CheckpointPrefabEntry
 	ResourceName m_sPrefab;
 }
 
+// ============================================================
+// A single ordered queue-slot marker (Stage 2 #18). One entry per
+// physical stopping position in the queue lane. ORDER MATTERS: the
+// first entry is the front of the queue (the stop line closest to
+// the checkpoint), the last entry is the back. Place at least as
+// many markers as "Max concurrent vehicles" so the queue never
+// overflows. A plain marker/waypoint entity works - only its origin
+// is used.
+// ============================================================
+[BaseContainerProps()]
+class EEF_CheckpointQueueSlotEntry
+{
+	[Attribute("", UIWidgets.EditBox, "Name of a queue slot marker entity. First entry = front (checkpoint stop line), last = back of the queue.")]
+	string m_sMarkerName;
+}
+
 //------------------------------------------------------------------------------------------------
-[ComponentEditorProps(category: "EEF/Checkpoint", description: "Checkpoint traffic orchestrator - attach to a SCR_BaseTriggerEntity in a layer. Spawns vehicles that drive through the checkpoint and despawn. Stage 1: no queueing yet.")]
+[ComponentEditorProps(category: "EEF/Checkpoint", description: "Checkpoint traffic orchestrator - attach to a SCR_BaseTriggerEntity in a layer. Spawns vehicles that approach, queue in an ordered lane, hold at the front, then depart and despawn. Stage 2: a debug timer auto-releases the front vehicle (player-driven release arrives in #19).")]
 class EEF_CheckpointComponentClass : ScriptComponentClass {}
 
 //------------------------------------------------------------------------------------------------
@@ -118,6 +155,14 @@ class EEF_CheckpointComponent : ScriptComponent
 
 	[Attribute("", UIWidgets.EditBox, "Name of the despawn/exit point marker entity (downstream). Vehicles are deleted on arrival here.")]
 	protected string m_sDespawnPointName;
+
+	// --------------------------------------------------------
+	// Queue lane (Stage 2 #18) - ordered stopping positions between
+	// the approach and the checkpoint. First entry = front.
+	// --------------------------------------------------------
+
+	[Attribute("", UIWidgets.Object, "Ordered queue slot markers. First entry = front of the queue (checkpoint stop line), last = back. Place at least 'Max concurrent vehicles' markers so the lane never overflows.")]
+	protected ref array<ref EEF_CheckpointQueueSlotEntry> m_aQueueSlotMarkers;
 
 	// --------------------------------------------------------
 	// Prefab pools
@@ -165,11 +210,21 @@ class EEF_CheckpointComponent : ScriptComponent
 	[Attribute("15.0", UIWidgets.EditBox, "Completion radius in metres applied to drive waypoints. Keep this generous - a tight radius makes the AI overshoot then reverse to nail the exact point.")]
 	protected float m_fWaypointCompletionRadius;
 
+	[Attribute("5.0", UIWidgets.EditBox, "Completion radius in metres applied specifically to queue-slot drive waypoints. Smaller than the general radius so queued vehicles line up tightly at their markers instead of stopping short.")]
+	protected float m_fQueueSlotCompletionRadius;
+
 	[Attribute("1.0", UIWidgets.EditBox, "How often in seconds to poll vehicle positions for arrival at their current route point.")]
 	protected float m_fArrivalPollInterval;
 
 	[Attribute("300.0", UIWidgets.EditBox, "Failsafe: force-despawn a vehicle that has been alive this many seconds without completing its route (e.g. stuck or piled up).")]
 	protected float m_fMaxVehicleLifetime;
+
+	// --------------------------------------------------------
+	// Release gate (Stage 2 #18 debug stand-in for #19)
+	// --------------------------------------------------------
+
+	[Attribute("8.0", UIWidgets.EditBox, "DEBUG stand-in for Stage 3 (#19): seconds a vehicle waits HELD at the front before it is auto-released. Once the real player-driven permit/deny gate exists this is bypassed. Set <= 0 to never auto-release (front vehicle waits forever - only useful with an external release caller).")]
+	protected float m_fDebugAutoReleaseSeconds;
 
 	// --------------------------------------------------------
 	// Startup / debug
@@ -190,9 +245,23 @@ class EEF_CheckpointComponent : ScriptComponent
 	protected IEntity m_SpawnPoint;
 	protected IEntity m_DespawnPoint;
 
+	//! Resolved, ordered queue-slot marker entities (index 0 = front). Lazily populated from
+	//! m_aQueueSlotMarkers by ResolveQueueSlots(). (Stage 2 #18)
+	protected ref array<IEntity> m_aQueueSlots = new array<IEntity>();
+	protected bool m_bQueueSlotsResolved = false;
+
+	//! Cached checkpoint-zone radius (the trigger's sphere radius). A vehicle within this
+	//! distance of the checkpoint origin has entered the zone. (Stage 2 #18)
+	protected float m_fZoneRadius = -1;
+
 	//! Fired with the EEF_CheckpointVehicleState just before it is removed. Later stages
 	//! (e.g. #21 "stop spawning during a firefight") observe this. Lazily created.
 	protected ref ScriptInvoker m_OnVehicleDespawned;
+
+	//! Fired with the EEF_CheckpointVehicleState whenever its lifecycle state changes. Stage 3
+	//! (#19 interaction) and Stage 5 (#21 hostile) observe queue-state transitions here. Lazily
+	//! created. (Stage 2 #18)
+	protected ref ScriptInvoker m_OnVehicleStateChanged;
 
 	//------------------------------------------------------------------------------------------------
 	// INITIALISATION
@@ -512,14 +581,14 @@ class EEF_CheckpointComponent : ScriptComponent
 
 		SetState(state, EEF_ECheckpointVehicleState.APPROACHING);
 
-		// Stage 1 is pure through-traffic: drive straight to the exit with a single waypoint and
-		// simply OBSERVE the checkpoint passage as the vehicle drives past. We deliberately do NOT
-		// place a waypoint at the checkpoint and hand off leg-by-leg - completing a waypoint stops
-		// the vehicle dead, and the AI then reverses / three-point-turns to re-path from a standstill.
-		// Stage 2 (#18) is where the vehicle actually stops at the checkpoint to queue.
-		AssignMoveWaypoint(state.m_OccupantGroup, m_DespawnPoint.GetOrigin());
+		// Stage 2: drive toward the checkpoint ZONE, not straight to the exit. The vehicle keeps
+		// APPROACHING until ArrivalTick sees it cross into the trigger sphere, at which point it is
+		// assigned a queue slot and re-tasked to that slot marker. We aim the approach waypoint at
+		// the checkpoint origin (with the generous general completion radius so it flows in smoothly)
+		// - the zone-enter detection fires well before it would ever complete that waypoint.
+		AssignMoveWaypoint(state.m_OccupantGroup, GetOwner().GetOrigin(), m_fWaypointCompletionRadius);
 
-		DebugLog("Vehicle dispatched through the checkpoint toward the exit.");
+		DebugLog("Vehicle dispatched - approaching the checkpoint zone.");
 	}
 
 	//------------------------------------------------------------------------------------------------
@@ -610,7 +679,9 @@ class EEF_CheckpointComponent : ScriptComponent
 	//------------------------------------------------------------------------------------------------
 
 	//! Poll every vehicle for arrival at its current route point (no native 'arrived' event) and
-	//! advance it along spawn -> checkpoint -> despawn, then delete it.
+	//! advance it through the queue state machine:
+	//!   APPROACHING -> (enter zone) QUEUED/AT_FRONT -> (reach front) HELD
+	//!               -> (released) DEPARTING -> (reach exit) despawn.
 	protected void ArrivalTick()
 	{
 		if (m_aVehicles.IsEmpty())
@@ -638,26 +709,366 @@ class EEF_CheckpointComponent : ScriptComponent
 
 			vector vehiclePos = state.m_Vehicle.GetOrigin();
 
-			// Observe the checkpoint passage (state only - the waypoint is NOT reassigned here, so
-			// the vehicle keeps flowing straight through toward the exit).
-			if (state.m_eState == EEF_ECheckpointVehicleState.APPROACHING
-				&& HasArrived(vehiclePos, GetOwner().GetOrigin()))
+			switch (state.m_eState)
 			{
-				SetState(state, EEF_ECheckpointVehicleState.DEPARTING);
-				DebugLog("Vehicle passed through the checkpoint.");
-			}
+				case EEF_ECheckpointVehicleState.APPROACHING:
+				{
+					// Wait until the vehicle crosses into the trigger sphere, then slot it.
+					if (IsInZone(vehiclePos))
+						EnterQueue(state);
+					break;
+				}
 
-			// Despawn once it reaches the exit, regardless of whether the checkpoint passage was
-			// detected (the route may not run exactly over the checkpoint origin). The vehicle
-			// counts its drive waypoint as complete - and therefore STOPS - up to a full completion
-			// radius short of the exit marker, so the despawn radius must span that gap or the
-			// vehicle halts just outside it and never despawns.
-			if (HasArrivedWithin(vehiclePos, m_DespawnPoint.GetOrigin(), GetExitDespawnRadius()))
-			{
-				DebugLog("Vehicle reached exit point - despawning.");
-				DespawnVehicle(i, true);
+				case EEF_ECheckpointVehicleState.AT_FRONT:
+				{
+					// Once it has driven up to the front stop line, hold it for the release decision.
+					if (state.m_iQueueSlot == 0 && HasArrivedAtSlot(vehiclePos, 0))
+					{
+						SetState(state, EEF_ECheckpointVehicleState.HELD);
+						DebugLog("Front vehicle arrived at the stop line - HELD, awaiting release.");
+						BeginHold(state);
+					}
+					break;
+				}
+
+				case EEF_ECheckpointVehicleState.DEPARTING:
+				{
+					// The vehicle counts its drive waypoint as complete - and therefore STOPS - up to a
+					// full completion radius short of the exit marker, so the despawn radius must span
+					// that gap or the vehicle halts just outside it and never despawns.
+					if (HasArrivedWithin(vehiclePos, m_DespawnPoint.GetOrigin(), GetExitDespawnRadius()))
+					{
+						DebugLog("Vehicle reached exit point - despawning.");
+						DespawnVehicle(i, true);
+					}
+					break;
+				}
+
+				// QUEUED / HELD: parked at a slot, waiting to be promoted or released - nothing to poll.
+				// SPAWNING / DESPAWNED: handled elsewhere (seat poll / removal).
 			}
 		}
+	}
+
+	//------------------------------------------------------------------------------------------------
+	// QUEUE (Stage 2 #18)
+	//
+	// This component's own m_aVehicles array is the source of truth for queue order - there is no
+	// native "trigger contains N vehicles, ordered" query. Each queued vehicle carries m_iQueueSlot
+	// (0 = front). When the front vehicle departs we PromoteQueue(): every remaining vehicle's slot
+	// decrements and it is re-tasked to drive up to its new marker, so the whole line advances.
+	//------------------------------------------------------------------------------------------------
+
+	//! Transition an APPROACHING vehicle into the queue: claim the lowest free slot, drive it to that
+	//! slot's marker, and set QUEUED (or AT_FRONT if it took slot 0). If the lane is full it stays
+	//! APPROACHING and retries on the next tick (a slot frees when the front vehicle departs).
+	protected void EnterQueue(EEF_CheckpointVehicleState state)
+	{
+		int slot = AssignQueueSlot();
+		if (slot < 0)
+		{
+			// Lane full - hold position here and retry once a slot frees. Clearing the waypoints
+			// stops the vehicle where it is instead of letting it plough into the checkpoint. Only
+			// do this once (when it still has an approach waypoint) to avoid re-clearing every tick.
+			if (HasWaypoints(state.m_OccupantGroup))
+			{
+				DebugLog("Checkpoint zone entered but the queue is full - holding position (add more queue slot markers than max concurrent vehicles).");
+				ClearWaypoints(state.m_OccupantGroup);
+			}
+			return;
+		}
+
+		state.m_iQueueSlot = slot;
+		DriveToSlot(state, slot);
+
+		if (slot == 0)
+		{
+			SetState(state, EEF_ECheckpointVehicleState.AT_FRONT);
+			DebugLog("Vehicle entered the zone into the FRONT slot - advancing to the stop line.");
+		}
+		else
+		{
+			SetState(state, EEF_ECheckpointVehicleState.QUEUED);
+			DebugLog(string.Format("Vehicle entered the zone into queue slot %1.", slot));
+		}
+	}
+
+	//! Lowest queue slot index not currently claimed by another vehicle, capped at the number of
+	//! authored markers. Returns -1 if the lane is full or no markers are configured.
+	protected int AssignQueueSlot()
+	{
+		ResolveQueueSlots();
+
+		int capacity = m_aQueueSlots.Count();
+		if (capacity == 0)
+		{
+			DebugLog("No queue slot markers configured - cannot queue. Add queue slot markers in the component attributes.");
+			return -1;
+		}
+
+		for (int slot = 0; slot < capacity; slot++)
+		{
+			if (!IsSlotOccupied(slot))
+				return slot;
+		}
+
+		return -1;
+	}
+
+	//! True if any queued/held vehicle currently holds this slot index.
+	protected bool IsSlotOccupied(int slot)
+	{
+		foreach (EEF_CheckpointVehicleState state : m_aVehicles)
+		{
+			if (state && state.m_iQueueSlot == slot)
+				return true;
+		}
+		return false;
+	}
+
+	//! Re-pack the queue after a vehicle leaves it (released or force-despawned): collect every
+	//! vehicle still waiting in the lane, order them by their current slot, and reassign compact
+	//! slots 0..n-1 - re-tasking each to drive to its new (closer or unchanged) marker. Whoever ends
+	//! up in slot 0 becomes AT_FRONT and heads for the stop line. Re-packing (rather than a blind
+	//! decrement) closes any gap left by a middle vehicle despawning, so the line never stalls.
+	protected void PromoteQueue()
+	{
+		// Gather the vehicles still queued, in current slot order.
+		array<EEF_CheckpointVehicleState> queued = {};
+		foreach (EEF_CheckpointVehicleState state : m_aVehicles)
+		{
+			if (!state || state.m_iQueueSlot < 0)
+				continue;
+
+			// A vehicle already DEPARTING keeps its (stale) slot until despawn but is no longer in the
+			// lane - never re-task it back to a marker.
+			if (state.m_eState != EEF_ECheckpointVehicleState.QUEUED
+				&& state.m_eState != EEF_ECheckpointVehicleState.AT_FRONT
+				&& state.m_eState != EEF_ECheckpointVehicleState.HELD)
+				continue;
+
+			InsertBySlot(queued, state);
+		}
+
+		for (int newSlot = 0; newSlot < queued.Count(); newSlot++)
+		{
+			EEF_CheckpointVehicleState state = queued[newSlot];
+
+			bool slotChanged = (state.m_iQueueSlot != newSlot);
+			state.m_iQueueSlot = newSlot;
+
+			if (newSlot == 0)
+			{
+				// Already at the front (HELD at the stop line, or AT_FRONT driving up to it) and not
+				// actually moved - leave it be rather than re-issuing the same waypoint / resetting a hold.
+				bool alreadyFront = (state.m_eState == EEF_ECheckpointVehicleState.HELD
+					|| state.m_eState == EEF_ECheckpointVehicleState.AT_FRONT);
+				if (alreadyFront && !slotChanged)
+					continue;
+
+				DriveToSlot(state, newSlot);
+				SetState(state, EEF_ECheckpointVehicleState.AT_FRONT);
+				DebugLog("Queue advanced - next vehicle promoted to the front.");
+			}
+			else if (slotChanged)
+			{
+				DriveToSlot(state, newSlot);
+				SetState(state, EEF_ECheckpointVehicleState.QUEUED);
+				DebugLog(string.Format("Queue advanced - vehicle moved up to slot %1.", newSlot));
+			}
+		}
+	}
+
+	//! Insert a state into a list kept sorted ascending by m_iQueueSlot.
+	protected void InsertBySlot(array<EEF_CheckpointVehicleState> list, EEF_CheckpointVehicleState state)
+	{
+		for (int i = 0; i < list.Count(); i++)
+		{
+			if (state.m_iQueueSlot < list[i].m_iQueueSlot)
+			{
+				list.InsertAt(state, i);
+				return;
+			}
+		}
+		list.Insert(state);
+	}
+
+	//! Re-task a vehicle's group to drive to the given slot marker, using the tight queue-slot
+	//! completion radius so it stops neatly on the mark.
+	protected void DriveToSlot(EEF_CheckpointVehicleState state, int slot)
+	{
+		vector slotPos;
+		if (!GetSlotPosition(slot, slotPos))
+			return;
+
+		AssignMoveWaypoint(state.m_OccupantGroup, slotPos, m_fQueueSlotCompletionRadius);
+	}
+
+	//------------------------------------------------------------------------------------------------
+	// RELEASE GATE (Stage 2 #18 debug stand-in for #19)
+	//------------------------------------------------------------------------------------------------
+
+	//! Start the debug hold timer for a vehicle that just became HELD at the front. Stage 3 (#19)
+	//! replaces this with the real player permit/deny; until then a timer auto-releases the vehicle.
+	protected void BeginHold(EEF_CheckpointVehicleState state)
+	{
+		if (m_fDebugAutoReleaseSeconds <= 0)
+		{
+			DebugLog("Debug auto-release disabled - front vehicle will wait for an external release call.");
+			return;
+		}
+
+		state.m_bReleasePending = true;
+		GetGame().GetCallqueue().CallLater(ReleaseHeldVehicle, m_fDebugAutoReleaseSeconds * 1000, false, state);
+	}
+
+	//! Debug timer callback: release the vehicle if it is still the HELD front vehicle we scheduled.
+	protected void ReleaseHeldVehicle(EEF_CheckpointVehicleState state)
+	{
+		if (!state || m_aVehicles.Find(state) == -1)
+			return;
+
+		if (state.m_eState != EEF_ECheckpointVehicleState.HELD)
+			return;
+
+		DebugLog("Debug auto-release timer elapsed - releasing front vehicle.");
+		ReleaseVehicle(state);
+	}
+
+	//! Public permit signal: release the vehicle currently held at the front, if any. This is the
+	//! seam Stage 3 (#19) drives instead of the debug timer.
+	void ReleaseFrontVehicle()
+	{
+		EEF_CheckpointVehicleState front = GetFrontVehicle();
+		if (front && front.m_eState == EEF_ECheckpointVehicleState.HELD)
+			ReleaseVehicle(front);
+	}
+
+	//! Send a held vehicle on its way: leave the queue, drive to the exit, and promote the rest.
+	protected void ReleaseVehicle(EEF_CheckpointVehicleState state)
+	{
+		if (!state)
+			return;
+
+		state.m_iQueueSlot = -1;
+		state.m_bReleasePending = false;
+
+		SetState(state, EEF_ECheckpointVehicleState.DEPARTING);
+		AssignMoveWaypoint(state.m_OccupantGroup, m_DespawnPoint.GetOrigin(), m_fWaypointCompletionRadius);
+		DebugLog("Vehicle released - departing toward the exit.");
+
+		// Advance everyone behind it now that the front slot is free.
+		PromoteQueue();
+	}
+
+	//------------------------------------------------------------------------------------------------
+	// ZONE / SLOT HELPERS (Stage 2 #18)
+	//------------------------------------------------------------------------------------------------
+
+	//! Resolve the ordered queue-slot marker names into entities exactly once. Missing markers are
+	//! skipped with a warning, so an author typo drops one slot rather than breaking the whole lane.
+	protected void ResolveQueueSlots()
+	{
+		if (m_bQueueSlotsResolved)
+			return;
+
+		m_bQueueSlotsResolved = true;
+		m_aQueueSlots.Clear();
+
+		if (!m_aQueueSlotMarkers)
+			return;
+
+		foreach (EEF_CheckpointQueueSlotEntry entry : m_aQueueSlotMarkers)
+		{
+			if (!entry || entry.m_sMarkerName.IsEmpty())
+				continue;
+
+			IEntity marker = GetGame().GetWorld().FindEntityByName(entry.m_sMarkerName);
+			if (!marker)
+			{
+				DebugLog(string.Format("Queue slot marker '%1' not found in world - skipping.", entry.m_sMarkerName));
+				continue;
+			}
+
+			m_aQueueSlots.Insert(marker);
+		}
+
+		DebugLog(string.Format("Resolved %1 queue slot marker(s).", m_aQueueSlots.Count()));
+	}
+
+	//! World position of a queue slot marker by index. Returns false if the index is out of range.
+	protected bool GetSlotPosition(int slot, out vector outPos)
+	{
+		ResolveQueueSlots();
+
+		if (slot < 0 || slot >= m_aQueueSlots.Count() || !m_aQueueSlots[slot])
+			return false;
+
+		outPos = m_aQueueSlots[slot].GetOrigin();
+		return true;
+	}
+
+	//! True if the vehicle has reached its slot marker (stopped on the mark). Spans the completion
+	//! radius plus the arrival tolerance, same idea as the exit despawn radius.
+	protected bool HasArrivedAtSlot(vector vehiclePos, int slot)
+	{
+		vector slotPos;
+		if (!GetSlotPosition(slot, slotPos))
+			return false;
+
+		float radius = m_fQueueSlotCompletionRadius + m_fArrivalRadius;
+		return HasArrivedWithin(vehiclePos, slotPos, radius);
+	}
+
+	//! True if the vehicle position is inside the checkpoint zone (trigger sphere).
+	protected bool IsInZone(vector vehiclePos)
+	{
+		return HasArrivedWithin(vehiclePos, GetOwner().GetOrigin(), GetZoneRadius());
+	}
+
+	//! Checkpoint zone radius, cached from the owning trigger's sphere radius. Falls back to the
+	//! arrival radius (treating the checkpoint as a point) with a one-time warning if the trigger
+	//! has no radius set, so queueing still functions rather than silently never triggering.
+	protected float GetZoneRadius()
+	{
+		if (m_fZoneRadius >= 0)
+			return m_fZoneRadius;
+
+		SCR_BaseTriggerEntity trigger = SCR_BaseTriggerEntity.Cast(GetOwner());
+		if (trigger && trigger.GetSphereRadius() > 0)
+		{
+			m_fZoneRadius = trigger.GetSphereRadius();
+		}
+		else
+		{
+			m_fZoneRadius = m_fArrivalRadius;
+			DebugLog(string.Format("Trigger has no sphere radius set - falling back to the arrival radius (%1m) as the checkpoint zone. Set a radius on the trigger entity for a proper queue zone.", m_fArrivalRadius));
+		}
+
+		return m_fZoneRadius;
+	}
+
+	//! True if the group still has any waypoint queued.
+	protected bool HasWaypoints(SCR_AIGroup group)
+	{
+		if (!group)
+			return false;
+
+		array<AIWaypoint> queue = {};
+		group.GetWaypoints(queue);
+		return !queue.IsEmpty();
+	}
+
+	//! Remove all of a group's waypoints (stops the vehicle where it is).
+	protected void ClearWaypoints(SCR_AIGroup group)
+	{
+		if (!group)
+			return;
+
+		array<AIWaypoint> queue = {};
+		group.GetWaypoints(queue);
+		foreach (AIWaypoint wp : queue)
+			group.RemoveWaypoint(wp);
 	}
 
 	//------------------------------------------------------------------------------------------------
@@ -665,8 +1076,9 @@ class EEF_CheckpointComponent : ScriptComponent
 	//------------------------------------------------------------------------------------------------
 
 	//! Clear the group's current waypoints and give it a single move waypoint at targetPos.
-	//! A member in the driver seat makes the group drive the vehicle there.
-	protected void AssignMoveWaypoint(SCR_AIGroup group, vector targetPos)
+	//! A member in the driver seat makes the group drive the vehicle there. completionRadius < 0
+	//! falls back to the general m_fWaypointCompletionRadius.
+	protected void AssignMoveWaypoint(SCR_AIGroup group, vector targetPos, float completionRadius = -1)
 	{
 		if (!group)
 			return;
@@ -691,10 +1103,14 @@ class EEF_CheckpointComponent : ScriptComponent
 			return;
 		}
 
+		if (completionRadius < 0)
+			completionRadius = m_fWaypointCompletionRadius;
+
 		// A generous completion radius stops the vehicle counting the waypoint as "reached" only
-		// at a pinpoint - which causes overshoot-and-reverse. It arrives smoothly instead.
-		if (m_fWaypointCompletionRadius > 0)
-			waypoint.SetCompletionRadius(m_fWaypointCompletionRadius);
+		// at a pinpoint - which causes overshoot-and-reverse. It arrives smoothly instead. Queue
+		// slots pass a smaller radius so vehicles line up tightly at their markers.
+		if (completionRadius > 0)
+			waypoint.SetCompletionRadius(completionRadius);
 
 		// Apply the speed limit as a waypoint movement-speed setting. Settings MUST be added before
 		// AddWaypoint() (API requirement) - same mechanism EEF_PatrolComponent uses.
@@ -725,18 +1141,37 @@ class EEF_CheckpointComponent : ScriptComponent
 			return;
 
 		EEF_CheckpointVehicleState state = m_aVehicles[index];
+		bool wasInLane = WasInLane(state);
 		m_aVehicles.Remove(index);
 		DestroyVehicleState(state, fireEvent);
+
+		// If a queued/front vehicle vanished (e.g. failsafe cull), close the gap so the line advances.
+		if (wasInLane && m_bActive)
+			PromoteQueue();
 	}
 
 	//! Same as DespawnVehicle but located by state reference (used before we have an index).
 	protected void DespawnVehicleState(EEF_CheckpointVehicleState state, bool fireEvent)
 	{
+		bool wasInLane = WasInLane(state);
+
 		int index = m_aVehicles.Find(state);
 		if (index != -1)
 			m_aVehicles.Remove(index);
 
 		DestroyVehicleState(state, fireEvent);
+
+		if (wasInLane && m_bActive)
+			PromoteQueue();
+	}
+
+	//! True if the state currently holds a queue slot in the waiting lane (not yet departing).
+	protected bool WasInLane(EEF_CheckpointVehicleState state)
+	{
+		return state && state.m_iQueueSlot >= 0
+			&& (state.m_eState == EEF_ECheckpointVehicleState.QUEUED
+				|| state.m_eState == EEF_ECheckpointVehicleState.AT_FRONT
+				|| state.m_eState == EEF_ECheckpointVehicleState.HELD);
 	}
 
 	//! Delete the entities backing a state and fire the despawn event. Does NOT touch the array.
@@ -869,12 +1304,6 @@ class EEF_CheckpointComponent : ScriptComponent
 		return valid[Math.RandomInt(0, valid.Count())];
 	}
 
-	//! Horizontal-only arrival test against m_fArrivalRadius.
-	protected bool HasArrived(vector fromPos, vector targetPos)
-	{
-		return HasArrivedWithin(fromPos, targetPos, m_fArrivalRadius);
-	}
-
 	//! Horizontal-only arrival test against an explicit radius.
 	protected bool HasArrivedWithin(vector fromPos, vector targetPos, float radius)
 	{
@@ -908,8 +1337,15 @@ class EEF_CheckpointComponent : ScriptComponent
 
 	protected void SetState(EEF_CheckpointVehicleState state, EEF_ECheckpointVehicleState newState)
 	{
+		if (state.m_eState == newState)
+			return;
+
 		state.m_eState = newState;
 		state.m_fStateEnterTime = GetWorldTimeSeconds();
+
+		// Notify observers (#19 interaction, #21 hostile) of the queue-state transition.
+		if (m_OnVehicleStateChanged)
+			m_OnVehicleStateChanged.Invoke(state);
 	}
 
 	protected float GetWorldTimeSeconds()
@@ -933,6 +1369,30 @@ class EEF_CheckpointComponent : ScriptComponent
 		if (!m_OnVehicleDespawned)
 			m_OnVehicleDespawned = new ScriptInvoker();
 		return m_OnVehicleDespawned;
+	}
+
+	//! State-changed event - Invoke passes the EEF_CheckpointVehicleState whose state just changed.
+	//! Read by #19 (interaction) and #21 (hostile) to react to queue transitions. Lazily created.
+	ScriptInvoker GetOnVehicleStateChanged()
+	{
+		if (!m_OnVehicleStateChanged)
+			m_OnVehicleStateChanged = new ScriptInvoker();
+		return m_OnVehicleStateChanged;
+	}
+
+	//! The vehicle currently at the front of the queue (slot 0) - the one AT_FRONT driving up to the
+	//! stop line or HELD waiting for release. Returns null if no vehicle is at the front. Read by #19
+	//! to know which vehicle a player interaction applies to.
+	EEF_CheckpointVehicleState GetFrontVehicle()
+	{
+		foreach (EEF_CheckpointVehicleState state : m_aVehicles)
+		{
+			if (state && state.m_iQueueSlot == 0
+				&& (state.m_eState == EEF_ECheckpointVehicleState.AT_FRONT
+					|| state.m_eState == EEF_ECheckpointVehicleState.HELD))
+				return state;
+		}
+		return null;
 	}
 
 	bool IsCheckpointActive()
