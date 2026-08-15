@@ -61,8 +61,10 @@ class EEF_CheckpointVehicleState
 	EEF_ECheckpointVehicleState m_eState;			//! Current lifecycle state
 	float m_fSpawnTime;								//! World time (s) the vehicle was spawned - failsafe lifetime
 	float m_fStateEnterTime;						//! World time (s) the current state was entered
-	bool m_bSeated;									//! True once the driver has been seated and dispatched
+	bool m_bSeated;									//! True once the crew is aboard and the vehicle has been dispatched
 	bool m_bHasContraband;							//! Contraband roll result - population data for #20 (placement) / interaction
+	int m_iLastAgentTotal;							//! Agent count seen on the previous seat poll - detects the roster still growing
+	int m_iStableSeatPolls;							//! Consecutive polls with a full, stable, fully-seated roster
 
 	void EEF_CheckpointVehicleState(IEntity vehicle, SCR_AIGroup group, float spawnTime, bool hasContraband)
 	{
@@ -73,6 +75,8 @@ class EEF_CheckpointVehicleState
 		m_fStateEnterTime = spawnTime;
 		m_bSeated = false;
 		m_bHasContraband = hasContraband;
+		m_iLastAgentTotal = -1;
+		m_iStableSeatPolls = 0;
 	}
 }
 
@@ -96,9 +100,13 @@ class EEF_CheckpointComponentClass : ScriptComponentClass {}
 //------------------------------------------------------------------------------------------------
 class EEF_CheckpointComponent : ScriptComponent
 {
-	// Seating retry tuning - GetAgents() can lag the group-ready signal by a tick or two.
-	protected const int CHECKPOINT_MAX_SEAT_ATTEMPTS = 20;	//! ~5s of retries at the interval below
-	protected const int CHECKPOINT_SEAT_RETRY_MS = 250;
+	// Seat-poll tuning. The occupant group spawns its members staggered across many frames (leader
+	// first, then the rest), so we poll fast to teleport each member the instant it appears - before
+	// group cohesion makes it walk to the vehicle on foot - and only dispatch once the roster has
+	// stopped growing and everyone is seated.
+	protected const int CHECKPOINT_MAX_SEAT_POLLS = 60;			//! ~9s ceiling at the interval below
+	protected const int CHECKPOINT_SEAT_POLL_MS = 150;
+	protected const int CHECKPOINT_STABLE_POLLS_REQUIRED = 3;	//! consecutive good polls before dispatch (~450ms)
 
 	// --------------------------------------------------------
 	// Route markers (referenced by entity name in the World Editor)
@@ -284,9 +292,9 @@ class EEF_CheckpointComponent : ScriptComponent
 	}
 
 	//------------------------------------------------------------------------------------------------
-	//! Spawn one vehicle at the spawn point, spawn its occupant group, roll contraband, and
-	//! begin the seating handoff. Members spawn across several frames, so seating and the first
-	//! waypoint are deferred until the group signals it is ready (OnOccupantGroupReady).
+	//! Spawn one vehicle at the spawn point, spawn its occupant group, roll contraband, and start
+	//! the seat poll. Members spawn staggered, so SeatPoll keeps seating them as they appear and
+	//! defers the drive waypoint until the whole crew is aboard.
 	protected void SpawnVehicle()
 	{
 		ResourceName vehiclePrefab = PickRandomPrefab(m_aVehiclePrefabs);
@@ -330,43 +338,29 @@ class EEF_CheckpointComponent : ScriptComponent
 
 		DebugLog(string.Format("Spawned vehicle at %1 (contraband: %2). Active: %3", spawnPos, hasContraband, m_aVehicles.Count()));
 
-		// SCR_AIGroup spawns members across multiple frames via EOnFrame. Until that finishes
-		// GetAgents() is empty and there is nobody to seat, so wait for the ready signal.
-		if (group.IsInitializing())
-		{
-			group.GetOnAllDelayedEntitySpawned().Insert(OnOccupantGroupReady);
-			DebugLog("Occupant group initialising - waiting for members before seating.");
-		}
-		else
-		{
-			SeatAndDispatch(state);
-		}
+		// Log the vehicle's compartment layout once so a "passenger won't seat" problem is
+		// diagnosable from the console (e.g. no free CARGO slots -> passenger seats are TURRET/FFV).
+		LogCompartmentLayout(vehicle);
+
+		// The occupant group spawns its members staggered - leader first, then the rest over the
+		// following frames/seconds. Start a fast seat poll immediately: it teleports each member the
+		// instant it appears (before group cohesion walks it to the vehicle) and only dispatches once
+		// the roster has stopped growing and everyone is aboard.
+		SeatPoll(state, 0);
 	}
 
 	//------------------------------------------------------------------------------------------------
-	//! SCR_AIGroup.GetOnAllDelayedEntitySpawned() callback - fires once when the group's members
-	//! have all spawned. Maps the group back to its state and seats it.
-	protected void OnOccupantGroupReady(SCR_AIGroup group)
-	{
-		EEF_CheckpointVehicleState state = FindStateByGroup(group);
-		if (!state)
-		{
-			// Stale callback - the vehicle was already cleaned up (e.g. StopCheckpoint).
-			return;
-		}
-
-		SeatAndDispatch(state);
-	}
-
+	// SEATING (fast poll)
 	//------------------------------------------------------------------------------------------------
-	//! Wait until the whole crew has spawned, seat them into the vehicle, then hand off to
-	//! VerifySeatedThenDispatch (which only gives the drive waypoint once occupants are aboard).
+
+	//! Repeatedly seat any un-seated group member, then dispatch once the crew is complete and stable.
 	//!
-	//! Even after the group reports ready, GetAgents() can stay empty for a tick or two while the
-	//! members finish appearing (same latency the helicopter boarding polls around), so an empty
-	//! result is retried up to CHECKPOINT_MAX_SEAT_ATTEMPTS before giving up rather than despawning
-	//! on the first miss.
-	protected void SeatAndDispatch(EEF_CheckpointVehicleState state, int attempt = 0)
+	//! Members arrive staggered, so a single seating pass always misses the late ones and they walk
+	//! in on foot. Instead we re-run every CHECKPOINT_SEAT_POLL_MS: seat whoever is newly present,
+	//! and require CHECKPOINT_STABLE_POLLS_REQUIRED consecutive polls where the agent count has
+	//! stopped growing AND everyone is in a seat before handing over the drive waypoint. This both
+	//! catches late members quickly and guarantees we never dispatch mid-spawn.
+	protected void SeatPoll(EEF_CheckpointVehicleState state, int attempt)
 	{
 		if (!state || !state.m_Vehicle || !state.m_OccupantGroup)
 			return;
@@ -374,66 +368,67 @@ class EEF_CheckpointComponent : ScriptComponent
 		if (state.m_bSeated)
 			return;
 
-		// Bail if the vehicle was cleaned up (e.g. StopCheckpoint) while this retry was pending.
+		// Bail if the vehicle was cleaned up (e.g. StopCheckpoint) while this poll was pending.
 		if (m_aVehicles.Find(state) == -1)
 			return;
 
 		array<AIAgent> agents = {};
 		state.m_OccupantGroup.GetAgents(agents);
-		int agentCount = agents.Count();
+		int total = agents.Count();
 
-		// Seat only once the WHOLE crew is present. IsInitializing() staying true means the group
-		// is still spawning members across frames; GetAgents() then holds only the ones spawned so
-		// far (often just the driver), and seating now would leave later passengers to board on
-		// foot. Waiting for IsInitializing()==false AND a non-zero agent count teleports everyone
-		// in one pass. The retry is capped so a genuinely empty/misconfigured group can't loop forever.
-		bool ready = !state.m_OccupantGroup.IsInitializing() && agentCount > 0;
+		// Teleport any member not yet in a seat.
+		SeatAllAgents(state, agents);
 
-		if (!ready)
+		int seated = CountSeatedAgents(agents);
+		bool doneSpawning = !state.m_OccupantGroup.IsInitializing();
+		bool rosterStable = (total > 0 && total == state.m_iLastAgentTotal);
+		bool everyoneSeated = (total > 0 && seated == total);
+
+		if (doneSpawning && rosterStable && everyoneSeated)
+			state.m_iStableSeatPolls = state.m_iStableSeatPolls + 1;
+		else
+			state.m_iStableSeatPolls = 0;
+
+		state.m_iLastAgentTotal = total;
+
+		// Crew complete, seated and settled - dispatch.
+		if (state.m_iStableSeatPolls >= CHECKPOINT_STABLE_POLLS_REQUIRED)
 		{
-			if (attempt < CHECKPOINT_MAX_SEAT_ATTEMPTS)
-			{
-				GetGame().GetCallqueue().CallLater(SeatAndDispatch, CHECKPOINT_SEAT_RETRY_MS, false, state, attempt + 1);
-				return;
-			}
-
-			if (agentCount == 0)
-			{
-				DebugLog(string.Format("Occupant group still has no agents after %1 attempts - despawning vehicle. Check the group prefab has members with Spawn Immediately enabled.", attempt + 1));
-				DespawnVehicleState(state, true);
-				return;
-			}
-			// Still flagged initializing but members exist - seat what we have rather than stall.
-			DebugLog(string.Format("Group still initializing after %1 attempts - seating %2 present member(s).", attempt + 1, agentCount));
+			Dispatch(state, seated, total);
+			return;
 		}
 
-		// Log the vehicle's compartment layout once so a "passenger won't seat" problem is
-		// diagnosable from the console (e.g. no free CARGO slots -> passenger seats are TURRET/FFV).
-		LogCompartmentLayout(state.m_Vehicle);
-
-		if (!SeatAllAgents(state, agents))
+		// Keep polling until the ceiling, then make a best-effort call.
+		if (attempt < CHECKPOINT_MAX_SEAT_POLLS)
 		{
-			DebugLog("Could not seat a driver (no free PILOT compartment?) - despawning vehicle.");
+			GetGame().GetCallqueue().CallLater(SeatPoll, CHECKPOINT_SEAT_POLL_MS, false, state, attempt + 1);
+			return;
+		}
+
+		if (total == 0)
+		{
+			DebugLog(string.Format("Occupant group still has no agents after %1 polls - despawning vehicle. Check the group prefab has members with Spawn Immediately enabled.", attempt + 1));
 			DespawnVehicleState(state, true);
 			return;
 		}
 
-		state.m_bSeated = true;
+		if (!IsDriverSeated(state.m_Vehicle))
+		{
+			DebugLog("No driver could be seated (no free PILOT compartment?) - despawning vehicle.");
+			DespawnVehicleState(state, true);
+			return;
+		}
 
-		// Do NOT dispatch yet. MoveInVehicle is RPC-based, so occupants land a tick or two later;
-		// if we hand the group a move waypoint before everyone is actually in a seat, the group
-		// issues a mount order and the not-yet-seated passenger walks to the vehicle on foot -
-		// exactly the behaviour we want to avoid. Verify occupancy first, then dispatch.
-		VerifySeatedThenDispatch(state, 0);
+		Dispatch(state, seated, total);
 	}
 
 	//------------------------------------------------------------------------------------------------
-	//! Seat every agent: the first into the driver seat (PILOT), the rest into any free passenger
-	//! compartment (CARGO first, then TURRET as a fallback for vehicles whose passenger seats are
-	//! gunner positions). Returns true if a driver was seated (the minimum needed to drive).
-	protected bool SeatAllAgents(EEF_CheckpointVehicleState state, array<AIAgent> agents)
+	//! Seat every un-seated agent: the first free member into the driver seat (PILOT), the rest into
+	//! any free passenger compartment (CARGO first, then TURRET as a fallback for vehicles whose
+	//! passenger seats are gunner positions). Idempotent - already-seated members are skipped.
+	protected void SeatAllAgents(EEF_CheckpointVehicleState state, array<AIAgent> agents)
 	{
-		bool driverSeated = false;
+		bool driverSeated = IsDriverSeated(state.m_Vehicle);
 
 		foreach (AIAgent agent : agents)
 		{
@@ -444,13 +439,9 @@ class EEF_CheckpointComponent : ScriptComponent
 			if (!character)
 				continue;
 
-			// Already seated (e.g. driver on a reseat pass) - leave them be.
+			// Already seated - leave them be (keeps this pass idempotent across polls).
 			if (IsInAnyCompartment(character))
-			{
-				if (!driverSeated)
-					driverSeated = true; // assume the first already-seated member is the driver
 				continue;
-			}
 
 			SCR_CompartmentAccessComponent access = SCR_CompartmentAccessComponent.Cast(
 				character.FindComponent(SCR_CompartmentAccessComponent)
@@ -470,39 +461,16 @@ class EEF_CheckpointComponent : ScriptComponent
 					access.MoveInVehicle(state.m_Vehicle, ECompartmentType.TURRET);
 			}
 		}
-
-		return driverSeated;
 	}
 
 	//------------------------------------------------------------------------------------------------
-	//! Poll until every agent is actually in a seat (RPC latency), re-issuing seat commands for any
-	//! stragglers, then dispatch. Only once the crew is aboard is the drive waypoint assigned, so no
-	//! passenger is ever left to mount on foot. Dispatches anyway after the retry cap so a genuinely
-	//! unseatable member (no free slot) can't stall the whole vehicle forever.
-	protected void VerifySeatedThenDispatch(EEF_CheckpointVehicleState state, int attempt)
+	//! Mark the crew aboard and give the group its single drive waypoint to the exit.
+	protected void Dispatch(EEF_CheckpointVehicleState state, int seated, int total)
 	{
-		if (!state || !state.m_Vehicle || !state.m_OccupantGroup)
-			return;
-
-		if (m_aVehicles.Find(state) == -1)
-			return;
-
-		array<AIAgent> agents = {};
-		state.m_OccupantGroup.GetAgents(agents);
-
-		int seated = CountSeatedAgents(agents);
-		int total = agents.Count();
-
-		if (seated < total && attempt < CHECKPOINT_MAX_SEAT_ATTEMPTS)
-		{
-			// Re-issue seat commands for anyone still standing, then check again shortly.
-			SeatAllAgents(state, agents);
-			GetGame().GetCallqueue().CallLater(VerifySeatedThenDispatch, CHECKPOINT_SEAT_RETRY_MS, false, state, attempt + 1);
-			return;
-		}
+		state.m_bSeated = true;
 
 		if (seated < total)
-			DebugLog(string.Format("Dispatching with %1/%2 member(s) seated after %3 attempts - check the vehicle prefab has enough passenger seats.", seated, total, attempt + 1));
+			DebugLog(string.Format("Dispatching with %1/%2 member(s) seated - check the vehicle prefab has enough passenger seats.", seated, total));
 		else
 			DebugLog(string.Format("All %1 member(s) seated - dispatching.", total));
 
@@ -516,6 +484,26 @@ class EEF_CheckpointComponent : ScriptComponent
 		AssignMoveWaypoint(state.m_OccupantGroup, m_DespawnPoint.GetOrigin());
 
 		DebugLog("Vehicle dispatched through the checkpoint toward the exit.");
+	}
+
+	//------------------------------------------------------------------------------------------------
+	//! True if a driver currently occupies a PILOT compartment on the vehicle.
+	protected bool IsDriverSeated(IEntity vehicle)
+	{
+		SCR_BaseCompartmentManagerComponent compMgr = SCR_BaseCompartmentManagerComponent.Cast(
+			vehicle.FindComponent(SCR_BaseCompartmentManagerComponent)
+		);
+		if (!compMgr)
+			return false;
+
+		array<BaseCompartmentSlot> slots = {};
+		compMgr.GetCompartmentsOfType(slots, ECompartmentType.PILOT);
+		foreach (BaseCompartmentSlot slot : slots)
+		{
+			if (slot && slot.GetOccupant())
+				return true;
+		}
+		return false;
 	}
 
 	//------------------------------------------------------------------------------------------------
@@ -855,16 +843,6 @@ class EEF_CheckpointComponent : ScriptComponent
 			radius = m_fWaypointCompletionRadius;
 
 		return radius + m_fArrivalRadius;
-	}
-
-	protected EEF_CheckpointVehicleState FindStateByGroup(SCR_AIGroup group)
-	{
-		foreach (EEF_CheckpointVehicleState state : m_aVehicles)
-		{
-			if (state && state.m_OccupantGroup == group)
-				return state;
-		}
-		return null;
 	}
 
 	//! Number of vehicles still occupying a concurrency slot (everything not yet despawned).
