@@ -230,6 +230,9 @@ class EEF_CheckpointComponent : ScriptComponent
 	[Attribute("2.0", UIWidgets.EditBox, "Completion radius in metres applied specifically to queue-slot drive waypoints. Keep this tight (1-2m) so queued vehicles line up neatly on their markers instead of stopping several metres short.")]
 	protected float m_fQueueSlotCompletionRadius;
 
+	[Attribute("80.0", UIWidgets.EditBox, "On release, aim the depart waypoint this far down the road (past the exit) so the AI builds a real navmesh path instead of 'simple steering' straight at a near target. MUST exceed the vehicle's Max Simple Steering Distance (~50m default) or departing vehicles wobble/re-path. The vehicle still despawns at the real exit marker; this far point is never reached.")]
+	protected float m_fDepartLeadDistance;
+
 	[Attribute("1.0", UIWidgets.EditBox, "How often in seconds to poll vehicle positions for arrival at their current route point.")]
 	protected float m_fArrivalPollInterval;
 
@@ -990,8 +993,13 @@ class EEF_CheckpointComponent : ScriptComponent
 		// it away from the checkpoint.
 		ApplyCruiseSpeed(state, m_fApproachSpeedKmh);
 
-		AssignMoveWaypoint(state.m_OccupantGroup, m_DespawnPoint.GetOrigin(), m_fWaypointCompletionRadius);
-		DebugLog("Vehicle released - departing toward the exit.");
+		// Aim WELL past the exit (down the road) so the target is beyond the vehicle's Max Simple
+		// Steering Distance and the AI builds a proper navmesh path instead of simple-steering straight
+		// at a near marker (which wobbles). The vehicle despawns at the real exit marker en route, so
+		// this lead point is never actually reached.
+		vector departTarget = m_DespawnPoint.GetOrigin() + GetDepartDirection(state) * m_fDepartLeadDistance;
+		AssignMoveWaypoint(state.m_OccupantGroup, departTarget, m_fWaypointCompletionRadius);
+		DebugLog(string.Format("Vehicle released - departing toward a lead point %1m past the exit to force navmesh pathing.", m_fDepartLeadDistance));
 
 		// Diagnostic: confirm the fresh order actually took (requestCompleted should now read 0 while
 		// it drives). Sampled a few times across the departure.
@@ -1030,6 +1038,31 @@ class EEF_CheckpointComponent : ScriptComponent
 		DebugLog(string.Format("Departure path sample: %1 node(s), requestCompleted=%2 (0 nodes = simple steering / no navmesh path).", pts.Count(), done));
 		foreach (int i, vector p : pts)
 			DebugLog(string.Format("  path[%1] = %2", i, p));
+	}
+
+	//! Direction to head on departure: along the road, from the checkpoint origin toward the exit
+	//! (horizontal, normalised). Falls back to the vehicle's own forward axis if the checkpoint and
+	//! exit are effectively coincident.
+	protected vector GetDepartDirection(EEF_CheckpointVehicleState state)
+	{
+		vector dir = m_DespawnPoint.GetOrigin() - GetOwner().GetOrigin();
+		dir[1] = 0;
+
+		float len = dir.Length();
+		if (len > 0.001)
+			return dir * (1.0 / len);
+
+		// Fallback: the vehicle's forward axis (Z) flattened to horizontal.
+		vector mat[4];
+		state.m_Vehicle.GetTransform(mat);
+		vector forward = mat[2];
+		forward[1] = 0;
+
+		len = forward.Length();
+		if (len > 0.001)
+			return forward * (1.0 / len);
+
+		return "0 0 1";
 	}
 
 	//------------------------------------------------------------------------------------------------
