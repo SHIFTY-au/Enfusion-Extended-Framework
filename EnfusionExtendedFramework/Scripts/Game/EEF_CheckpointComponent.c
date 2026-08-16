@@ -146,6 +146,16 @@ class EEF_CheckpointComponent : ScriptComponent
 	protected const int CHECKPOINT_STABLE_POLLS_REQUIRED = 10;	//! ~1.5s of a complete, seated, unchanged roster before dispatch
 	protected const int CHECKPOINT_MOPUP_STABLE_POLLS = 20;		//! ~3s settled after dispatch before we stop mopping up late members
 
+	// Extra metres beyond the tight queue-slot completion radius within which the front vehicle is
+	// treated as "arrived and stopped" at its slot. Small so HELD only fires once it has actually
+	// pulled up, not while still rolling in.
+	protected const float CHECKPOINT_SLOT_ARRIVAL_SLACK = 3.0;
+
+	// After releasing a held vehicle we clear its waypoints, then wait this long before handing it a
+	// fresh drive waypoint - letting the vehicle AI fully reset its path/steering state so it pulls
+	// away cleanly instead of cranking the wheel off the road / doing a multi-point turn.
+	protected const int CHECKPOINT_DEPART_REPATH_MS = 250;
+
 	// --------------------------------------------------------
 	// Route markers (referenced by entity name in the World Editor)
 	// --------------------------------------------------------
@@ -210,7 +220,7 @@ class EEF_CheckpointComponent : ScriptComponent
 	[Attribute("15.0", UIWidgets.EditBox, "Completion radius in metres applied to drive waypoints. Keep this generous - a tight radius makes the AI overshoot then reverse to nail the exact point.")]
 	protected float m_fWaypointCompletionRadius;
 
-	[Attribute("5.0", UIWidgets.EditBox, "Completion radius in metres applied specifically to queue-slot drive waypoints. Smaller than the general radius so queued vehicles line up tightly at their markers instead of stopping short.")]
+	[Attribute("2.0", UIWidgets.EditBox, "Completion radius in metres applied specifically to queue-slot drive waypoints. Keep this tight (1-2m) so queued vehicles line up neatly on their markers instead of stopping several metres short.")]
 	protected float m_fQueueSlotCompletionRadius;
 
 	[Attribute("1.0", UIWidgets.EditBox, "How often in seconds to poll vehicle positions for arrival at their current route point.")]
@@ -944,7 +954,11 @@ class EEF_CheckpointComponent : ScriptComponent
 			ReleaseVehicle(front);
 	}
 
-	//! Send a held vehicle on its way: leave the queue, drive to the exit, and promote the rest.
+	//! Send a held vehicle on its way: leave the queue, then drive to the exit. We first CLEAR the
+	//! group's waypoints and wait a beat before assigning the exit waypoint (see AssignDepartWaypoint)
+	//! - handing a new waypoint straight to a vehicle that just completed/held one makes the AI crank
+	//! the wheel and drive off the road / multi-point turn. Clearing first, then re-tasking from a
+	//! clean state, mimics the tidy pull-away it does at spawn.
 	protected void ReleaseVehicle(EEF_CheckpointVehicleState state)
 	{
 		if (!state)
@@ -954,11 +968,27 @@ class EEF_CheckpointComponent : ScriptComponent
 		state.m_bReleasePending = false;
 
 		SetState(state, EEF_ECheckpointVehicleState.DEPARTING);
-		AssignMoveWaypoint(state.m_OccupantGroup, m_DespawnPoint.GetOrigin(), m_fWaypointCompletionRadius);
-		DebugLog("Vehicle released - departing toward the exit.");
+
+		ClearWaypoints(state.m_OccupantGroup);
+		GetGame().GetCallqueue().CallLater(AssignDepartWaypoint, CHECKPOINT_DEPART_REPATH_MS, false, state);
+		DebugLog("Vehicle released - clearing waypoints before departing toward the exit.");
 
 		// Advance everyone behind it now that the front slot is free.
 		PromoteQueue();
+	}
+
+	//! Deferred second half of a release: give the departing vehicle its single exit waypoint once its
+	//! path/steering state has settled. Guards against the vehicle having been despawned in the gap.
+	protected void AssignDepartWaypoint(EEF_CheckpointVehicleState state)
+	{
+		if (!state || m_aVehicles.Find(state) == -1)
+			return;
+
+		if (state.m_eState != EEF_ECheckpointVehicleState.DEPARTING)
+			return;
+
+		AssignMoveWaypoint(state.m_OccupantGroup, m_DespawnPoint.GetOrigin(), m_fWaypointCompletionRadius);
+		DebugLog("Departing vehicle re-tasked to the exit.");
 	}
 
 	//------------------------------------------------------------------------------------------------
@@ -1008,15 +1038,16 @@ class EEF_CheckpointComponent : ScriptComponent
 		return true;
 	}
 
-	//! True if the vehicle has reached its slot marker (stopped on the mark). Spans the completion
-	//! radius plus the arrival tolerance, same idea as the exit despawn radius.
+	//! True if the vehicle has reached its slot marker (stopped on the mark). Detection spans the
+	//! tight completion radius plus a small fixed slack - NOT the loose general arrival radius, which
+	//! would flag "at front" while the vehicle is still several metres out and rolling in.
 	protected bool HasArrivedAtSlot(vector vehiclePos, int slot)
 	{
 		vector slotPos;
 		if (!GetSlotPosition(slot, slotPos))
 			return false;
 
-		float radius = m_fQueueSlotCompletionRadius + m_fArrivalRadius;
+		float radius = m_fQueueSlotCompletionRadius + CHECKPOINT_SLOT_ARRIVAL_SLACK;
 		return HasArrivedWithin(vehiclePos, slotPos, radius);
 	}
 
