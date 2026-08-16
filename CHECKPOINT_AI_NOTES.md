@@ -44,7 +44,46 @@ Vehicle is stopped/HELD at the front slot, then released → incoherent.
    the exit is > 80 m away and it still returned 0 nodes. Aiming even farther (a lead
    point past the exit) reverted; premise was wrong and it risked targeting off-mesh.
 
-## LEADING HYPOTHESIS (current): can't path OUT of the stop position
+## RESOLVED — root cause confirmed (open-road test)
+Moved the queue-slot markers to a clean straight stretch of open road and released:
+**departure became smooth.** Crucially the log STILL read `0 nodes / requestCompleted=1`
+even while driving off perfectly. So:
+
+- **`0 nodes` is NOT the bug.** It means *simple steering* — the AI drives straight at
+  the target with no navmesh path, and that is completely normal and works fine on a
+  clear straight line (even to a target >80 m away). Every earlier reading of "0 nodes =
+  broken path" was a misread. Struck.
+- The ONLY differentiator is the **stop location**. Open road → clear straight line to
+  the target → simple steering works. Checkpoint → the straight line to the exit is
+  **obstructed by the checkpoint props/barriers** (and there's no navmesh corridor
+  through them to route around), so simple steering flails.
+- ⇒ It IS the navmesh/geometry at the checkpoint, exactly as the leading hypothesis said,
+  but specifically: **no clear straight line AND no navmesh detour out of the gate.**
+
+### FIX IMPLEMENTED — authored exit-path markers
+The queue-slot markers already prove the AI drives to authored on-road points flawlessly.
+So on release we no longer aim it straight at the distant exit; we feed it an ordered
+chain of **exit-path markers** (author-placed on the road out of the gate) then the exit.
+Each leg is a short, clear, straight shot it can simple-steer cleanly — same mechanism as
+the inbound queue slots. Optional; empty = drive straight at exit (open road only).
+- New attribute: `m_aExitPathMarkers` (array of `EEF_CheckpointExitPathEntry`), resolved
+  by `ResolveExitPath()`; `GetExitRoute()` = markers + despawn point.
+- New: `CreateMoveWaypoint()` (extracted), `AssignRouteWaypoints()` (drives a chain).
+- `ReleaseVehicle()` now calls `AssignRouteWaypoints(group, GetExitRoute(...))`.
+- New radius attribute `m_fExitPathCompletionRadius` (default 5m) for the intermediate
+  points — loose enough to flow through, not stop/reverse.
+- **DEPARTING** still only watches distance to the despawn point, so the chain doesn't
+  change arrival/despawn. PromoteQueue ignores DEPARTING, so the route isn't disturbed.
+
+**Map-side alternative / complement:** clear the navmesh corridor through the checkpoint
+(props' navmesh generation mode, continuous road mesh, slot markers on-mesh) so a real
+path generates. The exit-path markers work regardless, so they're the robust default.
+
+**NOT the lever:** `Max Distance to Path` — only acts when a path exists; departure is
+simple-steering (no path), so tuning path-follow params does nothing here.
+
+---
+## LEADING HYPOTHESIS (superseded — see RESOLVED above): can't path OUT of the stop position
 Pathfinding returns **0 nodes to a far target** ⇒ no path exists **from where the
 vehicle is standing**. The vehicle drives *in* fine but, once stopped at the front
 slot, it's resting somewhere the navmesh can't originate a path from — most likely

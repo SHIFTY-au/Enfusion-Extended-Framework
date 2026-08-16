@@ -130,6 +130,31 @@ class EEF_CheckpointQueueSlotEntry
 	string m_sMarkerName;
 }
 
+// ============================================================
+// A single ordered exit-path marker (Stage 2 #18). One entry per
+// waypoint on the drive-OUT route, from the front stop line to the
+// exit. ORDER MATTERS: the first entry is the point a released
+// vehicle heads for first (just past the checkpoint gate), the last
+// is the final point before the despawn/exit marker.
+//
+// Why this exists: on release the front vehicle is stopped, boxed in
+// by checkpoint props/barriers. A straight line from there to the
+// distant exit is obstructed, and with no navmesh corridor through
+// the props the AI falls back to simple steering and flails. Feeding
+// it authored points ON the road - each a short, clear, straight leg
+// it can simple-steer cleanly (exactly like the queue-slot markers it
+// already drives to perfectly) - threads it out of the checkpoint
+// instead of aiming it straight at an unreachable target. Optional:
+// with none configured, a released vehicle drives straight at the
+// exit as before.
+// ============================================================
+[BaseContainerProps()]
+class EEF_CheckpointExitPathEntry
+{
+	[Attribute("", UIWidgets.EditBox, "Name of an exit-path marker entity. First entry = the point a released vehicle heads for first (just past the gate), last = the final point before the exit.")]
+	string m_sMarkerName;
+}
+
 //------------------------------------------------------------------------------------------------
 [ComponentEditorProps(category: "EEF/Checkpoint", description: "Checkpoint traffic orchestrator - attach to a SCR_BaseTriggerEntity in a layer. Spawns vehicles that approach, queue in an ordered lane, hold at the front, then depart and despawn. Stage 2: a debug timer auto-releases the front vehicle (player-driven release arrives in #19).")]
 class EEF_CheckpointComponentClass : ScriptComponentClass {}
@@ -168,6 +193,19 @@ class EEF_CheckpointComponent : ScriptComponent
 
 	[Attribute("", UIWidgets.Object, "Ordered queue slot markers. First entry = front of the queue (checkpoint stop line), last = back. Place at least 'Max concurrent vehicles' markers so the lane never overflows.")]
 	protected ref array<ref EEF_CheckpointQueueSlotEntry> m_aQueueSlotMarkers;
+
+	// --------------------------------------------------------
+	// Exit path (Stage 2 #18) - ordered drive-OUT waypoints from the
+	// front stop line to the exit. Optional but STRONGLY recommended
+	// where the checkpoint has props/barriers: a released vehicle is
+	// boxed in and cannot simple-steer straight to the distant exit,
+	// so it flails. Authored points on the road (first = just past the
+	// gate, last = last point before the exit) give it clean straight
+	// legs out, the same way the queue-slot markers do on the way in.
+	// --------------------------------------------------------
+
+	[Attribute("", UIWidgets.Object, "Ordered exit-path markers a released vehicle drives out through before the exit. First = just past the gate, last = final point before the exit. Leave empty to drive straight at the exit (fine only on open road with no obstructing props).")]
+	protected ref array<ref EEF_CheckpointExitPathEntry> m_aExitPathMarkers;
 
 	// --------------------------------------------------------
 	// Prefab pools
@@ -230,6 +268,9 @@ class EEF_CheckpointComponent : ScriptComponent
 	[Attribute("2.0", UIWidgets.EditBox, "Completion radius in metres applied specifically to queue-slot drive waypoints. Keep this tight (1-2m) so queued vehicles line up neatly on their markers instead of stopping several metres short.")]
 	protected float m_fQueueSlotCompletionRadius;
 
+	[Attribute("5.0", UIWidgets.EditBox, "Completion radius in metres applied to intermediate exit-path waypoints (not the final exit). Keep it moderate: tight enough that the vehicle actually threads through each point, loose enough it flows past without braking/reversing. The vehicle does not stop here so it need not be as tight as a queue slot.")]
+	protected float m_fExitPathCompletionRadius;
+
 	[Attribute("1.0", UIWidgets.EditBox, "How often in seconds to poll vehicle positions for arrival at their current route point.")]
 	protected float m_fArrivalPollInterval;
 
@@ -266,6 +307,11 @@ class EEF_CheckpointComponent : ScriptComponent
 	//! m_aQueueSlotMarkers by ResolveQueueSlots(). (Stage 2 #18)
 	protected ref array<IEntity> m_aQueueSlots = new array<IEntity>();
 	protected bool m_bQueueSlotsResolved = false;
+
+	//! Resolved, ordered exit-path marker entities (index 0 = first point past the gate). Lazily
+	//! populated from m_aExitPathMarkers by ResolveExitPath(). (Stage 2 #18)
+	protected ref array<IEntity> m_aExitPath = new array<IEntity>();
+	protected bool m_bExitPathResolved = false;
 
 	//! Cached checkpoint-zone radius (the trigger's sphere radius). A vehicle within this
 	//! distance of the checkpoint origin has entered the zone. (Stage 2 #18)
@@ -971,11 +1017,17 @@ class EEF_CheckpointComponent : ScriptComponent
 			ReleaseVehicle(front);
 	}
 
-	//! Send a held vehicle on its way: leave the queue and drive to the exit. Uses a FRESH waypoint
-	//! (clear + add) rather than retargeting the slot waypoint. At the front the car's movement request
-	//! has already completed (it braked to a stop of its own accord), so merely moving the waypoint
-	//! origin issues no new drive order - the vehicle sits with requestCompleted=1 and twitches. A
-	//! fresh waypoint forces the group to re-task the driver with a new order.
+	//! Send a held vehicle on its way: leave the queue and drive the authored exit route to the exit.
+	//! Uses a FRESH waypoint chain (clear + add) rather than retargeting the slot waypoint. At the front
+	//! the car's movement request has already completed (it braked to a stop of its own accord), so
+	//! merely moving the waypoint origin issues no new drive order - the vehicle sits with
+	//! requestCompleted=1 and twitches. Fresh waypoints force the group to re-task the driver.
+	//!
+	//! The route is the ordered exit-path markers then the exit itself. Boxed in by checkpoint props,
+	//! the front vehicle cannot simple-steer straight to the distant exit (no clear line, no navmesh
+	//! corridor through the props), so it flails. The markers give it short, clear, straight legs out -
+	//! the same authored-point steering it drives flawlessly on the way IN to the queue slots. With no
+	//! exit markers configured the route is just the exit (fine only on open, obstacle-free road).
 	protected void ReleaseVehicle(EEF_CheckpointVehicleState state)
 	{
 		if (!state || !state.m_Vehicle)
@@ -990,8 +1042,10 @@ class EEF_CheckpointComponent : ScriptComponent
 		// it away from the checkpoint.
 		ApplyCruiseSpeed(state, m_fApproachSpeedKmh);
 
-		AssignMoveWaypoint(state.m_OccupantGroup, m_DespawnPoint.GetOrigin(), m_fWaypointCompletionRadius);
-		DebugLog("Vehicle released - departing toward the exit.");
+		array<vector> route = {};
+		GetExitRoute(route);
+		AssignRouteWaypoints(state.m_OccupantGroup, route, m_fWaypointCompletionRadius, m_fExitPathCompletionRadius);
+		DebugLog(string.Format("Vehicle released - departing via %1 exit-path point(s) toward the exit.", route.Count() - 1));
 
 		// Diagnostic: confirm the fresh order actually took (requestCompleted should now read 0 while
 		// it drives). Sampled a few times across the departure.
@@ -1077,6 +1131,54 @@ class EEF_CheckpointComponent : ScriptComponent
 
 		outPos = m_aQueueSlots[slot].GetOrigin();
 		return true;
+	}
+
+	//! Resolve the ordered exit-path marker names into entities exactly once. Missing markers are
+	//! skipped with a warning (an author typo drops one point rather than breaking the route).
+	protected void ResolveExitPath()
+	{
+		if (m_bExitPathResolved)
+			return;
+
+		m_bExitPathResolved = true;
+		m_aExitPath.Clear();
+
+		if (!m_aExitPathMarkers)
+			return;
+
+		foreach (EEF_CheckpointExitPathEntry entry : m_aExitPathMarkers)
+		{
+			if (!entry || entry.m_sMarkerName.IsEmpty())
+				continue;
+
+			IEntity marker = GetGame().GetWorld().FindEntityByName(entry.m_sMarkerName);
+			if (!marker)
+			{
+				DebugLog(string.Format("Exit-path marker '%1' not found in world - skipping.", entry.m_sMarkerName));
+				continue;
+			}
+
+			m_aExitPath.Insert(marker);
+		}
+
+		DebugLog(string.Format("Resolved %1 exit-path marker(s).", m_aExitPath.Count()));
+	}
+
+	//! Ordered world positions a released vehicle drives through to leave: each authored exit-path
+	//! marker, then the despawn/exit point. With no exit markers configured it is just the exit point.
+	protected void GetExitRoute(out array<vector> outPoints)
+	{
+		outPoints.Clear();
+
+		ResolveExitPath();
+		foreach (IEntity marker : m_aExitPath)
+		{
+			if (marker)
+				outPoints.Insert(marker.GetOrigin());
+		}
+
+		if (m_DespawnPoint)
+			outPoints.Insert(m_DespawnPoint.GetOrigin());
 	}
 
 	//! True if the vehicle has reached its slot marker (stopped on the mark). Detection spans the
@@ -1170,23 +1272,16 @@ class EEF_CheckpointComponent : ScriptComponent
 	// WAYPOINTS
 	//------------------------------------------------------------------------------------------------
 
-	//! Clear the group's current waypoints and give it a single move waypoint at targetPos.
-	//! A member in the driver seat makes the group drive the vehicle there. completionRadius < 0
-	//! falls back to the general m_fWaypointCompletionRadius.
-	protected void AssignMoveWaypoint(SCR_AIGroup group, vector targetPos, float completionRadius = -1)
+	//! Spawn and configure a single move waypoint at targetPos (completion radius + movement-speed
+	//! setting). Returns null if the waypoint prefab is unset or fails to spawn. Does NOT add it to a
+	//! group - callers add it (or a chain of them). completionRadius < 0 falls back to the general
+	//! m_fWaypointCompletionRadius.
+	protected AIWaypoint CreateMoveWaypoint(vector targetPos, float completionRadius = -1)
 	{
-		if (!group)
-			return;
-
-		array<AIWaypoint> queue = {};
-		group.GetWaypoints(queue);
-		foreach (AIWaypoint wp : queue)
-			group.RemoveWaypoint(wp);
-
 		if (m_sWaypointPrefab.IsEmpty())
 		{
 			DebugLog("No waypoint prefab set - vehicle will not drive.");
-			return;
+			return null;
 		}
 
 		AIWaypoint waypoint = AIWaypoint.Cast(
@@ -1195,7 +1290,7 @@ class EEF_CheckpointComponent : ScriptComponent
 		if (!waypoint)
 		{
 			DebugLog("Failed to spawn move waypoint.");
-			return;
+			return null;
 		}
 
 		if (completionRadius < 0)
@@ -1221,7 +1316,48 @@ class EEF_CheckpointComponent : ScriptComponent
 		}
 
 		waypoint.SetOrigin(targetPos);
-		group.AddWaypoint(waypoint);
+		return waypoint;
+	}
+
+	//! Clear the group's current waypoints and give it a single move waypoint at targetPos.
+	//! A member in the driver seat makes the group drive the vehicle there. completionRadius < 0
+	//! falls back to the general m_fWaypointCompletionRadius.
+	protected void AssignMoveWaypoint(SCR_AIGroup group, vector targetPos, float completionRadius = -1)
+	{
+		if (!group)
+			return;
+
+		ClearWaypoints(group);
+
+		AIWaypoint waypoint = CreateMoveWaypoint(targetPos, completionRadius);
+		if (waypoint)
+			group.AddWaypoint(waypoint);
+	}
+
+	//! Clear the group's waypoints and give it an ordered CHAIN of move waypoints - the group drives
+	//! them in sequence, completing each before heading to the next. Used for the departure route so a
+	//! released vehicle threads through authored exit-path points (each a short, clean, straight leg it
+	//! can simple-steer) instead of aiming straight at a distant, obstructed exit. Intermediate points
+	//! use intermediateRadius; the final point uses finalRadius (both < 0 fall back to the general
+	//! completion radius).
+	protected void AssignRouteWaypoints(SCR_AIGroup group, array<vector> points, float finalRadius = -1, float intermediateRadius = -1)
+	{
+		if (!group || !points || points.IsEmpty())
+			return;
+
+		ClearWaypoints(group);
+
+		int last = points.Count() - 1;
+		foreach (int i, vector p : points)
+		{
+			float radius = intermediateRadius;
+			if (i == last)
+				radius = finalRadius;
+
+			AIWaypoint waypoint = CreateMoveWaypoint(p, radius);
+			if (waypoint)
+				group.AddWaypoint(waypoint);
+		}
 	}
 
 	//! Move the group's current move waypoint to targetPos instead of clearing and re-adding one.
