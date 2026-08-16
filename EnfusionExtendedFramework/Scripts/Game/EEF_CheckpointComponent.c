@@ -151,11 +151,6 @@ class EEF_CheckpointComponent : ScriptComponent
 	// pulled up, not while still rolling in.
 	protected const float CHECKPOINT_SLOT_ARRIVAL_SLACK = 3.0;
 
-	// After releasing a held vehicle we clear its waypoints, then wait this long before handing it a
-	// fresh drive waypoint - letting the vehicle AI fully reset its path/steering state so it pulls
-	// away cleanly instead of cranking the wheel off the road / doing a multi-point turn.
-	protected const int CHECKPOINT_DEPART_REPATH_MS = 250;
-
 	// --------------------------------------------------------
 	// Route markers (referenced by entity name in the World Editor)
 	// --------------------------------------------------------
@@ -924,14 +919,16 @@ class EEF_CheckpointComponent : ScriptComponent
 	}
 
 	//! Re-task a vehicle's group to drive to the given slot marker, using the tight queue-slot
-	//! completion radius so it stops neatly on the mark.
+	//! completion radius so it stops neatly on the mark. Uses RetargetWaypoint (moves the existing
+	//! waypoint) rather than clear-and-re-add, so a vehicle rolling in from the approach - or moving
+	//! up as the queue advances - never loses its target and brakes to a halt in the process.
 	protected void DriveToSlot(EEF_CheckpointVehicleState state, int slot)
 	{
 		vector slotPos;
 		if (!GetSlotPosition(slot, slotPos))
 			return;
 
-		AssignMoveWaypoint(state.m_OccupantGroup, slotPos, m_fQueueSlotCompletionRadius);
+		RetargetWaypoint(state.m_OccupantGroup, slotPos, m_fQueueSlotCompletionRadius);
 	}
 
 	//------------------------------------------------------------------------------------------------
@@ -974,11 +971,9 @@ class EEF_CheckpointComponent : ScriptComponent
 			ReleaseVehicle(front);
 	}
 
-	//! Send a held vehicle on its way: leave the queue, then drive to the exit. We first CLEAR the
-	//! group's waypoints and wait a beat before assigning the exit waypoint (see AssignDepartWaypoint)
-	//! - handing a new waypoint straight to a vehicle that just completed/held one makes the AI crank
-	//! the wheel and drive off the road / multi-point turn. Clearing first, then re-tasking from a
-	//! clean state, mimics the tidy pull-away it does at spawn.
+	//! Send a held vehicle on its way: leave the queue and drive to the exit. AssignMoveWaypoint
+	//! clears every existing waypoint and gives it the exit as its ONLY task, so it pulls straight
+	//! away with nothing leftover to fight.
 	protected void ReleaseVehicle(EEF_CheckpointVehicleState state)
 	{
 		if (!state)
@@ -989,30 +984,15 @@ class EEF_CheckpointComponent : ScriptComponent
 
 		SetState(state, EEF_ECheckpointVehicleState.DEPARTING);
 
-		ClearWaypoints(state.m_OccupantGroup);
-		GetGame().GetCallqueue().CallLater(AssignDepartWaypoint, CHECKPOINT_DEPART_REPATH_MS, false, state);
-		DebugLog("Vehicle released - clearing waypoints before departing toward the exit.");
-
-		// Advance everyone behind it now that the front slot is free.
-		PromoteQueue();
-	}
-
-	//! Deferred second half of a release: give the departing vehicle its single exit waypoint once its
-	//! path/steering state has settled. Guards against the vehicle having been despawned in the gap.
-	protected void AssignDepartWaypoint(EEF_CheckpointVehicleState state)
-	{
-		if (!state || m_aVehicles.Find(state) == -1)
-			return;
-
-		if (state.m_eState != EEF_ECheckpointVehicleState.DEPARTING)
-			return;
-
 		// Lift the in-zone slow-down - depart at the (controlled) approach speed rather than flooring
 		// it away from the checkpoint.
 		ApplyCruiseSpeed(state, m_fApproachSpeedKmh);
 
 		AssignMoveWaypoint(state.m_OccupantGroup, m_DespawnPoint.GetOrigin(), m_fWaypointCompletionRadius);
-		DebugLog("Departing vehicle re-tasked to the exit.");
+		DebugLog("Vehicle released - departing toward the exit.");
+
+		// Advance everyone behind it now that the front slot is free.
+		PromoteQueue();
 	}
 
 	//------------------------------------------------------------------------------------------------
@@ -1205,6 +1185,48 @@ class EEF_CheckpointComponent : ScriptComponent
 
 		waypoint.SetOrigin(targetPos);
 		group.AddWaypoint(waypoint);
+	}
+
+	//! Move the group's current move waypoint to targetPos instead of clearing and re-adding one.
+	//! Repositioning an active waypoint keeps the vehicle driving toward it without the momentary
+	//! brake-to-a-halt that removing all waypoints causes - so a vehicle entering the zone, or moving
+	//! up as the queue advances, flows straight into its new slot. Falls back to AssignMoveWaypoint if
+	//! the group has no waypoint to move (e.g. it already completed one and is sitting idle).
+	protected void RetargetWaypoint(SCR_AIGroup group, vector targetPos, float completionRadius = -1)
+	{
+		if (!group)
+			return;
+
+		array<AIWaypoint> queue = {};
+		group.GetWaypoints(queue);
+
+		// Reposition the first live waypoint and drop any extras so exactly one remains.
+		AIWaypoint keep = null;
+		foreach (AIWaypoint wp : queue)
+		{
+			if (!wp)
+				continue;
+
+			if (!keep)
+				keep = wp;
+			else
+				group.RemoveWaypoint(wp);
+		}
+
+		if (!keep)
+		{
+			// Nothing to move - assign a fresh waypoint (this path can briefly stop an idle vehicle,
+			// but an idle vehicle is already stopped, so there is no motion to preserve).
+			AssignMoveWaypoint(group, targetPos, completionRadius);
+			return;
+		}
+
+		if (completionRadius < 0)
+			completionRadius = m_fWaypointCompletionRadius;
+		if (completionRadius > 0)
+			keep.SetCompletionRadius(completionRadius);
+
+		keep.SetOrigin(targetPos);
 	}
 
 	//------------------------------------------------------------------------------------------------
