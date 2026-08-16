@@ -971,9 +971,13 @@ class EEF_CheckpointComponent : ScriptComponent
 			ReleaseVehicle(front);
 	}
 
-	//! Send a held vehicle on its way: leave the queue and drive to the exit. AssignMoveWaypoint
-	//! clears every existing waypoint and gives it the exit as its ONLY task, so it pulls straight
-	//! away with nothing leftover to fight.
+	//! Send a held vehicle on its way: leave the queue and drive to the exit. We RETARGET the front
+	//! vehicle's existing move waypoint to the exit rather than clearing and adding a new one. The AI
+	//! brakes over a long distance (see the vehicle's Stop Distance / Max Break At config) and usually
+	//! comes to rest short of the tight slot completion radius - so the slot waypoint never actually
+	//! completes and is still active while HELD. Moving that live waypoint lets the vehicle drive on
+	//! seamlessly; clearing and re-adding instead forces a fresh path solve from a standstill, which
+	//! is what made it lurch forward a few metres and then re-path. Same fix that smoothed zone entry.
 	protected void ReleaseVehicle(EEF_CheckpointVehicleState state)
 	{
 		if (!state)
@@ -988,7 +992,7 @@ class EEF_CheckpointComponent : ScriptComponent
 		// it away from the checkpoint.
 		ApplyCruiseSpeed(state, m_fApproachSpeedKmh);
 
-		AssignMoveWaypoint(state.m_OccupantGroup, m_DespawnPoint.GetOrigin(), m_fWaypointCompletionRadius);
+		RetargetWaypoint(state.m_OccupantGroup, m_DespawnPoint.GetOrigin(), m_fWaypointCompletionRadius);
 		DebugLog("Vehicle released - departing toward the exit.");
 
 		// Advance everyone behind it now that the front slot is free.
