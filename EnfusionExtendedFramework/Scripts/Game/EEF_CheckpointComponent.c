@@ -1020,15 +1020,21 @@ class EEF_CheckpointComponent : ScriptComponent
 		RetargetWaypoint(state.m_OccupantGroup, m_DespawnPoint.GetOrigin(), m_fWaypointCompletionRadius);
 		DebugLog("Departing vehicle now heading to the exit.");
 
-		// Diagnostic: dump the AI's computed path a moment later, once it has solved to the exit. A
-		// clean straight departure is ~2-3 nodes; a jagged path with many closely-spaced nodes through
-		// the checkpoint zone is the navmesh causing the constant steering corrections.
+		// Diagnostic: sample the AI's computed path several times across the departure. Consistently 0
+		// nodes = no navmesh path at all (simple steering straight at the target); a few nodes = a
+		// clean navmesh path; many tightly-spaced nodes = a jagged mesh causing constant re-steering.
+		// Sampling over time rules out "path not solved yet" at any single instant.
 		if (m_bDebugLog)
-			GetGame().GetCallqueue().CallLater(DumpDeparturePath, 600, false, state);
+		{
+			GetGame().GetCallqueue().CallLater(DumpDeparturePath, 300, false, state);
+			GetGame().GetCallqueue().CallLater(DumpDeparturePath, 1200, false, state);
+			GetGame().GetCallqueue().CallLater(DumpDeparturePath, 2500, false, state);
+		}
 	}
 
 	//! Log the AI's current navmesh path for a departing vehicle (debug only) - node count is the tell:
-	//! a handful = clean, many tightly-spaced = a rough mesh the vehicle keeps re-steering along.
+	//! 0 = simple steering (no path), a handful = clean, many tightly-spaced = a rough mesh the vehicle
+	//! keeps re-steering along. Also reports whether the movement request has completed.
 	protected void DumpDeparturePath(EEF_CheckpointVehicleState state)
 	{
 		if (!state || m_aVehicles.Find(state) == -1 || !state.m_Vehicle)
@@ -1038,12 +1044,16 @@ class EEF_CheckpointComponent : ScriptComponent
 			state.m_Vehicle.FindComponent(AICarMovementComponent)
 		);
 		if (!movement)
+		{
+			DebugLog("Departure path sample: vehicle has no AICarMovementComponent.");
 			return;
+		}
 
 		array<vector> pts = {};
 		movement.GetCurrentPath(pts);
 
-		DebugLog(string.Format("Departure path node count: %1 (few = clean, many = jagged navmesh).", pts.Count()));
+		bool done = movement.HasCompletedRequest(false);
+		DebugLog(string.Format("Departure path sample: %1 node(s), requestCompleted=%2 (0 nodes = simple steering / no navmesh path).", pts.Count(), done));
 		foreach (int i, vector p : pts)
 			DebugLog(string.Format("  path[%1] = %2", i, p));
 	}
