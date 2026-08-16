@@ -33,25 +33,38 @@ Vehicle is stopped/HELD at the front slot, then released → incoherent.
 
 ## Key diagnostic facts (from `GetCurrentPath` / `HasCompletedRequest`)
 - On departure: **0 path nodes**, **requestCompleted=1**, consistently across time samples.
-- 0 nodes = **no navmesh path** → the car is using **simple steering** (drive straight
-  at the target), which the component gates by **`Max Simple Steering Distance = 50 m`**.
-- At **spawn**, the approach target (checkpoint origin) is far (> 50 m) → a **navmesh
-  path** is built → smooth. At **departure**, the exit marker is **< 50 m** away →
-  **simple steering** → the wobble. This is the one theory that explains BOTH
-  "smooth at spawn" AND "janky on departure" AND "prime 40 m didn't help" (40 < 50).
+- **The exit/despawn marker is > 80 m from the checkpoint** (confirmed by user).
+- So 0 nodes is NOT "target too close for navmesh". The AI simply found **no path at
+  all from the vehicle's stopped position** to a far target.
 
-## LEADING HYPOTHESIS (current)
-The departure target is within the 50 m simple-steering radius, so the AI abandons
-navmesh pathfinding and drives straight at the point, wobbling near the checkpoint
-geometry. Force navmesh pathfinding by aiming the departure waypoint **> 50 m down
-the road** (a lead point well past the exit). Despawn still triggers at the real exit
-marker via the arrival poll, so the far lead point is never actually reached.
+## Hypotheses TESTED and RULED OUT (cont.)
+8. **Fresh clear+add waypoint re-commands the driver.** RULED OUT — requestCompleted
+   stays 1, 0 nodes; the group did not put the car under a new drive order.
+9. **Simple steering because target < Max Simple Steering Distance (50 m).** RULED OUT —
+   the exit is > 80 m away and it still returned 0 nodes. Aiming even farther (a lead
+   point past the exit) reverted; premise was wrong and it risked targeting off-mesh.
 
-### Test for this hypothesis
-After aiming the depart waypoint far down the road, the log should flip to
-**node count > 0** (navmesh path built) and the drive-off should be smooth.
-If node count stays 0 → simple steering is forced by something else and we escalate
-to on-rails direct control.
+## LEADING HYPOTHESIS (current): can't path OUT of the stop position
+Pathfinding returns **0 nodes to a far target** ⇒ no path exists **from where the
+vehicle is standing**. The vehicle drives *in* fine but, once stopped at the front
+slot, it's resting somewhere the navmesh can't originate a path from — most likely
+**on/against checkpoint props/barriers, or a slot marker placed off the road mesh**.
+This is the "local navmesh for the zone" instinct, but specifically about the
+**start** position, not a jagged path.
+
+Note: a **spawned** vehicle (open road, clean mesh) drives from a standstill fine —
+so "stopped vehicles can't be commanded" is NOT the cause. The differentiator is the
+**stop location** (checkpoint) vs spawn location (open road).
+
+### DECISIVE test (authoring, ~2 min) — distinguishes navmesh/position (B) from a
+### deeper re-command problem (A):
+Temporarily place the queue-slot markers on a **clean straight stretch of open road,
+well away from any checkpoint props/barriers**, and release.
+- Departure now smooth + **node count > 0** ⇒ (B) confirmed: navmesh/obstacle at the
+  stop position. Fix = navmesh cutters on the props / continuous road corridor /
+  marker placement. (Authoring, map-specific.)
+- Still 0 nodes / wobbles on clean open road ⇒ (A): the fully-stopped re-command is
+  the problem after all → escalate to on-rails direct control.
 
 ## Component API we have
 - `AICarMovementComponent : AIBaseMovementComponent`
