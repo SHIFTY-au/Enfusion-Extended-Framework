@@ -187,8 +187,20 @@ class EEF_CheckpointComponent : ScriptComponent
 	[Attribute("", UIWidgets.ResourcePickerThumbnail, "Move waypoint prefab used to drive vehicles to the exit. Select AIWaypoint_Move from Prefabs/AI/Waypoints/ (the same one used for Patrol/Hunter).", "et")]
 	protected ResourceName m_sWaypointPrefab;
 
-	[Attribute("1", UIWidgets.ComboBox, "Speed limit for driving vehicles (AI movement speed tier). LIMP/WALK = slow crawl, JOG = moderate, SPRINT = full speed.", "", ParamEnumArray.FromEnum(EMovementType))]
+	[Attribute("1", UIWidgets.ComboBox, "AI movement effort tier applied to drive waypoints. Coarse and barely governs cars - the real speed control is the AICarMovementComponent cruise governor below. Prefer a higher tier (JOG/SPRINT) and let the cruise speeds do the capping.", "", ParamEnumArray.FromEnum(EMovementType))]
 	protected EMovementType m_eMaxSpeed;
+
+	// --------------------------------------------------------
+	// Vehicle speed governor (Stage 2 #18) - the real km/h control.
+	// Drives AICarMovementComponent.SetCruiseSpeed() on the vehicle,
+	// which caps actual driving speed regardless of the effort tier.
+	// --------------------------------------------------------
+
+	[Attribute("35.0", UIWidgets.EditBox, "Cruise speed cap (km/h) while a vehicle is approaching or departing the checkpoint. Set <= 0 to leave the vehicle prefab's own configured cruise speed untouched.")]
+	protected float m_fApproachSpeedKmh;
+
+	[Attribute("12.0", UIWidgets.EditBox, "Cruise speed cap (km/h) once a vehicle is inside the checkpoint zone - the hard slow-down applied the instant it crosses the trigger so it eases up to the queue instead of braking hard behind it. Set <= 0 to not slow down in the zone.")]
+	protected float m_fZoneSpeedKmh;
 
 	// --------------------------------------------------------
 	// Spawn cadence
@@ -598,6 +610,9 @@ class EEF_CheckpointComponent : ScriptComponent
 		// - the zone-enter detection fires well before it would ever complete that waypoint.
 		AssignMoveWaypoint(state.m_OccupantGroup, GetOwner().GetOrigin(), m_fWaypointCompletionRadius);
 
+		// Govern the approach speed so vehicles don't come in hot toward the queue.
+		ApplyCruiseSpeed(state, m_fApproachSpeedKmh);
+
 		DebugLog("Vehicle dispatched - approaching the checkpoint zone.");
 	}
 
@@ -790,6 +805,11 @@ class EEF_CheckpointComponent : ScriptComponent
 
 		state.m_iQueueSlot = slot;
 		DriveToSlot(state, slot);
+
+		// Hard slow-down the instant it enters the zone so it eases up to its slot instead of
+		// braking hard behind the queue. Persists (SetCruiseSpeed is sticky) through any promotion
+		// until the vehicle is released.
+		ApplyCruiseSpeed(state, m_fZoneSpeedKmh);
 
 		if (slot == 0)
 		{
@@ -987,6 +1007,10 @@ class EEF_CheckpointComponent : ScriptComponent
 		if (state.m_eState != EEF_ECheckpointVehicleState.DEPARTING)
 			return;
 
+		// Lift the in-zone slow-down - depart at the (controlled) approach speed rather than flooring
+		// it away from the checkpoint.
+		ApplyCruiseSpeed(state, m_fApproachSpeedKmh);
+
 		AssignMoveWaypoint(state.m_OccupantGroup, m_DespawnPoint.GetOrigin(), m_fWaypointCompletionRadius);
 		DebugLog("Departing vehicle re-tasked to the exit.");
 	}
@@ -1100,6 +1124,29 @@ class EEF_CheckpointComponent : ScriptComponent
 		group.GetWaypoints(queue);
 		foreach (AIWaypoint wp : queue)
 			group.RemoveWaypoint(wp);
+	}
+
+	//! Set the vehicle's AI cruise-speed governor (km/h). kmh <= 0 restores the vehicle prefab's own
+	//! configured cruise speed via ResetCruiseSpeed(). This is the real speed control - the coarse
+	//! EMovementType effort tier is left on SPRINT so this governor is the limiting factor.
+	protected void ApplyCruiseSpeed(EEF_CheckpointVehicleState state, float kmh)
+	{
+		if (!state || !state.m_Vehicle)
+			return;
+
+		AICarMovementComponent movement = AICarMovementComponent.Cast(
+			state.m_Vehicle.FindComponent(AICarMovementComponent)
+		);
+		if (!movement)
+		{
+			DebugLog("Vehicle has no AICarMovementComponent - cannot govern cruise speed.");
+			return;
+		}
+
+		if (kmh > 0)
+			movement.SetCruiseSpeed(kmh);
+		else
+			movement.ResetCruiseSpeed();
 	}
 
 	//------------------------------------------------------------------------------------------------
