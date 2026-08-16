@@ -151,6 +151,14 @@ class EEF_CheckpointComponent : ScriptComponent
 	// pulled up, not while still rolling in.
 	protected const float CHECKPOINT_SLOT_ARRIVAL_SLACK = 3.0;
 
+	// Departure priming. Tasking a stopped front vehicle straight at the far exit makes the AI solve a
+	// path whose first segment isn't dead ahead, so it lurches forward a few metres then re-paths. We
+	// instead first send it this far straight DOWN THE ROAD (a dead-ahead target = trivial path = the
+	// clean pull-away it does at spawn), then - once it is moving - retarget that same waypoint to the
+	// real exit (retargeting a moving vehicle is already smooth, as at zone entry).
+	protected const float CHECKPOINT_DEPART_PRIME_DIST = 40.0;	//! metres straight down the road
+	protected const int CHECKPOINT_DEPART_PRIME_MS = 700;		//! let it get rolling before retargeting to the exit
+
 	// --------------------------------------------------------
 	// Route markers (referenced by entity name in the World Editor)
 	// --------------------------------------------------------
@@ -971,16 +979,13 @@ class EEF_CheckpointComponent : ScriptComponent
 			ReleaseVehicle(front);
 	}
 
-	//! Send a held vehicle on its way: leave the queue and drive to the exit. We RETARGET the front
-	//! vehicle's existing move waypoint to the exit rather than clearing and adding a new one. The AI
-	//! brakes over a long distance (see the vehicle's Stop Distance / Max Break At config) and usually
-	//! comes to rest short of the tight slot completion radius - so the slot waypoint never actually
-	//! completes and is still active while HELD. Moving that live waypoint lets the vehicle drive on
-	//! seamlessly; clearing and re-adding instead forces a fresh path solve from a standstill, which
-	//! is what made it lurch forward a few metres and then re-path. Same fix that smoothed zone entry.
+	//! Send a held vehicle on its way. Departing from a standstill straight at the far exit makes the
+	//! AI lurch and re-path, so we PRIME it: first aim a waypoint a good distance straight down the
+	//! road (dead-ahead target = clean pull-away, like at spawn), then FinishDepart() retargets it to
+	//! the real exit once it is moving.
 	protected void ReleaseVehicle(EEF_CheckpointVehicleState state)
 	{
-		if (!state)
+		if (!state || !state.m_Vehicle)
 			return;
 
 		state.m_iQueueSlot = -1;
@@ -992,11 +997,53 @@ class EEF_CheckpointComponent : ScriptComponent
 		// it away from the checkpoint.
 		ApplyCruiseSpeed(state, m_fApproachSpeedKmh);
 
-		RetargetWaypoint(state.m_OccupantGroup, m_DespawnPoint.GetOrigin(), m_fWaypointCompletionRadius);
-		DebugLog("Vehicle released - departing toward the exit.");
+		// Prime: drive straight down the road (checkpoint -> exit direction) first.
+		vector primePos = state.m_Vehicle.GetOrigin() + GetDepartDirection(state) * CHECKPOINT_DEPART_PRIME_DIST;
+		RetargetWaypoint(state.m_OccupantGroup, primePos, m_fWaypointCompletionRadius);
+		GetGame().GetCallqueue().CallLater(FinishDepart, CHECKPOINT_DEPART_PRIME_MS, false, state);
+		DebugLog("Vehicle released - priming straight ahead before turning out to the exit.");
 
 		// Advance everyone behind it now that the front slot is free.
 		PromoteQueue();
+	}
+
+	//! Second half of a departure: once the vehicle is rolling, retarget its (now moving) waypoint to
+	//! the real exit. Guards against the vehicle having been despawned during the prime window.
+	protected void FinishDepart(EEF_CheckpointVehicleState state)
+	{
+		if (!state || m_aVehicles.Find(state) == -1)
+			return;
+
+		if (state.m_eState != EEF_ECheckpointVehicleState.DEPARTING)
+			return;
+
+		RetargetWaypoint(state.m_OccupantGroup, m_DespawnPoint.GetOrigin(), m_fWaypointCompletionRadius);
+		DebugLog("Departing vehicle now heading to the exit.");
+	}
+
+	//! Direction to pull away in on release: along the road, i.e. from the checkpoint origin toward
+	//! the exit (horizontal). Falls back to the vehicle's own forward if the checkpoint and exit are
+	//! effectively coincident.
+	protected vector GetDepartDirection(EEF_CheckpointVehicleState state)
+	{
+		vector dir = m_DespawnPoint.GetOrigin() - GetOwner().GetOrigin();
+		dir[1] = 0;
+
+		float len = dir.Length();
+		if (len > 0.001)
+			return dir * (1.0 / len);
+
+		// Fallback: the vehicle's forward axis (Z) flattened to horizontal.
+		vector mat[4];
+		state.m_Vehicle.GetTransform(mat);
+		vector forward = mat[2];
+		forward[1] = 0;
+
+		len = forward.Length();
+		if (len > 0.001)
+			return forward * (1.0 / len);
+
+		return "0 0 1";
 	}
 
 	//------------------------------------------------------------------------------------------------
