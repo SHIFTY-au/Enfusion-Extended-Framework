@@ -271,6 +271,9 @@ class EEF_CheckpointComponent : ScriptComponent
 	[Attribute("5.0", UIWidgets.EditBox, "Completion radius in metres applied to intermediate exit-path waypoints (not the final exit). Keep it moderate: tight enough that the vehicle actually threads through each point, loose enough it flows past without braking/reversing. The vehicle does not stop here so it need not be as tight as a queue slot.")]
 	protected float m_fExitPathCompletionRadius;
 
+	[Attribute("0.0", UIWidgets.EditBox, "On release, first send the vehicle to a point this many metres straight ahead of its own nose, THEN on to the exit. Gives a stopped car a correct initial heading (straight out of the slot) so it drives off cleanly instead of lurching toward the distant exit and cutting across a curve. ~8-10m works; keep it short so it stays on the road through a bend. 0 = disabled (no roll-out point).")]
+	protected float m_fDepartRollOutDistance;
+
 	[Attribute("1.0", UIWidgets.EditBox, "How often in seconds to poll vehicle positions for arrival at their current route point.")]
 	protected float m_fArrivalPollInterval;
 
@@ -1044,6 +1047,19 @@ class EEF_CheckpointComponent : ScriptComponent
 
 		array<vector> route = {};
 		GetExitRoute(route);
+
+		// Optional roll-out point straight ahead of the vehicle's nose, prepended to the route. A
+		// stopped car re-tasked with a distant target re-plans from cold and lurches off on a straight
+		// line toward it - on a curve that means cutting across the road before it corrects. A short
+		// first leg along the car's current facing (which is straight out of the slot, i.e. along the
+		// road) gives it a correct initial heading so it pulls away cleanly.
+		if (m_fDepartRollOutDistance > 0)
+		{
+			vector rollOut;
+			if (GetForwardPoint(state.m_Vehicle, m_fDepartRollOutDistance, rollOut))
+				route.InsertAt(rollOut, 0);
+		}
+
 		AssignRouteWaypoints(state.m_OccupantGroup, route, m_fWaypointCompletionRadius, m_fExitPathCompletionRadius);
 		DebugLog(string.Format("Vehicle released - departing via %1 exit-path point(s) toward the exit.", route.Count() - 1));
 
@@ -1575,6 +1591,26 @@ class EEF_CheckpointComponent : ScriptComponent
 			return ResourceName.Empty;
 
 		return valid[Math.RandomInt(0, valid.Count())];
+	}
+
+	//! A point `distance` metres straight ahead of the entity's nose, at the entity's own height
+	//! (forward flattened to horizontal). Returns false if the entity has no usable forward axis.
+	protected bool GetForwardPoint(IEntity entity, float distance, out vector outPos)
+	{
+		if (!entity)
+			return false;
+
+		vector mat[4];
+		entity.GetWorldTransform(mat);
+
+		vector forward = mat[2];
+		forward[1] = 0;
+		if (forward.LengthSq() < 0.001)
+			return false;
+
+		forward.Normalize();
+		outPos = entity.GetOrigin() + forward * distance;
+		return true;
 	}
 
 	//! Horizontal-only arrival test against an explicit radius.
