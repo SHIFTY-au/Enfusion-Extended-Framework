@@ -1019,6 +1019,33 @@ class EEF_CheckpointComponent : ScriptComponent
 
 		RetargetWaypoint(state.m_OccupantGroup, m_DespawnPoint.GetOrigin(), m_fWaypointCompletionRadius);
 		DebugLog("Departing vehicle now heading to the exit.");
+
+		// Diagnostic: dump the AI's computed path a moment later, once it has solved to the exit. A
+		// clean straight departure is ~2-3 nodes; a jagged path with many closely-spaced nodes through
+		// the checkpoint zone is the navmesh causing the constant steering corrections.
+		if (m_bDebugLog)
+			GetGame().GetCallqueue().CallLater(DumpDeparturePath, 600, false, state);
+	}
+
+	//! Log the AI's current navmesh path for a departing vehicle (debug only) - node count is the tell:
+	//! a handful = clean, many tightly-spaced = a rough mesh the vehicle keeps re-steering along.
+	protected void DumpDeparturePath(EEF_CheckpointVehicleState state)
+	{
+		if (!state || m_aVehicles.Find(state) == -1 || !state.m_Vehicle)
+			return;
+
+		AICarMovementComponent movement = AICarMovementComponent.Cast(
+			state.m_Vehicle.FindComponent(AICarMovementComponent)
+		);
+		if (!movement)
+			return;
+
+		array<vector> pts = {};
+		movement.GetCurrentPath(pts);
+
+		DebugLog(string.Format("Departure path node count: %1 (few = clean, many = jagged navmesh).", pts.Count()));
+		foreach (int i, vector p : pts)
+			DebugLog(string.Format("  path[%1] = %2", i, p));
 	}
 
 	//! Direction to pull away in on release: along the road, i.e. from the checkpoint origin toward
