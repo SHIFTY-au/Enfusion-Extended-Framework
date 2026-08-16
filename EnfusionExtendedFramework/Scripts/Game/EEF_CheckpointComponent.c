@@ -151,14 +151,6 @@ class EEF_CheckpointComponent : ScriptComponent
 	// pulled up, not while still rolling in.
 	protected const float CHECKPOINT_SLOT_ARRIVAL_SLACK = 3.0;
 
-	// Departure priming. Tasking a stopped front vehicle straight at the far exit makes the AI solve a
-	// path whose first segment isn't dead ahead, so it lurches forward a few metres then re-paths. We
-	// instead first send it this far straight DOWN THE ROAD (a dead-ahead target = trivial path = the
-	// clean pull-away it does at spawn), then - once it is moving - retarget that same waypoint to the
-	// real exit (retargeting a moving vehicle is already smooth, as at zone entry).
-	protected const float CHECKPOINT_DEPART_PRIME_DIST = 40.0;	//! metres straight down the road
-	protected const int CHECKPOINT_DEPART_PRIME_MS = 700;		//! let it get rolling before retargeting to the exit
-
 	// --------------------------------------------------------
 	// Route markers (referenced by entity name in the World Editor)
 	// --------------------------------------------------------
@@ -979,10 +971,11 @@ class EEF_CheckpointComponent : ScriptComponent
 			ReleaseVehicle(front);
 	}
 
-	//! Send a held vehicle on its way. Departing from a standstill straight at the far exit makes the
-	//! AI lurch and re-path, so we PRIME it: first aim a waypoint a good distance straight down the
-	//! road (dead-ahead target = clean pull-away, like at spawn), then FinishDepart() retargets it to
-	//! the real exit once it is moving.
+	//! Send a held vehicle on its way: leave the queue and drive to the exit. Uses a FRESH waypoint
+	//! (clear + add) rather than retargeting the slot waypoint. At the front the car's movement request
+	//! has already completed (it braked to a stop of its own accord), so merely moving the waypoint
+	//! origin issues no new drive order - the vehicle sits with requestCompleted=1 and twitches. A
+	//! fresh waypoint forces the group to re-task the driver with a new order.
 	protected void ReleaseVehicle(EEF_CheckpointVehicleState state)
 	{
 		if (!state || !state.m_Vehicle)
@@ -997,39 +990,20 @@ class EEF_CheckpointComponent : ScriptComponent
 		// it away from the checkpoint.
 		ApplyCruiseSpeed(state, m_fApproachSpeedKmh);
 
-		// Prime: drive straight down the road (checkpoint -> exit direction) first.
-		vector primePos = state.m_Vehicle.GetOrigin() + GetDepartDirection(state) * CHECKPOINT_DEPART_PRIME_DIST;
-		RetargetWaypoint(state.m_OccupantGroup, primePos, m_fWaypointCompletionRadius);
-		GetGame().GetCallqueue().CallLater(FinishDepart, CHECKPOINT_DEPART_PRIME_MS, false, state);
-		DebugLog("Vehicle released - priming straight ahead before turning out to the exit.");
+		AssignMoveWaypoint(state.m_OccupantGroup, m_DespawnPoint.GetOrigin(), m_fWaypointCompletionRadius);
+		DebugLog("Vehicle released - departing toward the exit.");
 
-		// Advance everyone behind it now that the front slot is free.
-		PromoteQueue();
-	}
-
-	//! Second half of a departure: once the vehicle is rolling, retarget its (now moving) waypoint to
-	//! the real exit. Guards against the vehicle having been despawned during the prime window.
-	protected void FinishDepart(EEF_CheckpointVehicleState state)
-	{
-		if (!state || m_aVehicles.Find(state) == -1)
-			return;
-
-		if (state.m_eState != EEF_ECheckpointVehicleState.DEPARTING)
-			return;
-
-		RetargetWaypoint(state.m_OccupantGroup, m_DespawnPoint.GetOrigin(), m_fWaypointCompletionRadius);
-		DebugLog("Departing vehicle now heading to the exit.");
-
-		// Diagnostic: sample the AI's computed path several times across the departure. Consistently 0
-		// nodes = no navmesh path at all (simple steering straight at the target); a few nodes = a
-		// clean navmesh path; many tightly-spaced nodes = a jagged mesh causing constant re-steering.
-		// Sampling over time rules out "path not solved yet" at any single instant.
+		// Diagnostic: confirm the fresh order actually took (requestCompleted should now read 0 while
+		// it drives). Sampled a few times across the departure.
 		if (m_bDebugLog)
 		{
 			GetGame().GetCallqueue().CallLater(DumpDeparturePath, 300, false, state);
 			GetGame().GetCallqueue().CallLater(DumpDeparturePath, 1200, false, state);
 			GetGame().GetCallqueue().CallLater(DumpDeparturePath, 2500, false, state);
 		}
+
+		// Advance everyone behind it now that the front slot is free.
+		PromoteQueue();
 	}
 
 	//! Log the AI's current navmesh path for a departing vehicle (debug only) - node count is the tell:
@@ -1056,31 +1030,6 @@ class EEF_CheckpointComponent : ScriptComponent
 		DebugLog(string.Format("Departure path sample: %1 node(s), requestCompleted=%2 (0 nodes = simple steering / no navmesh path).", pts.Count(), done));
 		foreach (int i, vector p : pts)
 			DebugLog(string.Format("  path[%1] = %2", i, p));
-	}
-
-	//! Direction to pull away in on release: along the road, i.e. from the checkpoint origin toward
-	//! the exit (horizontal). Falls back to the vehicle's own forward if the checkpoint and exit are
-	//! effectively coincident.
-	protected vector GetDepartDirection(EEF_CheckpointVehicleState state)
-	{
-		vector dir = m_DespawnPoint.GetOrigin() - GetOwner().GetOrigin();
-		dir[1] = 0;
-
-		float len = dir.Length();
-		if (len > 0.001)
-			return dir * (1.0 / len);
-
-		// Fallback: the vehicle's forward axis (Z) flattened to horizontal.
-		vector mat[4];
-		state.m_Vehicle.GetTransform(mat);
-		vector forward = mat[2];
-		forward[1] = 0;
-
-		len = forward.Length();
-		if (len > 0.001)
-			return forward * (1.0 / len);
-
-		return "0 0 1";
 	}
 
 	//------------------------------------------------------------------------------------------------
