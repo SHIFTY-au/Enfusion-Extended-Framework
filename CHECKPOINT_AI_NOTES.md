@@ -38,14 +38,7 @@ better waypoint orders. All failed with the same jank:
 Conclusion: issuing better orders to the engine's AI driver does not fix this.
 The engine vehicle brain is unreliable at low speed in tight/curved space.
 
-## 4. Agreed direction
-Stop delegating in-zone movement to the engine AI. Take **direct script
-control** of vehicles while they are inside the checkpoint zone, using the road
-network as the path source (`RoadNetworkManager`, §5) so movement traces the
-road instead of cutting curves. AI handles far approach only; scripted control
-takes over inside the zone.
-
-## 5. Known API (obtained from Workbench; not fetchable in this sandbox)
+## 4. Known API (obtained from Workbench; not fetchable in this sandbox)
 ```
 class RoadNetworkManager {
     proto int  GetClosestRoad(vector pos, out BaseRoad foundRoad, out float distance, bool skipNavlinks = false);
@@ -57,7 +50,7 @@ Still needed from Workbench: how to obtain the `RoadNetworkManager` instance,
 the `BaseRoad` surface (to place a point on the road / know which side), and the
 vehicle input/drive component (throttle/brake/steering) if going physics-based.
 
-## 6. Environment constraint
+## 5. Environment constraint
 BI wiki, arexplorer, and BI forums are egress-blocked in this sandbox, so API
 signatures must come from Workbench autocomplete. User tests each build by
 pulling `claude/issue-16-epic-tp3hy5` into their own Workbench.
