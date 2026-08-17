@@ -1,120 +1,97 @@
-# Checkpoint AI Movement — Debugging Notes (#18)
+# BUG: Checkpoint front-slot departure is incoherent (#18 blocker)
 
-Working notes for the AI vehicle **departure** problem so we stop re-testing dead ends.
-
-## Symptom
-When the front (HELD) vehicle is released, it drives forward ~5 m then "reassesses"
-its pathing and behaves incoherently (veer, correct, sometimes multi-point turn).
-We just want it to continue on its way to the exit.
-
-## What WORKS (do not blame these)
-- **Spawn → approach drive**: smooth. Vehicle spawns upstream, gets one waypoint at
-  the checkpoint origin, drives in fine. **Paths fine (navmesh) at spawn.**
-- **Zone entry / queue advance**: smooth, after we switched to *retargeting* the
-  active waypoint (moving its origin) instead of clear+add. Works because the vehicle
-  is still executing a live (incomplete) request, so moving the target updates it.
-- **Queue itself**: slots, promotion, hold, release timing all correct.
-
-## What does NOT work: departure
-Vehicle is stopped/HELD at the front slot, then released → incoherent.
-
-## Hypotheses TESTED and RULED OUT
-1. **Leftover/multiple waypoints** → clear all + single fresh waypoint. RULED OUT (same jank).
-2. **Clear + delayed re-add (let AI settle 250ms)**. RULED OUT.
-3. **Retarget the still-active slot waypoint to the exit** (worked for zone entry).
-   RULED OUT — at the front the request has already completed, so moving the origin
-   issues no new order.
-4. **Stuck-recovery** (hold > Max Stuck Time 4s). RULED OUT — tested 2s hold, same jank.
-5. **Prime straight ahead 40 m, then retarget to exit.** RULED OUT (still jank).
-6. **Fresh clear+add order at release.** RULED OUT — log shows `requestCompleted=1`,
-   `0` path nodes on all samples; a fresh waypoint did NOT put the car under an active
-   drive order.
-7. **Jagged zone navmesh.** Effectively ruled out — path node count is **0**, not "many".
-
-## Key diagnostic facts (from `GetCurrentPath` / `HasCompletedRequest`)
-- On departure: **0 path nodes**, **requestCompleted=1**, consistently across time samples.
-- **The exit/despawn marker is > 80 m from the checkpoint** (confirmed by user).
-- So 0 nodes is NOT "target too close for navmesh". The AI simply found **no path at
-  all from the vehicle's stopped position** to a far target.
-
-## Hypotheses TESTED and RULED OUT (cont.)
-8. **Fresh clear+add waypoint re-commands the driver.** RULED OUT — requestCompleted
-   stays 1, 0 nodes; the group did not put the car under a new drive order.
-9. **Simple steering because target < Max Simple Steering Distance (50 m).** RULED OUT —
-   the exit is > 80 m away and it still returned 0 nodes. Aiming even farther (a lead
-   point past the exit) reverted; premise was wrong and it risked targeting off-mesh.
-
-## RESOLVED — root cause confirmed (open-road test)
-Moved the queue-slot markers to a clean straight stretch of open road and released:
-**departure became smooth.** Crucially the log STILL read `0 nodes / requestCompleted=1`
-even while driving off perfectly. So:
-
-- **`0 nodes` is NOT the bug.** It means *simple steering* — the AI drives straight at
-  the target with no navmesh path, and that is completely normal and works fine on a
-  clear straight line (even to a target >80 m away). Every earlier reading of "0 nodes =
-  broken path" was a misread. Struck.
-- The ONLY differentiator is the **stop location**. Open road → clear straight line to
-  the target → simple steering works. Checkpoint → the straight line to the exit is
-  **obstructed by the checkpoint props/barriers** (and there's no navmesh corridor
-  through them to route around), so simple steering flails.
-- ⇒ It IS the navmesh/geometry at the checkpoint, exactly as the leading hypothesis said,
-  but specifically: **no clear straight line AND no navmesh detour out of the gate.**
-
-### FIX IMPLEMENTED — authored exit-path markers
-The queue-slot markers already prove the AI drives to authored on-road points flawlessly.
-So on release we no longer aim it straight at the distant exit; we feed it an ordered
-chain of **exit-path markers** (author-placed on the road out of the gate) then the exit.
-Each leg is a short, clear, straight shot it can simple-steer cleanly — same mechanism as
-the inbound queue slots. Optional; empty = drive straight at exit (open road only).
-- New attribute: `m_aExitPathMarkers` (array of `EEF_CheckpointExitPathEntry`), resolved
-  by `ResolveExitPath()`; `GetExitRoute()` = markers + despawn point.
-- New: `CreateMoveWaypoint()` (extracted), `AssignRouteWaypoints()` (drives a chain).
-- `ReleaseVehicle()` now calls `AssignRouteWaypoints(group, GetExitRoute(...))`.
-- New radius attribute `m_fExitPathCompletionRadius` (default 5m) for the intermediate
-  points — loose enough to flow through, not stop/reverse.
-- **DEPARTING** still only watches distance to the despawn point, so the chain doesn't
-  change arrival/despawn. PromoteQueue ignores DEPARTING, so the route isn't disturbed.
-
-**Map-side alternative / complement:** clear the navmesh corridor through the checkpoint
-(props' navmesh generation mode, continuous road mesh, slot markers on-mesh) so a real
-path generates. The exit-path markers work regardless, so they're the robust default.
-
-**NOT the lever:** `Max Distance to Path` — only acts when a path exists; departure is
-simple-steering (no path), so tuning path-follow params does nothing here.
+**Status:** OPEN — sole blocker to completing Stage 2 (#18) and moving to Stage 3 (#19).
+**Build:** baseline restored at commit `7a93b25` (reverted to known-good `3c930df`).
+**Branch:** `claude/issue-16-epic-tp3hy5`
+**File:** `EnfusionExtendedFramework/Scripts/Game/EEF_CheckpointComponent.c`
 
 ---
-## LEADING HYPOTHESIS (superseded — see RESOLVED above): can't path OUT of the stop position
-Pathfinding returns **0 nodes to a far target** ⇒ no path exists **from where the
-vehicle is standing**. The vehicle drives *in* fine but, once stopped at the front
-slot, it's resting somewhere the navmesh can't originate a path from — most likely
-**on/against checkpoint props/barriers, or a slot marker placed off the road mesh**.
-This is the "local navmesh for the zone" instinct, but specifically about the
-**start** position, not a jagged path.
 
-Note: a **spawned** vehicle (open road, clean mesh) drives from a standstill fine —
-so "stopped vehicles can't be commanded" is NOT the cause. The differentiator is the
-**stop location** (checkpoint) vs spawn location (open road).
+## 1. Summary
+The whole Stage 2 traffic loop works — spawn → seat → approach → enter zone → queue →
+advance → hold at the front — **except the final step**. When the front (HELD) vehicle is
+released, it does **not** pull away cleanly toward the exit. It veers off the road and/or
+does multi-point turns before eventually recovering. Everything up to release is solid.
 
-### DECISIVE test (authoring, ~2 min) — distinguishes navmesh/position (B) from a
-### deeper re-command problem (A):
-Temporarily place the queue-slot markers on a **clean straight stretch of open road,
-well away from any checkpoint props/barriers**, and release.
-- Departure now smooth + **node count > 0** ⇒ (B) confirmed: navmesh/obstacle at the
-  stop position. Fix = navmesh cutters on the props / continuous road corridor /
-  marker placement. (Authoring, map-specific.)
-- Still 0 nodes / wobbles on clean open road ⇒ (A): the fully-stopped re-command is
-  the problem after all → escalate to on-rails direct control.
+## 2. What works (confirmed, do not touch)
+- Spawn, crew seating, dispatch.
+- **Approach + zone entry**: smooth. Zone entry was fixed by *retargeting* the live
+  waypoint (moving its origin) instead of clear-and-re-add, so the car never stops on entry.
+- **Queue**: slot assignment, promotion/re-pack, hold timing — all correct.
+- Debug auto-release timer (stands in for the #19 player gate).
 
-## Component API we have
-- `AICarMovementComponent : AIBaseMovementComponent`
-  - `SetCruiseSpeed(float kmh)`, `ResetCruiseSpeed()`, `GetLastNavlinkEntity()`
-- `AIBaseMovementComponent`
-  - `HasCompletedRequest(bool)`, `RequestFollowPathOfEntity(IEntity)`,
-    `GetCurrentPath(array<vector>)`, `GetPathfindingComponent()`, event `OnPathSet()`
-- Relevant prefab config (NOT script-settable): `Max Simple Steering Distance 50`,
-  `Min Prediction Distance 4`, `Max Distance to Path 1`, `Stop Distance Coefficient 17`,
-  `Steering PID`, `Cruise Vehicle Speed Kmh 60`, `Min Speed 6`.
+## 3. The bug (reproduction)
+1. Checkpoint trigger + spawn/despawn markers + queue-slot markers placed on a road that
+   has **any curve** near the front stop.
+2. Let a vehicle spawn, queue, reach the front, and get auto-released.
+3. **Observe:** instead of driving straight out to the exit, the car turns off the road /
+   3-point-turns, then eventually heads to the exit. On a **dead-straight** road it looks
+   fine (see §5).
 
-## Escape hatch if the leading hypothesis fails
-On-rails scripted control: drive the vehicle directly via `CarControllerComponent`
-inputs along the authored lane, bypassing the AI driver entirely.
+## 4. Established facts (what we KNOW)
+- On release the car is **fully stopped** at the front slot (its prior move request
+  completed — it braked to a halt on its own).
+- Re-commanding a stopped car with a fresh, distant waypoint makes it **simple-steer**
+  (drive a straight line at the target) for the first stretch before it settles. On a
+  curve that initial straight line leaves the road → veer → correct → multi-point turn.
+- The **same vehicle follows the same curved road fine while it is already MOVING**
+  (approach and queue-advance are smooth, both done via waypoint *retargeting*).
+- **No props/barriers were present in any failing test** — only a slight road curve. So it
+  is NOT obstacle avoidance / being boxed in.
+- `AICarMovementComponent.GetCurrentPath()` reported **0 nodes / requestCompleted=1** on the
+  departing car. This is now believed to be the **wrong component to inspect** — the navmesh
+  path lives on the driver *agent's* pathfinding, not the car movement component — so that
+  reading is unreliable and is NOT proof that "no path exists."
+
+## 5. Why a straight road hid it
+Simple-steering drives a straight line to the target. On a straight road that line lies on
+the road, so departure looks perfect. On a curve the same line leaves the road. The
+underlying defect (cold re-command → simple-steer → cut the curve) is identical in both;
+the road shape only changes whether it's visible.
+
+## 6. Hypotheses TESTED and RULED OUT (do not re-test)
+1. Leftover / multiple waypoints (clear all + single fresh) — same jank.
+2. Clear + delayed re-add (settle 250 ms) — same.
+3. Retarget the completed slot waypoint — no-op: request already completed, no new order.
+4. Stuck-recovery (hold > Max Stuck Time) — tested 2 s hold, same.
+5. Prime straight-ahead 40 m then retarget — same.
+6. Fresh clear+add order — `requestCompleted` stayed 1, 0 nodes.
+7. Jagged zone navmesh — path node count was 0, not "many".
+8. Simple-steering distance cutoff (target < 50 m) — exit is > 80 m and still simple-steered.
+9. Props / navmesh obstacle at the stop — **no props present** in any failing test.
+10. **Nose-projected roll-out point** (drive 8 m ahead of the vehicle's nose first) —
+    REGRESSION: a car at the front faces the way it *drove in* (toward the checkpoint), not
+    the exit, so the point landed off-road/behind it → it drove off and 3-point-turned,
+    jamming the lane and making the queue behind it look broken. Reverted in `7a93b25`.
+
+## 7. Leading theory (current)
+The AI driver, re-tasked **from a dead stop**, does not immediately follow the road navmesh;
+it simple-steers toward the target first, cutting curves. The only mechanism proven smooth
+is updating a waypoint while the car is **already moving** (retarget). So a fix must either
+(a) never let the car cold-start toward a distant target, or (b) feed it look-ahead points
+that are always **on the road**, so even simple-steering traces the road.
+
+## 8. Proposed next approach (after reset — deliberate, one idea at a time)
+**Road-network "pure pursuit."** Use `RoadNetworkManager.GetClosestRoad()` to snap a short
+look-ahead point onto the road ahead of the car, and *retarget* the (moving) waypoint to it
+every few ticks while in-zone/departing. The road network becomes the path — **no authored
+exit markers**. Confirmed to exist in the API; exact signatures still needed (see §10).
+
+## 9. Decision needed
+Is coherent departure a **hard requirement to close #18**, or is it acceptable to ship #18
+with the clean queue + a documented departure TODO and address it as a follow-up (e.g. its
+own issue) so Stage 3 (#19 interaction) can proceed? #19 only needs the existing
+`GetFrontVehicle()` / `ReleaseFrontVehicle()` / `OnVehicleStateChanged` seams, which are done.
+
+## 10. Blockers / environment
+- Dev sandbox has **BI wiki, arexplorer, and BI forums egress-blocked** — API docs cannot be
+  read here. Real signatures must come from **Workbench autocomplete** (as done for
+  `AICarMovementComponent`). Needed next: `RoadNetworkManager` methods + how to obtain it.
+- Test loop: push to `claude/issue-16-epic-tp3hy5`; user tests in their own Workbench.
+
+## Component seams already in place (for #19)
+- `AICarMovementComponent`: `SetCruiseSpeed(float kmh)`, `ResetCruiseSpeed()`.
+- Waypoints: `AssignMoveWaypoint()` (clear+add), `RetargetWaypoint()` (move live waypoint —
+  the smooth path), `ClearWaypoints()`, `HasWaypoints()`.
+- Public: `GetFrontVehicle()`, `ReleaseFrontVehicle()`, `GetOnVehicleStateChanged()`,
+  `GetOnVehicleDespawned()`, `GetVehicleStates()`.
