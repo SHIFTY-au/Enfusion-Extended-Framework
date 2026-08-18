@@ -171,3 +171,112 @@ separately check `AIWorld` in autocomplete for a method returning
 `RoadNetworkManager` (or however an `AIWorld`/`BaseWorld` instance is itself
 obtained, if that's an extra hop). Report back or fix the one line in
 `ResolveDrivePoint()` directly.
+
+## 9. Live-tested finding (2026-08-18): heading, not position, is the dominant
+## variable — new design direction supersedes §8's position-snap approach
+
+**Test result:** §8's position-snap code was never actually live when tested
+(`roadMgr` was still hardcoded `null` per §8's blocker), so what got tested
+was baseline behaviour — described as "the AI was super bad." Separately,
+manually re-orienting a stopped vehicle at a curve queue point (in Workbench,
+before release) so it faced more directly down the exit road produced an
+**acceptable departure with only a slight S-shaped path**, instead of the
+usual 3-point-turn jank. Same position, only heading changed.
+
+**Conclusion:** vehicle heading at the stop point is the dominant variable,
+not point position. This fits the mechanism theory in §6/§8: the AI's
+replan-from-a-stop has to solve a forward arc from the vehicle's *current
+heading* to the target; a badly misaligned heading means no forward arc
+fits the corridor, so it reverses to reorient. Align the heading first and
+the arc shrinks to something solvable. §8's position-only snap does nothing
+for a vehicle sitting at the *right point* facing the *wrong way* - this
+likely explains why it read as useless even setting aside that it was inert.
+
+**NOT the same as the already-ruled-out "nose-projected roll-out point" in
+§3.** That attempt derived a lead-in point from the vehicle's *live* facing
+when it happened to stop (unreliable, caused a regression). This is an
+*authored/intentional* target heading, independent of how the vehicle
+settled - a different, better-grounded lever. Do not conflate the two or
+re-dismiss this based on §3's entry.
+
+**Ruled out outright: directly snapping a stopped vehicle's transform to a
+target heading in code.** Explicitly rejected as "100% immersion breaking."
+Do not revisit.
+
+### New design direction (replaces §8's approach; supersedes it, not additive)
+Rather than authoring per-slot heading (which would push authoring burden
+onto the mission maker) or snapping a stopped vehicle's facing, let the AI
+drive one continuous route through the zone - as if passing straight
+through at the already-governed low speed - and never re-task it while it's
+in the lane. Concretely:
+
+1. Queue hold points are **calculated**, not authored, from the checkpoint
+   (or a mission-maker-defined checkpoint zone): starting at the checkpoint
+   and walking back along the road at even spacing, find the road's local
+   heading at each spacing interval and drop a gate line perpendicular to
+   it there.
+2. The vehicle is dispatched with a single continuous route through the
+   zone - never re-tasked to a series of disconnected stop markers the way
+   `DriveToSlot`/`RetargetWaypoint` currently work.
+3. Each poll tick tests whether the vehicle has *crossed* its currently
+   assigned gate line (a line-crossing test between consecutive polls, not
+   a proximity/radius test like today's `HasArrivedWithin`).
+4. On crossing its assigned gate: halt **in place, mid-route**, without
+   cancelling or replacing the order.
+5. On release: resume the *same* order/route - no new waypoint, no replan -
+   so the AI is never asked to solve anything from a dead stop, which is
+   exactly the case we already know works cleanly (§2: "the same car
+   follows the same curve fine once it is already moving").
+
+This explains the test result directly: a vehicle mid-route is tangent to
+the road by construction, at every point along it, with zero authoring
+burden per checkpoint.
+
+### Blocking - four things need Workbench confirmation before this is coded
+Learned from §8: don't guess API and burn another test cycle. In priority
+order:
+
+1. **Road tangent/heading at an arbitrary point.** Needed to place gates.
+   `RoadNetworkManager.GetClosestRoad()` returns a `BaseRoad` (see §4) -
+   does `BaseRoad` expose a curve/point-list or direction query? Check
+   `BaseRoad`'s members in autocomplete.
+2. **Obtaining a live `RoadNetworkManager` instance at all.** Same
+   unresolved blocker as §8 - needed regardless of design.
+3. **Walking distance along the road to space gates evenly**, including
+   across a curve built from multiple connected road segments. Look for a
+   points/nodes array or a distance-along-road query on `BaseRoad`, and
+   whether `RoadNetworkManager.GetRoadsInAABB` is how segments get stitched
+   together across the queue lane's span.
+4. **The linchpin: halting a moving AI vehicle in place without cancelling
+   its order, then resuming the same order later.** Determines whether
+   "gate-crossing + freeze" is achievable at all. `AICarMovementComponent`
+   is already in use in this file (`SetCruiseSpeed`/`ResetCruiseSpeed`/
+   `GetCurrentPath`) - check whether it has a real stop/halt call, or
+   whether `SetCruiseSpeed(0)` actually holds at zero rather than being
+   treated as "unset" (today's code treats `kmh <= 0` as "reset to prefab
+   default," which is not a true stop - see `ApplyCruiseSpeed`). Also check
+   whether `AIWaypoint`/`SCR_AIWaypoint` has any pause/dwell state as an
+   alternative mechanism.
+
+Line-crossing detection (step 3 above) is plain vector math on data already
+available - no new engine API needed there.
+
+### Debug visualisation (nice-to-have, asked for but not blocking)
+Enfusion-family engines conventionally expose a debug-draw primitive -
+commonly a `Shape` class (`Shape.CreateSphere`, `CreateArrow`, lines, etc.)
+for exactly this kind of gizmo. Unconfirmed for this title specifically -
+check Workbench autocomplete on `Shape`. If present, it slots onto code
+that already exists: `DumpDeparturePath()` already pulls
+`movement.GetCurrentPath()` and currently only prints it to console -
+extending that to draw spheres/lines would visualise the live AI path, the
+computed gate lines, and the hold points at once in the Workbench viewport.
+If nothing like that exists, the console dump already in place is the
+fallback.
+
+### Status of §8's code
+`m_bSnapToRoadNetwork` / `ResolveDrivePoint()` in `EEF_CheckpointComponent.c`
+are superseded by this design, not extended by it - the whole
+retarget-to-a-corrected-point mechanism goes away under the
+continuous-route/gate-crossing model. Left in place (still an inert no-op)
+until the new design is actually implemented, rather than ripping it out
+pre-emptively before its replacement exists.
