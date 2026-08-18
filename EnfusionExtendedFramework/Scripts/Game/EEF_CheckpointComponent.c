@@ -170,6 +170,22 @@ class EEF_CheckpointComponent : ScriptComponent
 	protected ref array<ref EEF_CheckpointQueueSlotEntry> m_aQueueSlotMarkers;
 
 	// --------------------------------------------------------
+	// Road-network correction (#23 workaround) - every drive-to-point order issued below (approach,
+	// queue slot, departure) is snapped onto the actual road corridor before being handed to the AI.
+	// Root cause theory: a hand-authored point that doesn't sit cleanly on the navigable corridor at
+	// a curve forces the driver to replan from a pose no forward arc can reach, so it reverses to
+	// reorient (the 3-point-turn jank). A moving vehicle never hits this because it is already
+	// tracking a valid corridor - only a fresh/re-tasked order does. Toggle off to A/B against the
+	// pre-#23 raw-marker behaviour.
+	// --------------------------------------------------------
+
+	[Attribute("1", UIWidgets.CheckBox, "Snap every drive-to-point target (approach, queue slot, departure) onto the road network before issuing it, instead of using the raw marker/point position. Workaround for #23 (AI driver jank on curves). Disable to compare against the raw-marker behaviour.")]
+	protected bool m_bSnapToRoadNetwork;
+
+	[Attribute("15.0", UIWidgets.EditBox, "Search range (metres) passed to the road-network reachability query when snapping a target point. Too small and a valid nearby road point may not be found; too large and it may snap to the wrong stretch of road.")]
+	protected float m_fRoadSnapRange;
+
+	// --------------------------------------------------------
 	// Prefab pools
 	// --------------------------------------------------------
 
@@ -603,7 +619,8 @@ class EEF_CheckpointComponent : ScriptComponent
 		// assigned a queue slot and re-tasked to that slot marker. We aim the approach waypoint at
 		// the checkpoint origin (with the generous general completion radius so it flows in smoothly)
 		// - the zone-enter detection fires well before it would ever complete that waypoint.
-		AssignMoveWaypoint(state.m_OccupantGroup, GetOwner().GetOrigin(), m_fWaypointCompletionRadius);
+		vector approachTarget = ResolveDrivePoint(state.m_Vehicle.GetOrigin(), GetOwner().GetOrigin());
+		AssignMoveWaypoint(state.m_OccupantGroup, approachTarget, m_fWaypointCompletionRadius);
 
 		// Govern the approach speed so vehicles don't come in hot toward the queue.
 		ApplyCruiseSpeed(state, m_fApproachSpeedKmh);
@@ -928,6 +945,9 @@ class EEF_CheckpointComponent : ScriptComponent
 		if (!GetSlotPosition(slot, slotPos))
 			return;
 
+		if (state.m_Vehicle)
+			slotPos = ResolveDrivePoint(state.m_Vehicle.GetOrigin(), slotPos);
+
 		RetargetWaypoint(state.m_OccupantGroup, slotPos, m_fQueueSlotCompletionRadius);
 	}
 
@@ -990,7 +1010,8 @@ class EEF_CheckpointComponent : ScriptComponent
 		// it away from the checkpoint.
 		ApplyCruiseSpeed(state, m_fApproachSpeedKmh);
 
-		AssignMoveWaypoint(state.m_OccupantGroup, m_DespawnPoint.GetOrigin(), m_fWaypointCompletionRadius);
+		vector exitTarget = ResolveDrivePoint(state.m_Vehicle.GetOrigin(), m_DespawnPoint.GetOrigin());
+		AssignMoveWaypoint(state.m_OccupantGroup, exitTarget, m_fWaypointCompletionRadius);
 		DebugLog("Vehicle released - departing toward the exit.");
 
 		// Diagnostic: confirm the fresh order actually took (requestCompleted should now read 0 while
@@ -1169,6 +1190,37 @@ class EEF_CheckpointComponent : ScriptComponent
 	//------------------------------------------------------------------------------------------------
 	// WAYPOINTS
 	//------------------------------------------------------------------------------------------------
+
+	//! Attempt to snap targetPos onto the actual road-network corridor reachable from fromPos, before
+	//! it is ever handed to the AI as a drive order (#23 workaround - see the road-network-correction
+	//! block in the attributes above). Purely additive: falls back to the untouched raw point whenever
+	//! the manager or the query is unavailable, so this can never behave worse than the pre-#23 code.
+	//!
+	//! *** UNCONFIRMED - DO NOT TEST UNTIL THIS IS FIXED ***
+	//! The accessor to obtain a live RoadNetworkManager instance was never confirmed - BI's wiki and
+	//! forums are egress-blocked from the research sandbox that wrote this (see CHECKPOINT_AI_NOTES.md
+	//! §5-7). Check Workbench autocomplete on GetGame().GetWorld() and on AIWorld for a method that
+	//! returns RoadNetworkManager, then replace the line below. Until fixed, roadMgr is always null and
+	//! this whole feature is a documented no-op (m_bSnapToRoadNetwork has no effect).
+	protected vector ResolveDrivePoint(vector fromPos, vector targetPos)
+	{
+		if (!m_bSnapToRoadNetwork)
+			return targetPos;
+
+		RoadNetworkManager roadMgr = null; // TODO(#23): confirm real accessor in Workbench, see above.
+		if (!roadMgr)
+			return targetPos;
+
+		vector corrected;
+		if (roadMgr.GetReachableWaypointInRoad(fromPos, targetPos, m_fRoadSnapRange, corrected))
+		{
+			DebugLog(string.Format("Road-network snap: %1 -> %2", targetPos, corrected));
+			return corrected;
+		}
+
+		DebugLog(string.Format("Road-network snap found no reachable point near %1 (range %2m) - using raw target.", targetPos, m_fRoadSnapRange));
+		return targetPos;
+	}
 
 	//! Clear the group's current waypoints and give it a single move waypoint at targetPos.
 	//! A member in the driver seat makes the group drive the vehicle there. completionRadius < 0

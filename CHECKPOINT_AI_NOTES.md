@@ -136,3 +136,38 @@ problem curve against the 2.6 m agent radius. Only fall back to the
 `AIPathfindingComponent` filter or full `RoadNetworkManager`-driven
 in-zone-only physics control if the geometry angle doesn't resolve it —
 in that order, since each is progressively more code to own long-term.
+
+## 8. Implementation: road-network target-point correction (2026-08-18)
+Landed the "calculated queue location" fix in `EEF_CheckpointComponent.c`,
+gated behind a new `m_bSnapToRoadNetwork` attribute so it can be A/B tested
+against the pre-#23 raw-marker behaviour without a code revert. It's one
+mechanism, not two separate ones ("road-graph pathing" and "calculated queue
+location" were the same idea described at two altitudes):
+
+- New helper `ResolveDrivePoint(fromPos, targetPos)` snaps `targetPos` onto
+  the road corridor reachable from `fromPos` via
+  `RoadNetworkManager.GetReachableWaypointInRoad()`, falling back to the raw
+  point untouched if the manager/query is unavailable - purely additive,
+  can't behave worse than before.
+- Wired into all three places the component issues a drive-to-point order
+  (matches "not tied to one phase" in §1): the approach target in
+  `Dispatch()`, the queue-slot target in `DriveToSlot()`, and the exit
+  target in `ReleaseVehicle()`. The AI's own driving (throttle/steer/
+  obstacle-avoidance) is untouched - only the target point changes.
+- New attributes: `m_bSnapToRoadNetwork` (toggle, default on) and
+  `m_fRoadSnapRange` (search range in metres for the reachability query).
+
+**BLOCKING - not yet testable as-is:** the accessor to obtain a live
+`RoadNetworkManager` instance was never confirmed (see §5 - BI wiki/forums/
+Workshop/YouTube are all egress-blocked from this sandbox). `ResolveDrivePoint()`
+currently hardcodes `RoadNetworkManager roadMgr = null;` with a `TODO(#23)`
+marker at that exact line, so the feature compiles and is a documented no-op
+until that one line is fixed. Deliberately not guessed at - a wrong guess
+there would just fail to compile and burn a Workbench test cycle for
+nothing, the same trap that made §3's testing pass slow.
+
+**Needed from whoever has Workbench next:** type `GetGame().GetWorld().` and
+separately check `AIWorld` in autocomplete for a method returning
+`RoadNetworkManager` (or however an `AIWorld`/`BaseWorld` instance is itself
+obtained, if that's an extra hop). Report back or fix the one line in
+`ResolveDrivePoint()` directly.
