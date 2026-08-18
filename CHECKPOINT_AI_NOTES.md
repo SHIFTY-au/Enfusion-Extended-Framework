@@ -414,7 +414,67 @@ Workbench console against where vehicles actually stop - a low-effort stand-in
 for the debug visualisation asked about in section 9 (no in-world debug-draw
 API was found/needed).
 
-**Not yet re-tested** - this fix has not had a live Workbench pass yet.
+**Re-tested (2026-08-18) - large improvement, one issue remains open:**
+
+The retarget fix works: the front vehicle now visibly drives to and stops at
+the correct near-checkpoint stop line (gate 0, which sits right at the
+checkpoint's own projection onto the road - so "looks like it's driving to
+the checkpoint location" is the *correct*, expected result, not a bug),
+"Front vehicle reached the stop line - HELD, awaiting release." now fires,
+and the debug auto-release / promote / depart / despawn cycle completed
+correctly at least once, confirmed end-to-end in the log (release -> "Queue
+advanced" x3 -> departure path samples -> despawn -> new spawn backfilling
+the freed slot).
+
+Two things observed this round:
+
+1. **The HELD front vehicle nudges forward a few metres when the next
+   vehicle approaches from behind**, even though it has zero waypoints
+   (`ClearWaypoints` already ran) and reduced cruise speed. This happens
+   with no active drive order at all, so it isn't something our waypoint
+   logic is issuing - it looks like Reforger's own low-level AI vehicle
+   collision/obstacle avoidance reacting to a nearby dynamic obstacle,
+   independent of the scripted waypoint system. No API for suppressing this
+   was found. Not necessarily harmful (a car easing forward a couple of
+   metres when another queues up behind it is not unrealistic), but worth
+   watching in case it ever pushes a HELD/QUEUED vehicle far enough to
+   destabilise a later arrival check.
+
+2. **After the first release/promotion cycle, most subsequent front
+   vehicles failed to ever reach HELD** - they sat until
+   `m_fMaxVehicleLifetime` (300s) force-despawned them, and the queue only
+   ever advanced via those forced despawns, not real releases. One promoted
+   vehicle *did* eventually reach HELD near the end of the log, so
+   `ResumeTowardFront()`'s retarget-to-own-gate isn't fundamentally broken -
+   it stalls, most likely on single-lane pathing contention with the
+   vehicle(s) still parked ahead of it on the same narrow road (the AI
+   struggling to route past/behind a stationary vehicle directly in its
+   lane, rather than smoothly queuing behind it). This is the same family of
+   problem as the section 11 bug, just surfacing differently now that
+   destinations are distinct instead of shared.
+
+   Since this is very plausibly an engine-level AI pathing limitation rather
+   than a logic bug in this file, and there wasn't enough log evidence to
+   confirm the mechanism, no behavioural fix was attempted blind. Instead:
+   `ArrivalTick()`'s QUEUED/AT_FRONT arrival handling was made idempotent
+   (guarded by `HasWaypoints()`, same idiom as the "lane full" branch in
+   `EnterQueue()`) so a holding non-front vehicle no longer re-logs "reached
+   queue slot N - holding" and re-clears an already-empty waypoint list every
+   poll forever - a real (if minor) bug, now fixed. And a new throttled
+   diagnostic, `LogQueueProgress()`, samples every ~10s per vehicle while it
+   is still short of its gate: distance remaining, AI path node count, and
+   `HasCompletedRequest()`. This is the same instrumentation pattern as
+   `DumpDeparturePath()` for departures, aimed at the QUEUED/AT_FRONT side
+   instead. Next test's console log should show, for a stalled vehicle,
+   whether it's making slow real progress (distance shrinking, 0 path
+   nodes), stuck re-routing (path node count churns without distance
+   shrinking), or never got a real order at all
+   (`requestCompleted` stuck at `1`) - which determines what the actual fix
+   needs to be.
+
+**Not yet re-tested** - the section 11 fix (retarget-to-own-gate) has had
+one live pass with the results above; the log-spam fix and the new stall
+diagnostic added in this entry have not been tested yet.
 
 **Rejected explicitly - do not revisit:** direct transform heading-snap
 ("100% immersion breaking") and per-slot authored headings (mission-maker

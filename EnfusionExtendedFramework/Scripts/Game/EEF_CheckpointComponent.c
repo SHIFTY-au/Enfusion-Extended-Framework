@@ -87,6 +87,7 @@ class EEF_CheckpointVehicleState
 	int m_iStableSeatPolls;							//! Consecutive polls with a full, stable, fully-seated roster
 	int m_iQueueSlot;								//! Queue position: 0 = front, -1 = not in the queue (Stage 2 #18)
 	bool m_bReleasePending;							//! True once a release has been scheduled/requested for this vehicle, so it fires once (Stage 2 #18)
+	float m_fLastStallLogTime;						//! World time (s) LogQueueProgress last fired for this vehicle - throttles the stall diagnostic (#23)
 
 	void EEF_CheckpointVehicleState(IEntity vehicle, SCR_AIGroup group, float spawnTime, bool hasContraband)
 	{
@@ -101,6 +102,7 @@ class EEF_CheckpointVehicleState
 		m_iStableSeatPolls = 0;
 		m_iQueueSlot = -1;
 		m_bReleasePending = false;
+		m_fLastStallLogTime = spawnTime;
 	}
 }
 
@@ -150,6 +152,8 @@ class EEF_CheckpointComponent : ScriptComponent
 	protected const int CHECKPOINT_SEAT_POLL_MS = 150;
 	protected const int CHECKPOINT_STABLE_POLLS_REQUIRED = 10;	//! ~1.5s of a complete, seated, unchanged roster before dispatch
 	protected const int CHECKPOINT_MOPUP_STABLE_POLLS = 20;		//! ~3s settled after dispatch before we stop mopping up late members
+
+	protected const float CHECKPOINT_STALL_LOG_INTERVAL = 10.0;	//! Throttle for the queue-progress stall diagnostic below
 
 	// --------------------------------------------------------
 	// Route markers (referenced by entity name in the World Editor)
@@ -760,20 +764,44 @@ class EEF_CheckpointComponent : ScriptComponent
 					// perpendicular line crossing on a route aimed elsewhere) means it can't be
 					// satisfied early by a generous radius or missed because the AI stopped short.
 					EEF_CheckpointQueueGate gate = GetQueueGate(state.m_iQueueSlot);
-					if (gate && HasArrivedWithin(vehiclePos, gate.m_Point, m_fQueueGateCompletionRadius))
-					{
-						ClearWaypoints(state.m_OccupantGroup);
+					if (!gate)
+						break;
 
-						if (state.m_iQueueSlot == 0)
+					if (HasArrivedWithin(vehiclePos, gate.m_Point, m_fQueueGateCompletionRadius))
+					{
+						// HasWaypoints guards this so it only fires once per arrival: a non-front slot
+						// stays QUEUED (no state change) while it holds, so without this guard the check
+						// above would keep being true and this block would re-fire every poll for as
+						// long as the vehicle sits there. Mirrors the same idiom already used in
+						// EnterQueue's "lane full" branch. A fresh retarget (ResumeTowardFront) always
+						// hands it a new waypoint, so HasWaypoints goes true again the moment it matters.
+						if (HasWaypoints(state.m_OccupantGroup))
 						{
-							SetState(state, EEF_ECheckpointVehicleState.HELD);
-							DebugLog("Front vehicle reached the stop line - HELD, awaiting release.");
-							BeginHold(state);
+							ClearWaypoints(state.m_OccupantGroup);
+
+							if (state.m_iQueueSlot == 0)
+							{
+								SetState(state, EEF_ECheckpointVehicleState.HELD);
+								DebugLog("Front vehicle reached the stop line - HELD, awaiting release.");
+								BeginHold(state);
+							}
+							else
+							{
+								DebugLog(string.Format("Vehicle reached queue slot %1 - holding.", state.m_iQueueSlot));
+							}
 						}
-						else
-						{
-							DebugLog(string.Format("Vehicle reached queue slot %1 - holding.", state.m_iQueueSlot));
-						}
+					}
+					else if (m_bDebugLog && now - state.m_fLastStallLogTime >= CHECKPOINT_STALL_LOG_INTERVAL)
+					{
+						// Diagnostic (#23, second live-test round): a promoted vehicle has been seen to
+						// take a very long time - occasionally exceeding m_fMaxVehicleLifetime entirely -
+						// to reach a gate it was already retargeted to, most likely single-lane pathing
+						// contention with the vehicle(s) still parked ahead of it. Sample every 10s while
+						// still short of the gate so a real stall (requestCompleted stuck at 1, or many
+						// path nodes that never shrink) is visible in the console instead of just "it
+						// never arrived".
+						state.m_fLastStallLogTime = now;
+						LogQueueProgress(state, gate, vehiclePos);
 					}
 					break;
 				}
@@ -795,6 +823,33 @@ class EEF_CheckpointComponent : ScriptComponent
 				// SPAWNING / DESPAWNED: handled elsewhere (seat poll / removal).
 			}
 		}
+	}
+
+	//! Debug only (#23, second live-test round): a queued/front vehicle hasn't yet reached its gate -
+	//! log how far short it still is plus its current AI path/request state, throttled by the caller
+	//! to CHECKPOINT_STALL_LOG_INTERVAL per vehicle. Distinguishes "still driving, just far away" (0
+	//! path nodes, requestCompleted=0, distance shrinking across samples) from a genuine stall
+	//! (requestCompleted=1 with no new order ever taking, or a path that keeps re-routing without the
+	//! distance closing - most likely single-lane contention with the vehicle ahead of it).
+	protected void LogQueueProgress(EEF_CheckpointVehicleState state, EEF_CheckpointQueueGate gate, vector vehiclePos)
+	{
+		float dx = vehiclePos[0] - gate.m_Point[0];
+		float dz = vehiclePos[2] - gate.m_Point[2];
+		float dist = Math.Sqrt(dx * dx + dz * dz);
+
+		AICarMovementComponent movement = AICarMovementComponent.Cast(
+			state.m_Vehicle.FindComponent(AICarMovementComponent)
+		);
+		if (!movement)
+		{
+			DebugLog(string.Format("Slot %1 still %2m from its gate - no AICarMovementComponent to sample path.", state.m_iQueueSlot, dist));
+			return;
+		}
+
+		array<vector> pts = {};
+		movement.GetCurrentPath(pts);
+		bool done = movement.HasCompletedRequest(false);
+		DebugLog(string.Format("Slot %1 still %2m from its gate - %3 path node(s), requestCompleted=%4.", state.m_iQueueSlot, dist, pts.Count(), done));
 	}
 
 	//------------------------------------------------------------------------------------------------
