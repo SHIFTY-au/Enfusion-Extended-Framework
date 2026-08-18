@@ -1079,7 +1079,14 @@ class EEF_CheckpointComponent : ScriptComponent
 		m_bQueueGatesComputed = true;
 		m_aQueueGates.Clear();
 
-		RoadNetworkManager roadMgr = null; // TODO(#23): confirm real accessor in Workbench, see above.
+		SCR_AIWorld aiWorld = SCR_AIWorld.Cast(GetGame().GetAIWorld());
+		if (!aiWorld)
+		{
+			DebugLog("AI world unavailable - cannot compute queue gates.");
+			return;
+		}
+
+		RoadNetworkManager roadMgr = aiWorld.GetRoadNetworkManager();
 		if (!roadMgr)
 		{
 			DebugLog("Road network manager unavailable - cannot compute queue gates.");

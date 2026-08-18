@@ -320,12 +320,26 @@ from live feedback:
   `AssignMoveWaypoint` toward the checkpoint origin) instead of retargeting
   to a marker - the vehicle resumes and the next, closer gate catches it.
 
-**Still the one blocking unknown:** obtaining a live `RoadNetworkManager`
-instance. `ComputeQueueGates()` hardcodes `roadMgr = null` with a
-`TODO(#23)` at that exact line - same isolation pattern as §8, now the only
-remaining unknown instead of one of four. Everything downstream (gate math,
-crossing detection, resume-on-promotion) is fully wired and doesn't depend
-on anything else unconfirmed.
+**Resolved: the `RoadNetworkManager` instance accessor.** `GetGame().GetAIWorld()`
+is typed to return the base `AIWorld` class, so Workbench autocomplete on
+that chain (and on `GetGame().`/`GetGame().GetWorld().`) never showed
+anything road-related - three separate autocomplete checks came up empty
+because `GetRoadNetworkManager()` is declared on the `SCR_AIWorld` subclass,
+invisible to autocomplete until cast down to that type. Found by searching
+all shipped scripts (not just this project) for the literal string
+`RoadNetworkManager`, which turned up the base game's own
+`SCR_resupplyTaskSolver.c` using exactly this pattern:
+
+```
+SCR_AIWorld aiWorld = SCR_AIWorld.Cast(GetGame().GetAIWorld());
+RoadNetworkManager roadNetworkManager = aiWorld.GetRoadNetworkManager();
+```
+
+`ComputeQueueGates()` now uses the same two-step cast-then-call instead of
+the hardcoded `null` placeholder. This was the last unconfirmed piece -
+everything downstream (gate math, crossing detection, resume-on-promotion)
+was already fully wired. The whole feature is implemented and ready for a
+live Workbench test.
 
 **Minor unflagged assumption:** uses `Math.Sqrt()` (not previously used
 elsewhere in this file, though `Math.RandomFloat`/`Math.RandomInt` already
