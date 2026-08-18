@@ -43,9 +43,12 @@
 //   APPROACHING  - driver seated, driving toward the checkpoint zone
 //                  (has not yet entered the trigger sphere).
 //   QUEUED       - inside the zone, assigned a queue slot behind other
-//                  vehicles, driving to / waiting at that slot marker.
+//                  vehicles, driving toward the front on one continuous
+//                  route until halted at its assigned gate (#23 redesign -
+//                  never retasked to a separate stop marker).
 //   AT_FRONT     - promoted to the front slot (slot 0), driving up to
-//                  the front stop position.
+//                  the front stop position (same continuous-route/gate
+//                  mechanism as QUEUED, just slot 0's gate).
 //   HELD         - stopped at the front, waiting for a release decision
 //                  (Stage 2: the debug auto-release timer; Stage 3: the
 //                  player's permit/deny).
@@ -84,6 +87,7 @@ class EEF_CheckpointVehicleState
 	int m_iStableSeatPolls;							//! Consecutive polls with a full, stable, fully-seated roster
 	int m_iQueueSlot;								//! Queue position: 0 = front, -1 = not in the queue (Stage 2 #18)
 	bool m_bReleasePending;							//! True once a release has been scheduled/requested for this vehicle, so it fires once (Stage 2 #18)
+	vector m_LastPolledPos;							//! Vehicle position at the previous ArrivalTick poll - gate-crossing detection needs the pair (#23 redesign)
 
 	void EEF_CheckpointVehicleState(IEntity vehicle, SCR_AIGroup group, float spawnTime, bool hasContraband)
 	{
@@ -98,6 +102,7 @@ class EEF_CheckpointVehicleState
 		m_iStableSeatPolls = 0;
 		m_iQueueSlot = -1;
 		m_bReleasePending = false;
+		m_LastPolledPos = vehicle.GetOrigin();
 	}
 }
 
@@ -115,19 +120,18 @@ class EEF_CheckpointPrefabEntry
 }
 
 // ============================================================
-// A single ordered queue-slot marker (Stage 2 #18). One entry per
-// physical stopping position in the queue lane. ORDER MATTERS: the
-// first entry is the front of the queue (the stop line closest to
-// the checkpoint), the last entry is the back. Place at least as
-// many markers as "Max concurrent vehicles" so the queue never
-// overflows. A plain marker/waypoint entity works - only its origin
-// is used.
+// A single calculated queue gate (#23 redesign - see CHECKPOINT_AI_NOTES.md
+// section 9). Replaces the old hand-authored marker list: computed by
+// ComputeQueueGates() by walking the road network back from the checkpoint.
+// Index 0 is the front (checkpoint stop line); higher indices step back
+// toward the spawn point. m_Forward is the road's local direction of travel
+// at m_Point (spawn side -> checkpoint) - both the vehicle's expected
+// heading there and the gate-crossing test's normal.
 // ============================================================
-[BaseContainerProps()]
-class EEF_CheckpointQueueSlotEntry
+class EEF_CheckpointQueueGate
 {
-	[Attribute("", UIWidgets.EditBox, "Name of a queue slot marker entity. First entry = front (checkpoint stop line), last = back of the queue.")]
-	string m_sMarkerName;
+	vector m_Point;
+	vector m_Forward;
 }
 
 //------------------------------------------------------------------------------------------------
@@ -146,11 +150,6 @@ class EEF_CheckpointComponent : ScriptComponent
 	protected const int CHECKPOINT_STABLE_POLLS_REQUIRED = 10;	//! ~1.5s of a complete, seated, unchanged roster before dispatch
 	protected const int CHECKPOINT_MOPUP_STABLE_POLLS = 20;		//! ~3s settled after dispatch before we stop mopping up late members
 
-	// Extra metres beyond the tight queue-slot completion radius within which the front vehicle is
-	// treated as "arrived and stopped" at its slot. Small so HELD only fires once it has actually
-	// pulled up, not while still rolling in.
-	protected const float CHECKPOINT_SLOT_ARRIVAL_SLACK = 3.0;
-
 	// --------------------------------------------------------
 	// Route markers (referenced by entity name in the World Editor)
 	// --------------------------------------------------------
@@ -162,28 +161,19 @@ class EEF_CheckpointComponent : ScriptComponent
 	protected string m_sDespawnPointName;
 
 	// --------------------------------------------------------
-	// Queue lane (Stage 2 #18) - ordered stopping positions between
-	// the approach and the checkpoint. First entry = front.
+	// Queue gates (#23 redesign) - queue stop points are CALCULATED, not authored, so a mission
+	// maker never places or orients a single queue marker. Starting at the checkpoint and walking
+	// back along the road network, ComputeQueueGates() drops a gate every m_fQueueSlotSpacing metres,
+	// each with its own heading taken from the road at that exact point (correct through a curve). A
+	// queued vehicle is never retasked to an off-road marker - it drives one continuous route toward
+	// the front and is simply halted the instant it crosses its assigned gate, so its heading is
+	// always whatever the road already gave it. See CHECKPOINT_AI_NOTES.md section 9 for why (heading,
+	// not position, was the actual defect - a direct heading-snap was tried and rejected as immersion
+	// breaking, so this earns a correct heading structurally instead).
 	// --------------------------------------------------------
 
-	[Attribute("", UIWidgets.Object, "Ordered queue slot markers. First entry = front of the queue (checkpoint stop line), last = back. Place at least 'Max concurrent vehicles' markers so the lane never overflows.")]
-	protected ref array<ref EEF_CheckpointQueueSlotEntry> m_aQueueSlotMarkers;
-
-	// --------------------------------------------------------
-	// Road-network correction (#23 workaround) - every drive-to-point order issued below (approach,
-	// queue slot, departure) is snapped onto the actual road corridor before being handed to the AI.
-	// Root cause theory: a hand-authored point that doesn't sit cleanly on the navigable corridor at
-	// a curve forces the driver to replan from a pose no forward arc can reach, so it reverses to
-	// reorient (the 3-point-turn jank). A moving vehicle never hits this because it is already
-	// tracking a valid corridor - only a fresh/re-tasked order does. Toggle off to A/B against the
-	// pre-#23 raw-marker behaviour.
-	// --------------------------------------------------------
-
-	[Attribute("1", UIWidgets.CheckBox, "Snap every drive-to-point target (approach, queue slot, departure) onto the road network before issuing it, instead of using the raw marker/point position. Workaround for #23 (AI driver jank on curves). Disable to compare against the raw-marker behaviour.")]
-	protected bool m_bSnapToRoadNetwork;
-
-	[Attribute("15.0", UIWidgets.EditBox, "Search range (metres) passed to the road-network reachability query when snapping a target point. Too small and a valid nearby road point may not be found; too large and it may snap to the wrong stretch of road.")]
-	protected float m_fRoadSnapRange;
+	[Attribute("12.0", UIWidgets.EditBox, "Distance in metres between queue gates, walking back from the checkpoint along the road. Should clear the longest vehicle in the pool plus a buffer (e.g. a ~7.5m truck + ~4m clearance).")]
+	protected float m_fQueueSlotSpacing;
 
 	// --------------------------------------------------------
 	// Prefab pools
@@ -243,9 +233,6 @@ class EEF_CheckpointComponent : ScriptComponent
 	[Attribute("15.0", UIWidgets.EditBox, "Completion radius in metres applied to drive waypoints. Keep this generous - a tight radius makes the AI overshoot then reverse to nail the exact point.")]
 	protected float m_fWaypointCompletionRadius;
 
-	[Attribute("2.0", UIWidgets.EditBox, "Completion radius in metres applied specifically to queue-slot drive waypoints. Keep this tight (1-2m) so queued vehicles line up neatly on their markers instead of stopping several metres short.")]
-	protected float m_fQueueSlotCompletionRadius;
-
 	[Attribute("1.0", UIWidgets.EditBox, "How often in seconds to poll vehicle positions for arrival at their current route point.")]
 	protected float m_fArrivalPollInterval;
 
@@ -278,10 +265,10 @@ class EEF_CheckpointComponent : ScriptComponent
 	protected IEntity m_SpawnPoint;
 	protected IEntity m_DespawnPoint;
 
-	//! Resolved, ordered queue-slot marker entities (index 0 = front). Lazily populated from
-	//! m_aQueueSlotMarkers by ResolveQueueSlots(). (Stage 2 #18)
-	protected ref array<IEntity> m_aQueueSlots = new array<IEntity>();
-	protected bool m_bQueueSlotsResolved = false;
+	//! Calculated, ordered queue gates (index 0 = front / checkpoint stop line). Lazily computed from
+	//! the road network by ComputeQueueGates(). (#23 redesign)
+	protected ref array<ref EEF_CheckpointQueueGate> m_aQueueGates = new array<ref EEF_CheckpointQueueGate>();
+	protected bool m_bQueueGatesComputed = false;
 
 	//! Cached checkpoint-zone radius (the trigger's sphere radius). A vehicle within this
 	//! distance of the checkpoint origin has entered the zone. (Stage 2 #18)
@@ -616,11 +603,12 @@ class EEF_CheckpointComponent : ScriptComponent
 
 		// Stage 2: drive toward the checkpoint ZONE, not straight to the exit. The vehicle keeps
 		// APPROACHING until ArrivalTick sees it cross into the trigger sphere, at which point it is
-		// assigned a queue slot and re-tasked to that slot marker. We aim the approach waypoint at
-		// the checkpoint origin (with the generous general completion radius so it flows in smoothly)
-		// - the zone-enter detection fires well before it would ever complete that waypoint.
-		vector approachTarget = ResolveDrivePoint(state.m_Vehicle.GetOrigin(), GetOwner().GetOrigin());
-		AssignMoveWaypoint(state.m_OccupantGroup, approachTarget, m_fWaypointCompletionRadius);
+		// assigned a queue slot (#23 redesign: no retargeting - it keeps driving this exact waypoint
+		// the whole way through the queue, and is simply halted when it crosses its assigned gate).
+		// We aim the approach waypoint at the checkpoint origin (with the generous general completion
+		// radius so it flows in smoothly) - the zone-enter detection fires well before it would ever
+		// complete that waypoint.
+		AssignMoveWaypoint(state.m_OccupantGroup, GetOwner().GetOrigin(), m_fWaypointCompletionRadius);
 
 		// Govern the approach speed so vehicles don't come in hot toward the queue.
 		ApplyCruiseSpeed(state, m_fApproachSpeedKmh);
@@ -756,14 +744,28 @@ class EEF_CheckpointComponent : ScriptComponent
 					break;
 				}
 
+				case EEF_ECheckpointVehicleState.QUEUED:
 				case EEF_ECheckpointVehicleState.AT_FRONT:
 				{
-					// Once it has driven up to the front stop line, hold it for the release decision.
-					if (state.m_iQueueSlot == 0 && HasArrivedAtSlot(vehiclePos, 0))
+					// #23 redesign: the vehicle drives one continuous route toward the front (never
+					// retasked to an off-road marker) - halt it exactly where it is the instant it
+					// crosses its currently assigned gate, so its heading stays whatever the smooth
+					// route already gave it. Self-limiting: once stopped, both sides of the crossing
+					// test read "past the gate" on every later poll, so this never re-fires.
+					if (HasCrossedAssignedGate(state, vehiclePos))
 					{
-						SetState(state, EEF_ECheckpointVehicleState.HELD);
-						DebugLog("Front vehicle arrived at the stop line - HELD, awaiting release.");
-						BeginHold(state);
+						ClearWaypoints(state.m_OccupantGroup);
+
+						if (state.m_iQueueSlot == 0)
+						{
+							SetState(state, EEF_ECheckpointVehicleState.HELD);
+							DebugLog("Front vehicle reached the stop line - HELD, awaiting release.");
+							BeginHold(state);
+						}
+						else
+						{
+							DebugLog(string.Format("Vehicle reached queue slot %1 - holding.", state.m_iQueueSlot));
+						}
 					}
 					break;
 				}
@@ -781,9 +783,11 @@ class EEF_CheckpointComponent : ScriptComponent
 					break;
 				}
 
-				// QUEUED / HELD: parked at a slot, waiting to be promoted or released - nothing to poll.
+				// HELD: parked at the front, waiting to be released - nothing to poll.
 				// SPAWNING / DESPAWNED: handled elsewhere (seat poll / removal).
 			}
+
+			state.m_LastPolledPos = vehiclePos;
 		}
 	}
 
@@ -792,13 +796,16 @@ class EEF_CheckpointComponent : ScriptComponent
 	//
 	// This component's own m_aVehicles array is the source of truth for queue order - there is no
 	// native "trigger contains N vehicles, ordered" query. Each queued vehicle carries m_iQueueSlot
-	// (0 = front). When the front vehicle departs we PromoteQueue(): every remaining vehicle's slot
-	// decrements and it is re-tasked to drive up to its new marker, so the whole line advances.
+	// (0 = front), mapped to a calculated EEF_CheckpointQueueGate via GetQueueGate() (#23 redesign -
+	// see CHECKPOINT_AI_NOTES.md section 9). When the front vehicle departs we PromoteQueue(): every
+	// remaining vehicle's slot decrements and it resumes toward its new (closer) gate, so the whole
+	// line advances.
 	//------------------------------------------------------------------------------------------------
 
-	//! Transition an APPROACHING vehicle into the queue: claim the lowest free slot, drive it to that
-	//! slot's marker, and set QUEUED (or AT_FRONT if it took slot 0). If the lane is full it stays
-	//! APPROACHING and retries on the next tick (a slot frees when the front vehicle departs).
+	//! Transition an APPROACHING vehicle into the queue: claim the lowest free slot and set QUEUED
+	//! (or AT_FRONT if it took slot 0). No retargeting - it keeps driving its existing route toward
+	//! the front; ArrivalTick's gate-crossing check halts it at the right spot. If the lane is full it
+	//! stays APPROACHING and retries on the next tick (a slot frees when the front vehicle departs).
 	protected void EnterQueue(EEF_CheckpointVehicleState state)
 	{
 		int slot = AssignQueueSlot();
@@ -809,20 +816,23 @@ class EEF_CheckpointComponent : ScriptComponent
 			// do this once (when it still has an approach waypoint) to avoid re-clearing every tick.
 			if (HasWaypoints(state.m_OccupantGroup))
 			{
-				DebugLog("Checkpoint zone entered but the queue is full - holding position (add more queue slot markers than max concurrent vehicles).");
+				DebugLog("Checkpoint zone entered but the queue is full - holding position (increase max concurrent vehicles or reduce queue slot spacing so more gates fit).");
 				ClearWaypoints(state.m_OccupantGroup);
 			}
 			return;
 		}
 
 		state.m_iQueueSlot = slot;
-		DriveToSlot(state, slot);
 
 		// Hard slow-down the instant it enters the zone so it eases up to its slot instead of
 		// braking hard behind the queue. Persists (SetCruiseSpeed is sticky) through any promotion
 		// until the vehicle is released.
 		ApplyCruiseSpeed(state, m_fZoneSpeedKmh);
 
+		// #23 redesign: no retargeting here. The vehicle is already driving toward the checkpoint on
+		// its original Dispatch() waypoint - ArrivalTick's gate-crossing check halts it the instant it
+		// reaches its assigned gate. Continuing the same route the whole way keeps its heading correct
+		// instead of retasking it toward a separate, potentially misaligned stop marker.
 		if (slot == 0)
 		{
 			SetState(state, EEF_ECheckpointVehicleState.AT_FRONT);
@@ -836,15 +846,15 @@ class EEF_CheckpointComponent : ScriptComponent
 	}
 
 	//! Lowest queue slot index not currently claimed by another vehicle, capped at the number of
-	//! authored markers. Returns -1 if the lane is full or no markers are configured.
+	//! computed gates. Returns -1 if the lane is full or no gates could be computed.
 	protected int AssignQueueSlot()
 	{
-		ResolveQueueSlots();
+		ComputeQueueGates();
 
-		int capacity = m_aQueueSlots.Count();
+		int capacity = m_aQueueGates.Count();
 		if (capacity == 0)
 		{
-			DebugLog("No queue slot markers configured - cannot queue. Add queue slot markers in the component attributes.");
+			DebugLog("No queue gates available - cannot queue. Check the road network near the checkpoint (see CHECKPOINT_AI_NOTES.md section 9).");
 			return -1;
 		}
 
@@ -870,8 +880,8 @@ class EEF_CheckpointComponent : ScriptComponent
 
 	//! Re-pack the queue after a vehicle leaves it (released or force-despawned): collect every
 	//! vehicle still waiting in the lane, order them by their current slot, and reassign compact
-	//! slots 0..n-1 - re-tasking each to drive to its new (closer or unchanged) marker. Whoever ends
-	//! up in slot 0 becomes AT_FRONT and heads for the stop line. Re-packing (rather than a blind
+	//! slots 0..n-1 - resuming each toward its new (closer or unchanged) gate. Whoever ends up in
+	//! slot 0 becomes AT_FRONT and heads for the stop line. Re-packing (rather than a blind
 	//! decrement) closes any gap left by a middle vehicle despawning, so the line never stalls.
 	protected void PromoteQueue()
 	{
@@ -883,7 +893,7 @@ class EEF_CheckpointComponent : ScriptComponent
 				continue;
 
 			// A vehicle already DEPARTING keeps its (stale) slot until despawn but is no longer in the
-			// lane - never re-task it back to a marker.
+			// lane - never resume it back toward a gate.
 			if (state.m_eState != EEF_ECheckpointVehicleState.QUEUED
 				&& state.m_eState != EEF_ECheckpointVehicleState.AT_FRONT
 				&& state.m_eState != EEF_ECheckpointVehicleState.HELD)
@@ -908,13 +918,13 @@ class EEF_CheckpointComponent : ScriptComponent
 				if (alreadyFront && !slotChanged)
 					continue;
 
-				DriveToSlot(state, newSlot);
+				ResumeTowardFront(state);
 				SetState(state, EEF_ECheckpointVehicleState.AT_FRONT);
 				DebugLog("Queue advanced - next vehicle promoted to the front.");
 			}
 			else if (slotChanged)
 			{
-				DriveToSlot(state, newSlot);
+				ResumeTowardFront(state);
 				SetState(state, EEF_ECheckpointVehicleState.QUEUED);
 				DebugLog(string.Format("Queue advanced - vehicle moved up to slot %1.", newSlot));
 			}
@@ -935,20 +945,14 @@ class EEF_CheckpointComponent : ScriptComponent
 		list.Insert(state);
 	}
 
-	//! Re-task a vehicle's group to drive to the given slot marker, using the tight queue-slot
-	//! completion radius so it stops neatly on the mark. Uses RetargetWaypoint (moves the existing
-	//! waypoint) rather than clear-and-re-add, so a vehicle rolling in from the approach - or moving
-	//! up as the queue advances - never loses its target and brakes to a halt in the process.
-	protected void DriveToSlot(EEF_CheckpointVehicleState state, int slot)
+	//! Get a halted queued vehicle moving again after a promotion (#23 redesign). It was stopped in
+	//! place (ClearWaypoints) when it crossed its previous gate, with no waypoint left to retarget -
+	//! reissuing the same "drive toward the checkpoint" order resumes it without ever tasking it
+	//! toward an off-road point. ArrivalTick's gate-crossing check picks up its (now closer) assigned
+	//! gate on the next poll and halts it there in turn.
+	protected void ResumeTowardFront(EEF_CheckpointVehicleState state)
 	{
-		vector slotPos;
-		if (!GetSlotPosition(slot, slotPos))
-			return;
-
-		if (state.m_Vehicle)
-			slotPos = ResolveDrivePoint(state.m_Vehicle.GetOrigin(), slotPos);
-
-		RetargetWaypoint(state.m_OccupantGroup, slotPos, m_fQueueSlotCompletionRadius);
+		AssignMoveWaypoint(state.m_OccupantGroup, GetOwner().GetOrigin(), m_fWaypointCompletionRadius);
 	}
 
 	//------------------------------------------------------------------------------------------------
@@ -1010,8 +1014,7 @@ class EEF_CheckpointComponent : ScriptComponent
 		// it away from the checkpoint.
 		ApplyCruiseSpeed(state, m_fApproachSpeedKmh);
 
-		vector exitTarget = ResolveDrivePoint(state.m_Vehicle.GetOrigin(), m_DespawnPoint.GetOrigin());
-		AssignMoveWaypoint(state.m_OccupantGroup, exitTarget, m_fWaypointCompletionRadius);
+		AssignMoveWaypoint(state.m_OccupantGroup, m_DespawnPoint.GetOrigin(), m_fWaypointCompletionRadius);
 		DebugLog("Vehicle released - departing toward the exit.");
 
 		// Diagnostic: confirm the fresh order actually took (requestCompleted should now read 0 while
@@ -1057,60 +1060,220 @@ class EEF_CheckpointComponent : ScriptComponent
 	// ZONE / SLOT HELPERS (Stage 2 #18)
 	//------------------------------------------------------------------------------------------------
 
-	//! Resolve the ordered queue-slot marker names into entities exactly once. Missing markers are
-	//! skipped with a warning, so an author typo drops one slot rather than breaking the whole lane.
-	protected void ResolveQueueSlots()
+	//! Lazily compute the ordered queue gates from the road network exactly once (#23 redesign,
+	//! replaces the old hand-authored marker list - see CHECKPOINT_AI_NOTES.md section 9). Finds the
+	//! road nearest the checkpoint, then walks its point list back toward the spawn point, dropping a
+	//! gate every m_fQueueSlotSpacing metres with a heading taken from the road at that exact point.
+	//!
+	//! *** UNCONFIRMED - DO NOT TEST UNTIL THIS IS FIXED ***
+	//! The accessor to obtain a live RoadNetworkManager instance was never confirmed - BI's wiki and
+	//! forums are egress-blocked from the research sandbox that wrote this (see CHECKPOINT_AI_NOTES.md
+	//! section 5). Check Workbench autocomplete on GetGame().GetWorld() and on AIWorld for a method
+	//! that returns RoadNetworkManager, then replace the line below. Until fixed this always computes
+	//! zero gates and queueing cannot function (same failure mode "no markers configured" used to be).
+	protected void ComputeQueueGates()
 	{
-		if (m_bQueueSlotsResolved)
+		if (m_bQueueGatesComputed)
 			return;
 
-		m_bQueueSlotsResolved = true;
-		m_aQueueSlots.Clear();
+		m_bQueueGatesComputed = true;
+		m_aQueueGates.Clear();
 
-		if (!m_aQueueSlotMarkers)
-			return;
-
-		foreach (EEF_CheckpointQueueSlotEntry entry : m_aQueueSlotMarkers)
+		RoadNetworkManager roadMgr = null; // TODO(#23): confirm real accessor in Workbench, see above.
+		if (!roadMgr)
 		{
-			if (!entry || entry.m_sMarkerName.IsEmpty())
-				continue;
-
-			IEntity marker = GetGame().GetWorld().FindEntityByName(entry.m_sMarkerName);
-			if (!marker)
-			{
-				DebugLog(string.Format("Queue slot marker '%1' not found in world - skipping.", entry.m_sMarkerName));
-				continue;
-			}
-
-			m_aQueueSlots.Insert(marker);
+			DebugLog("Road network manager unavailable - cannot compute queue gates.");
+			return;
 		}
 
-		DebugLog(string.Format("Resolved %1 queue slot marker(s).", m_aQueueSlots.Count()));
+		vector checkpointPos = GetOwner().GetOrigin();
+
+		BaseRoad road = null;
+		float roadDist = 0;
+		roadMgr.GetClosestRoad(checkpointPos, road, roadDist);
+		if (!road)
+		{
+			DebugLog("No road found near the checkpoint - cannot compute queue gates.");
+			return;
+		}
+
+		array<vector> points = {};
+		road.GetPoints(points);
+		if (points.Count() < 2)
+		{
+			DebugLog("Road near the checkpoint has fewer than 2 points - cannot compute queue gates.");
+			return;
+		}
+
+		// Build a "back-directed" polyline: start at the checkpoint's projection onto the road, then
+		// walk the road's point list toward the spawn point, accumulating distance as we go. Slot 0's
+		// gate is that projected point itself (the front stop line); slot N's gate is
+		// N * m_fQueueSlotSpacing further back along this polyline.
+		int nearestIndex = FindNearestSegment(points, checkpointPos);
+		vector originOnRoad = ProjectOnSegment(checkpointPos, points[nearestIndex], points[nearestIndex + 1]);
+
+		array<vector> backPoints = {};
+		backPoints.Insert(originOnRoad);
+
+		vector segDir = points[nearestIndex + 1] - points[nearestIndex];
+		vector toSpawn = m_SpawnPoint.GetOrigin() - checkpointPos;
+
+		if (segDir[0] * toSpawn[0] + segDir[2] * toSpawn[2] >= 0)
+		{
+			// The segment already runs toward the spawn point - walk the list forward from here.
+			backPoints.Insert(points[nearestIndex + 1]);
+			for (int i = nearestIndex + 2; i < points.Count(); i++)
+				backPoints.Insert(points[i]);
+		}
+		else
+		{
+			// The segment runs toward the checkpoint - walk the list backward instead.
+			backPoints.Insert(points[nearestIndex]);
+			for (int i = nearestIndex - 1; i >= 0; i--)
+				backPoints.Insert(points[i]);
+		}
+
+		// Cumulative horizontal distance along backPoints, index-aligned: cumDist[i] is the distance
+		// from backPoints[0] to backPoints[i].
+		array<float> cumDist = {};
+		cumDist.Insert(0.0);
+		for (int i = 1; i < backPoints.Count(); i++)
+		{
+			float dx = backPoints[i][0] - backPoints[i - 1][0];
+			float dz = backPoints[i][2] - backPoints[i - 1][2];
+			cumDist.Insert(cumDist[i - 1] + Math.Sqrt(dx * dx + dz * dz));
+		}
+
+		float roadLength = cumDist[cumDist.Count() - 1];
+
+		for (int slot = 0; slot < m_iMaxConcurrent; slot++)
+		{
+			float targetDist = slot * m_fQueueSlotSpacing;
+			if (targetDist > roadLength)
+			{
+				DebugLog(string.Format("Road runs out %1m short for queue slot %2 - computed %3 of %4 requested gate(s). Extend the road, reduce spacing, or lower max concurrent.", targetDist - roadLength, slot, m_aQueueGates.Count(), m_iMaxConcurrent));
+				break;
+			}
+
+			// Find the backPoints segment containing targetDist and interpolate within it.
+			int segIndex = 0;
+			for (int i = 1; i < cumDist.Count(); i++)
+			{
+				if (cumDist[i] >= targetDist)
+				{
+					segIndex = i - 1;
+					break;
+				}
+			}
+
+			vector segStart = backPoints[segIndex];
+			vector segEnd = backPoints[segIndex + 1];
+			float segLen = cumDist[segIndex + 1] - cumDist[segIndex];
+
+			float t = 0;
+			if (segLen > 0.001)
+				t = (targetDist - cumDist[segIndex]) / segLen;
+
+			vector forward = segEnd - segStart;
+			forward[1] = 0;
+			float forwardLen = Math.Sqrt(forward[0] * forward[0] + forward[2] * forward[2]);
+			if (forwardLen > 0.001)
+			{
+				forward[0] = forward[0] / forwardLen;
+				forward[2] = forward[2] / forwardLen;
+			}
+
+			EEF_CheckpointQueueGate gate = new EEF_CheckpointQueueGate();
+			gate.m_Point = segStart + (segEnd - segStart) * t;
+			// backPoints runs from the checkpoint toward the spawn point ("back"); the vehicle drives
+			// the opposite way, so its expected heading at the gate is the reverse of that direction.
+			gate.m_Forward = forward * -1;
+			m_aQueueGates.Insert(gate);
+		}
+
+		DebugLog(string.Format("Computed %1 of %2 requested queue gate(s), spacing %3m.", m_aQueueGates.Count(), m_iMaxConcurrent, m_fQueueSlotSpacing));
 	}
 
-	//! World position of a queue slot marker by index. Returns false if the index is out of range.
-	protected bool GetSlotPosition(int slot, out vector outPos)
+	//! The gate for a queue slot index, or null if out of range. Triggers ComputeQueueGates() on
+	//! first use.
+	protected EEF_CheckpointQueueGate GetQueueGate(int slot)
 	{
-		ResolveQueueSlots();
+		ComputeQueueGates();
 
-		if (slot < 0 || slot >= m_aQueueSlots.Count() || !m_aQueueSlots[slot])
-			return false;
+		if (slot < 0 || slot >= m_aQueueGates.Count())
+			return null;
 
-		outPos = m_aQueueSlots[slot].GetOrigin();
-		return true;
+		return m_aQueueGates[slot];
 	}
 
-	//! True if the vehicle has reached its slot marker (stopped on the mark). Detection spans the
-	//! tight completion radius plus a small fixed slack - NOT the loose general arrival radius, which
-	//! would flag "at front" while the vehicle is still several metres out and rolling in.
-	protected bool HasArrivedAtSlot(vector vehiclePos, int slot)
+	//! Index of the points[] segment (points[i]..points[i+1]) whose nearest point on the segment is
+	//! closest to pos, horizontal-only. points must have at least 2 entries.
+	protected int FindNearestSegment(array<vector> points, vector pos)
 	{
-		vector slotPos;
-		if (!GetSlotPosition(slot, slotPos))
+		int best = 0;
+		float bestDistSq = -1;
+
+		for (int i = 0; i < points.Count() - 1; i++)
+		{
+			vector proj = ProjectOnSegment(pos, points[i], points[i + 1]);
+			float dx = pos[0] - proj[0];
+			float dz = pos[2] - proj[2];
+			float distSq = dx * dx + dz * dz;
+
+			if (bestDistSq < 0 || distSq < bestDistSq)
+			{
+				bestDistSq = distSq;
+				best = i;
+			}
+		}
+
+		return best;
+	}
+
+	//! Horizontal-only projection of pos onto the segment a->b, clamped to the segment.
+	protected vector ProjectOnSegment(vector pos, vector a, vector b)
+	{
+		float abx = b[0] - a[0];
+		float abz = b[2] - a[2];
+		float lenSq = abx * abx + abz * abz;
+		if (lenSq < 0.001)
+			return a;
+
+		float t = ((pos[0] - a[0]) * abx + (pos[2] - a[2]) * abz) / lenSq;
+		if (t < 0)
+			t = 0;
+		else if (t > 1)
+			t = 1;
+
+		vector result;
+		result[0] = a[0] + abx * t;
+		result[1] = a[1] + (b[1] - a[1]) * t;
+		result[2] = a[2] + abz * t;
+		return result;
+	}
+
+	//! True exactly once, the poll tick a queued vehicle's position crosses from the approach side of
+	//! its assigned gate to the far side (#23 redesign). Horizontal-only, matching HasArrivedWithin.
+	//! Self-limiting: once the vehicle has stopped past the gate, both sides of the comparison read
+	//! "at or past it" on every later poll, so this only ever fires on the actual crossing.
+	protected bool HasCrossedAssignedGate(EEF_CheckpointVehicleState state, vector currPos)
+	{
+		EEF_CheckpointQueueGate gate = GetQueueGate(state.m_iQueueSlot);
+		if (!gate)
 			return false;
 
-		float radius = m_fQueueSlotCompletionRadius + CHECKPOINT_SLOT_ARRIVAL_SLACK;
-		return HasArrivedWithin(vehiclePos, slotPos, radius);
+		float dPrev = SignedDistanceAlongGate(state.m_LastPolledPos, gate);
+		float dCurr = SignedDistanceAlongGate(currPos, gate);
+		return dPrev < 0 && dCurr >= 0;
+	}
+
+	//! Horizontal-only signed distance of pos along gate.m_Forward from gate.m_Point. Negative = still
+	//! approaching the gate, >= 0 = at or past it.
+	protected float SignedDistanceAlongGate(vector pos, EEF_CheckpointQueueGate gate)
+	{
+		float dx = pos[0] - gate.m_Point[0];
+		float dz = pos[2] - gate.m_Point[2];
+		return dx * gate.m_Forward[0] + dz * gate.m_Forward[2];
 	}
 
 	//! True if the vehicle position is inside the checkpoint zone (trigger sphere).
@@ -1191,37 +1354,6 @@ class EEF_CheckpointComponent : ScriptComponent
 	// WAYPOINTS
 	//------------------------------------------------------------------------------------------------
 
-	//! Attempt to snap targetPos onto the actual road-network corridor reachable from fromPos, before
-	//! it is ever handed to the AI as a drive order (#23 workaround - see the road-network-correction
-	//! block in the attributes above). Purely additive: falls back to the untouched raw point whenever
-	//! the manager or the query is unavailable, so this can never behave worse than the pre-#23 code.
-	//!
-	//! *** UNCONFIRMED - DO NOT TEST UNTIL THIS IS FIXED ***
-	//! The accessor to obtain a live RoadNetworkManager instance was never confirmed - BI's wiki and
-	//! forums are egress-blocked from the research sandbox that wrote this (see CHECKPOINT_AI_NOTES.md
-	//! §5-7). Check Workbench autocomplete on GetGame().GetWorld() and on AIWorld for a method that
-	//! returns RoadNetworkManager, then replace the line below. Until fixed, roadMgr is always null and
-	//! this whole feature is a documented no-op (m_bSnapToRoadNetwork has no effect).
-	protected vector ResolveDrivePoint(vector fromPos, vector targetPos)
-	{
-		if (!m_bSnapToRoadNetwork)
-			return targetPos;
-
-		RoadNetworkManager roadMgr = null; // TODO(#23): confirm real accessor in Workbench, see above.
-		if (!roadMgr)
-			return targetPos;
-
-		vector corrected;
-		if (roadMgr.GetReachableWaypointInRoad(fromPos, targetPos, m_fRoadSnapRange, corrected))
-		{
-			DebugLog(string.Format("Road-network snap: %1 -> %2", targetPos, corrected));
-			return corrected;
-		}
-
-		DebugLog(string.Format("Road-network snap found no reachable point near %1 (range %2m) - using raw target.", targetPos, m_fRoadSnapRange));
-		return targetPos;
-	}
-
 	//! Clear the group's current waypoints and give it a single move waypoint at targetPos.
 	//! A member in the driver seat makes the group drive the vehicle there. completionRadius < 0
 	//! falls back to the general m_fWaypointCompletionRadius.
@@ -1255,7 +1387,8 @@ class EEF_CheckpointComponent : ScriptComponent
 
 		// A generous completion radius stops the vehicle counting the waypoint as "reached" only
 		// at a pinpoint - which causes overshoot-and-reverse. It arrives smoothly instead. Queue
-		// slots pass a smaller radius so vehicles line up tightly at their markers.
+		// stops no longer rely on this at all (#23 redesign) - they're halted directly by
+		// ArrivalTick's gate-crossing check, independent of whatever radius this waypoint has.
 		if (completionRadius > 0)
 			waypoint.SetCompletionRadius(completionRadius);
 
@@ -1274,48 +1407,6 @@ class EEF_CheckpointComponent : ScriptComponent
 
 		waypoint.SetOrigin(targetPos);
 		group.AddWaypoint(waypoint);
-	}
-
-	//! Move the group's current move waypoint to targetPos instead of clearing and re-adding one.
-	//! Repositioning an active waypoint keeps the vehicle driving toward it without the momentary
-	//! brake-to-a-halt that removing all waypoints causes - so a vehicle entering the zone, or moving
-	//! up as the queue advances, flows straight into its new slot. Falls back to AssignMoveWaypoint if
-	//! the group has no waypoint to move (e.g. it already completed one and is sitting idle).
-	protected void RetargetWaypoint(SCR_AIGroup group, vector targetPos, float completionRadius = -1)
-	{
-		if (!group)
-			return;
-
-		array<AIWaypoint> queue = {};
-		group.GetWaypoints(queue);
-
-		// Reposition the first live waypoint and drop any extras so exactly one remains.
-		AIWaypoint keep = null;
-		foreach (AIWaypoint wp : queue)
-		{
-			if (!wp)
-				continue;
-
-			if (!keep)
-				keep = wp;
-			else
-				group.RemoveWaypoint(wp);
-		}
-
-		if (!keep)
-		{
-			// Nothing to move - assign a fresh waypoint (this path can briefly stop an idle vehicle,
-			// but an idle vehicle is already stopped, so there is no motion to preserve).
-			AssignMoveWaypoint(group, targetPos, completionRadius);
-			return;
-		}
-
-		if (completionRadius < 0)
-			completionRadius = m_fWaypointCompletionRadius;
-		if (completionRadius > 0)
-			keep.SetCompletionRadius(completionRadius);
-
-		keep.SetOrigin(targetPos);
 	}
 
 	//------------------------------------------------------------------------------------------------

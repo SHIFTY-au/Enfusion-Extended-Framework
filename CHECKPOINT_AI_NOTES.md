@@ -274,9 +274,64 @@ If nothing like that exists, the console dump already in place is the
 fallback.
 
 ### Status of §8's code
-`m_bSnapToRoadNetwork` / `ResolveDrivePoint()` in `EEF_CheckpointComponent.c`
-are superseded by this design, not extended by it - the whole
-retarget-to-a-corrected-point mechanism goes away under the
-continuous-route/gate-crossing model. Left in place (still an inert no-op)
-until the new design is actually implemented, rather than ripping it out
-pre-emptively before its replacement exists.
+Removed. `m_bSnapToRoadNetwork` / `ResolveDrivePoint()` and the whole
+marker-based queue system (`EEF_CheckpointQueueSlotEntry`, `m_aQueueSlotMarkers`,
+`DriveToSlot`, `ResolveQueueSlots`, `GetSlotPosition`, `HasArrivedAtSlot`,
+`RetargetWaypoint`, `m_fQueueSlotCompletionRadius`, `CHECKPOINT_SLOT_ARRIVAL_SLACK`)
+are gone, replaced by the design below - implemented 2026-08-18.
+
+## 10. Implemented: calculated gate-crossing queue (2026-08-18)
+
+Landed in `EEF_CheckpointComponent.c`. Two corrections to the section 9 plan
+from live feedback:
+- **Item 1 (road tangent) resolved, not blocked.** `BaseRoad` only exposes
+  `GetWidth()` and `GetPoints(out array<vector>)` - no dedicated tangent
+  query. Tangent is computed from consecutive points in that polyline
+  instead (`ComputeQueueGates()`'s segment-direction math), so this needed
+  no new engine capability.
+- **Item 4 (halt-in-place/resume) dropped as a requirement.** "Stop and
+  cancel order" was confirmed acceptable, so gate-stop reuses the existing
+  `ClearWaypoints()`/`AssignMoveWaypoint()` primitives instead of needing any
+  new pause/dwell/freeze API. This works specifically *because* the vehicle
+  was already driving a continuous, on-road route when it stopped - its
+  heading is correct by construction, so resuming with a fresh order toward
+  the next gate is a trivial straight-ahead correction, not a re-plan from a
+  bad pose (the case that was actually broken).
+- Item 3 (walking distance along the road) needed no separate Workbench
+  answer either - it's the same `GetPoints()` polyline, walked and
+  accumulated in script. The requested spacing input (longest vehicle +
+  buffer) became the `m_fQueueSlotSpacing` attribute default (12m, per a
+  ~7.5m truck + ~4m clearance).
+
+**What's live:**
+- `ComputeQueueGates()` - lazily computes `m_iMaxConcurrent` gates by
+  finding the road nearest the checkpoint (`RoadNetworkManager.GetClosestRoad`),
+  projecting the checkpoint onto it, and walking the point list back toward
+  the spawn point, accumulating distance to place a gate every
+  `m_fQueueSlotSpacing` metres with a heading from the local segment
+  direction.
+- `EnterQueue()` no longer retargets anything - a vehicle keeps driving the
+  same waypoint it was dispatched with the whole time it's in the lane.
+- `ArrivalTick()` halts a QUEUED/AT_FRONT vehicle (`ClearWaypoints`) the
+  instant `HasCrossedAssignedGate()` detects it has passed its gate's
+  perpendicular line (a signed-distance sign flip between polls, horizontal
+  only) - self-limiting, fires exactly once per gate.
+- `PromoteQueue()` calls the new `ResumeTowardFront()` (reissues
+  `AssignMoveWaypoint` toward the checkpoint origin) instead of retargeting
+  to a marker - the vehicle resumes and the next, closer gate catches it.
+
+**Still the one blocking unknown:** obtaining a live `RoadNetworkManager`
+instance. `ComputeQueueGates()` hardcodes `roadMgr = null` with a
+`TODO(#23)` at that exact line - same isolation pattern as §8, now the only
+remaining unknown instead of one of four. Everything downstream (gate math,
+crossing detection, resume-on-promotion) is fully wired and doesn't depend
+on anything else unconfirmed.
+
+**Minor unflagged assumption:** uses `Math.Sqrt()` (not previously used
+elsewhere in this file, though `Math.RandomFloat`/`Math.RandomInt` already
+are). Standard enough on a Math class across Bohemia engines that this
+wasn't treated as a fourth blocker, unlike the `RoadNetworkManager` accessor.
+
+**Rejected explicitly - do not revisit:** direct transform heading-snap
+("100% immersion breaking") and per-slot authored headings (mission-maker
+authoring burden). See section 9.
