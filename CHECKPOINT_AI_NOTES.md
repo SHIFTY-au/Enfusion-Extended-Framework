@@ -472,9 +472,62 @@ Two things observed this round:
    (`requestCompleted` stuck at `1`) - which determines what the actual fix
    needs to be.
 
-**Not yet re-tested** - the section 11 fix (retarget-to-own-gate) has had
-one live pass with the results above; the log-spam fix and the new stall
-diagnostic added in this entry have not been tested yet.
+**Third live test (2026-08-18) - the stall diagnostic gave a conclusive
+answer.** `LogQueueProgress()` did exactly its job: every one of the four
+vehicles' distance-to-gate readings converged and then held rock-steady at a
+fixed, vehicle-specific, non-zero value - 4.30954m, 3.48013m, 3.49269m,
+4.28298m - with `requestCompleted=1` and `0 path node(s)` every single poll
+after that. These are not vehicles stuck mid-route or endlessly re-routing;
+they are parked, with the AI itself considering the drive request finished,
+sitting consistently 3.5m-4.3m short of the exact point `HasArrivedWithin`
+was checking against. The AI's real stopping precision for a car has a floor
+noticeably above the 3m `m_fQueueGateCompletionRadius` we were testing -
+`SetCompletionRadius(3.0)` does not make the vehicle stop within 3m, so our
+arrival check was structurally impossible to satisfy. That's the actual
+cause of the "never reaches HELD" stall from the second test - not pathing
+contention as guessed there.
+
+This also explains the "collision" the user flagged this round: a stopped
+vehicle drives forward a few metres, unprompted, when the next vehicle
+approaches - which the user was explicit is not acceptable for a queue of
+cars, in any form. One log line makes the mechanism visible: slot 2's
+distance-to-gate jumped from 3.49269m to 8.75089m between two 10s samples
+while still reading `0 path node(s), requestCompleted=1` (i.e. no new drive
+order was ever issued to it) - it moved ~5.3m on its own while the script
+had given it nothing to do. The only thing that can move a parked vehicle
+with no active waypoint is a physical shove from something else - almost
+certainly the vehicle behind it arriving too close, given the AI's ~4m
+stopping imprecision leaves less real clearance between vehicles than the
+12m nominal gate spacing implies. (The specific instance logged was a
+backward shove on a mid-queue vehicle rather than the forward creep on the
+HELD front vehicle the user described visually, but it is the same
+insufficient-clearance mechanism - contact between vehicles that shouldn't
+be able to reach each other.)
+
+**Fix (recalibrated from the measured numbers, not guessed):**
+- `m_fQueueSlotSpacing` default raised 12.0 -> 18.0m - real clearance
+  between vehicles has to absorb the ~4-5m stopping imprecision on *both*
+  the vehicle ahead and the vehicle behind, on top of vehicle length, or
+  they end up close enough to make contact exactly as observed.
+- `m_fQueueGateCompletionRadius` default raised 3.0 -> 6.0m - comfortably
+  above the observed 3.48m-4.31m genuine stopping range (with margin for
+  larger vehicles / other prefabs), while still well under half of the new
+  18m spacing, so gates can't overlap.
+- `m_fZoneSpeedKmh` default lowered 12.0 -> 8.0 km/h - more reaction
+  distance for a vehicle to brake cleanly behind the one ahead instead of
+  nudging/contacting it, as a second, independent lever on the same
+  clearance problem.
+
+None of this touches the retarget-to-own-gate mechanism itself (still
+correct per the second test) or the heading source (still the real road) -
+it only recalibrates two distance constants and one speed constant to match
+measured AI behaviour instead of assumed behaviour. `LogQueueProgress()` and
+the `HasWaypoints()` idempotency guard from this same entry's earlier fix
+both stay in place - the diagnostic in particular is what made this
+diagnosis possible and should keep running on every future test.
+
+**Not yet re-tested** - the spacing/radius/speed recalibration above has not
+had a live Workbench pass yet.
 
 **Rejected explicitly - do not revisit:** direct transform heading-snap
 ("100% immersion breaking") and per-slot authored headings (mission-maker

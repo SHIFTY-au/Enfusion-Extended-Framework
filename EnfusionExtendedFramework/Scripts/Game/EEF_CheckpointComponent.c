@@ -178,12 +178,19 @@ class EEF_CheckpointComponent : ScriptComponent
 	// around - see CHECKPOINT_AI_NOTES.md section 9 for why (heading, not position, was the actual
 	// defect - a direct heading-snap was tried and rejected as immersion breaking, so this earns a
 	// correct heading structurally instead) and section 11 for the shared-target bug this replaced.
+	//
+	// Both defaults below were recalibrated from measured data (section 11 second re-test, see notes):
+	// LogQueueProgress showed real AI cars settling 3.48m-4.31m short of a requested waypoint even
+	// with a 3m completion radius - the AI's own stopping precision for a car has a floor above what
+	// we were checking, so gates were never detected as reached, and the resulting slack in the queue
+	// left too little real clearance between vehicles (one vehicle was observed shoved ~5m backward
+	// while parked - a physical nudge/contact from the vehicle behind, not a scripted repositioning).
 	// --------------------------------------------------------
 
-	[Attribute("12.0", UIWidgets.EditBox, "Distance in metres between queue gates, walking back from the checkpoint along the road. Should clear the longest vehicle in the pool plus a buffer (e.g. a ~7.5m truck + ~4m clearance).")]
+	[Attribute("18.0", UIWidgets.EditBox, "Distance in metres between queue gates, walking back from the checkpoint along the road. Should clear the longest vehicle in the pool, the AI's own stopping imprecision (observed up to ~4-5m short of a waypoint), and a buffer (e.g. a ~7.5m truck + ~5m imprecision + ~5m clearance).")]
 	protected float m_fQueueSlotSpacing;
 
-	[Attribute("3.0", UIWidgets.EditBox, "Completion/arrival radius in metres used only for queue gate waypoints. Deliberately tight (unlike the generous m_fWaypointCompletionRadius below) so a vehicle actually reaches its own gate instead of satisfying the AI's arrival check somewhere between two gates. Keep it well under half of m_fQueueSlotSpacing.")]
+	[Attribute("6.0", UIWidgets.EditBox, "Completion/arrival radius in metres used only for queue gate waypoints. Deliberately tighter than the generous m_fWaypointCompletionRadius below, but NOT tighter than the AI can actually achieve - real cars were observed stopping 3.48m-4.31m short of a waypoint even at a 3m radius, so this must clear that with margin or a vehicle can stop correctly and still never be detected as arrived. Keep it well under half of m_fQueueSlotSpacing.")]
 	protected float m_fQueueGateCompletionRadius;
 
 	// --------------------------------------------------------
@@ -211,7 +218,7 @@ class EEF_CheckpointComponent : ScriptComponent
 	[Attribute("35.0", UIWidgets.EditBox, "Cruise speed cap (km/h) while a vehicle is approaching or departing the checkpoint. Set <= 0 to leave the vehicle prefab's own configured cruise speed untouched.")]
 	protected float m_fApproachSpeedKmh;
 
-	[Attribute("12.0", UIWidgets.EditBox, "Cruise speed cap (km/h) once a vehicle is inside the checkpoint zone - the hard slow-down applied the instant it crosses the trigger so it eases up to the queue instead of braking hard behind it. Set <= 0 to not slow down in the zone.")]
+	[Attribute("8.0", UIWidgets.EditBox, "Cruise speed cap (km/h) once a vehicle is inside the checkpoint zone - the hard slow-down applied the instant it crosses the trigger so it eases up to the queue instead of braking hard behind it. Lowered from 12 (section 11 second re-test) alongside the wider queue spacing/completion radius - gives the AI more reaction distance to stop cleanly behind the vehicle ahead instead of nudging/contacting it. Set <= 0 to not slow down in the zone.")]
 	protected float m_fZoneSpeedKmh;
 
 	// --------------------------------------------------------
