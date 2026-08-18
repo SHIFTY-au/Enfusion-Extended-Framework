@@ -88,6 +88,7 @@ class EEF_CheckpointVehicleState
 	int m_iQueueSlot;								//! Queue position: 0 = front, -1 = not in the queue (Stage 2 #18)
 	bool m_bReleasePending;							//! True once a release has been scheduled/requested for this vehicle, so it fires once (Stage 2 #18)
 	float m_fLastStallLogTime;						//! World time (s) LogQueueProgress last fired for this vehicle - throttles the stall diagnostic (#23)
+	vector m_LastPolledPos;							//! Vehicle position at the previous ArrivalTick poll - gate-crossing detection needs the pair (#23 redesign, restored - see notes section 12)
 
 	void EEF_CheckpointVehicleState(IEntity vehicle, SCR_AIGroup group, float spawnTime, bool hasContraband)
 	{
@@ -103,6 +104,7 @@ class EEF_CheckpointVehicleState
 		m_iQueueSlot = -1;
 		m_bReleasePending = false;
 		m_fLastStallLogTime = spawnTime;
+		m_LastPolledPos = vehicle.GetOrigin();
 	}
 }
 
@@ -121,15 +123,18 @@ class EEF_CheckpointPrefabEntry
 
 // ============================================================
 // A single calculated queue gate (#23 redesign - see CHECKPOINT_AI_NOTES.md
-// section 9). Replaces the old hand-authored marker list: computed by
-// ComputeQueueGates() by walking the road network back from the checkpoint.
-// Index 0 is the front (checkpoint stop line); higher indices step back
-// toward the spawn point. m_Point is a distinct drive destination on the
-// road - each queued vehicle is retargeted straight to its own gate (fresh
-// AssignMoveWaypoint), never left chasing a shared far-away target. m_Forward
-// is the road's local direction of travel at m_Point (spawn side ->
-// checkpoint), kept for the ComputeQueueGates() debug log so a gate's
-// heading can be sanity-checked against the road in Workbench.
+// section 9, corrected in section 12). Replaces the old hand-authored marker
+// list: computed by ComputeQueueGates() by walking the road network back
+// from the checkpoint. Index 0 is the front (checkpoint stop line); higher
+// indices step back toward the spawn point. m_Point + m_Forward together
+// define a perpendicular line across the road at that point - every vehicle
+// drives ONE continuous route toward the real end point (never retargeted
+// per-gate) and is halted the instant its position crosses its own assigned
+// gate's line (HasCrossedAssignedGate), independent of the AI's own
+// waypoint-arrival precision, which measured data showed is unpredictable
+// (3.5m-7.2m short of a requested point, worse with more distance/slower
+// speed, not better - see section 12). m_Forward is the road's local
+// direction of travel at m_Point (spawn side -> checkpoint).
 // ============================================================
 class EEF_CheckpointQueueGate
 {
@@ -166,32 +171,27 @@ class EEF_CheckpointComponent : ScriptComponent
 	protected string m_sDespawnPointName;
 
 	// --------------------------------------------------------
-	// Queue gates (#23 redesign) - queue stop points are CALCULATED, not authored, so a mission
-	// maker never places or orients a single queue marker. Starting at the checkpoint and walking
-	// back along the road network, ComputeQueueGates() drops a gate every m_fQueueSlotSpacing metres,
-	// each with its own heading taken from the road at that exact point (correct through a curve). A
-	// queued vehicle is never retasked to an off-road marker - it is retargeted (fresh AssignMoveWaypoint)
-	// straight to its own gate, still a point on the same road in the direction of travel, so its
-	// heading is always whatever the road already gave it. Each vehicle driving to a distinct,
-	// nearby, on-road point (rather than every vehicle chasing the same far-away checkpoint origin)
-	// is also what keeps a queued vehicle from treating the one ahead of it as an obstacle to route
-	// around - see CHECKPOINT_AI_NOTES.md section 9 for why (heading, not position, was the actual
-	// defect - a direct heading-snap was tried and rejected as immersion breaking, so this earns a
-	// correct heading structurally instead) and section 11 for the shared-target bug this replaced.
-	//
-	// Both defaults below were recalibrated from measured data (section 11 second re-test, see notes):
-	// LogQueueProgress showed real AI cars settling 3.48m-4.31m short of a requested waypoint even
-	// with a 3m completion radius - the AI's own stopping precision for a car has a floor above what
-	// we were checking, so gates were never detected as reached, and the resulting slack in the queue
-	// left too little real clearance between vehicles (one vehicle was observed shoved ~5m backward
-	// while parked - a physical nudge/contact from the vehicle behind, not a scripted repositioning).
+	// Queue gates (#23 redesign, corrected in section 12) - queue stop points are CALCULATED, not
+	// authored, so a mission maker never places or orients a single queue marker. Starting at the
+	// checkpoint and walking back along the road network, ComputeQueueGates() drops a gate every
+	// m_fQueueSlotSpacing metres, each with its own heading taken from the road at that exact point
+	// (correct through a curve). Every vehicle drives ONE continuous route toward the real end point
+	// (m_sDespawnPointName) the whole way through the queue - never retargeted to an off-road marker,
+	// never retargeted per-gate either - so its heading is always whatever the road already gave it.
+	// ArrivalTick halts each vehicle the instant its own position crosses its assigned gate's
+	// perpendicular line (HasCrossedAssignedGate), which is a geometric test independent of the AI's
+	// own waypoint-arrival behaviour. That independence is the point: three rounds of live testing
+	// (section 11) showed the AI's own stopping precision for a car is not a fixed, tunable constant -
+	// vehicles were measured settling anywhere from 3.5m to 7.2m short of a requested waypoint, and
+	// widening the completion radius to chase that number made it worse, not better. Relying on our
+	// own crossing test instead of the AI's arrival self-report sidesteps that unpredictability
+	// entirely - see CHECKPOINT_AI_NOTES.md section 9 for the original design and section 12 for why
+	// it's back after section 11 replaced it, and what was actually wrong with it the first time
+	// (masked by a different bug, not a flaw in crossing-detection itself).
 	// --------------------------------------------------------
 
-	[Attribute("18.0", UIWidgets.EditBox, "Distance in metres between queue gates, walking back from the checkpoint along the road. Should clear the longest vehicle in the pool, the AI's own stopping imprecision (observed up to ~4-5m short of a waypoint), and a buffer (e.g. a ~7.5m truck + ~5m imprecision + ~5m clearance).")]
+	[Attribute("18.0", UIWidgets.EditBox, "Distance in metres between queue gates, walking back from the checkpoint along the road. Should clear the longest vehicle in the pool plus a buffer for post-crossing braking overshoot (e.g. a ~7.5m truck + ~5m clearance).")]
 	protected float m_fQueueSlotSpacing;
-
-	[Attribute("6.0", UIWidgets.EditBox, "Completion/arrival radius in metres used only for queue gate waypoints. Deliberately tighter than the generous m_fWaypointCompletionRadius below, but NOT tighter than the AI can actually achieve - real cars were observed stopping 3.48m-4.31m short of a waypoint even at a 3m radius, so this must clear that with margin or a vehicle can stop correctly and still never be detected as arrived. Keep it well under half of m_fQueueSlotSpacing.")]
-	protected float m_fQueueGateCompletionRadius;
 
 	// --------------------------------------------------------
 	// Prefab pools
@@ -619,13 +619,17 @@ class EEF_CheckpointComponent : ScriptComponent
 
 		SetState(state, EEF_ECheckpointVehicleState.APPROACHING);
 
-		// Stage 2: drive toward the checkpoint ZONE, not straight to the exit. The vehicle keeps
-		// APPROACHING until ArrivalTick sees it cross into the trigger sphere, at which point it is
-		// assigned a queue slot and immediately retargeted to that gate's exact on-road point
-		// (EnterQueue - #23 redesign). Until then we aim the approach waypoint at the checkpoint
-		// origin with the generous general completion radius so it flows in smoothly - the zone-enter
-		// detection fires well before it would ever complete that waypoint.
-		AssignMoveWaypoint(state.m_OccupantGroup, GetOwner().GetOrigin(), m_fWaypointCompletionRadius);
+		// #23 redesign, section 12: aim at the real end point (despawn/exit marker), not the
+		// checkpoint origin. The vehicle drives this ONE continuous route the whole way through -
+		// approach, zone entry, queueing, all the way to the front - and is only ever halted by
+		// ArrivalTick's gate-crossing check (EnterQueue does no retargeting). Aiming this far away
+		// matters: it keeps the AI's own generous completion radius from ever being satisfiable
+		// anywhere near the queue zone, which is what silently desynced the crossing check from
+		// reality the first time this design was tried (see notes section 12) - aiming at the nearby
+		// checkpoint origin let the AI call itself "arrived" and stop on its own before ever crossing
+		// a gate line, so the crossing test (which only fires on an actual line crossing) never saw
+		// one happen.
+		AssignMoveWaypoint(state.m_OccupantGroup, m_DespawnPoint.GetOrigin(), m_fWaypointCompletionRadius);
 
 		// Govern the approach speed so vehicles don't come in hot toward the queue.
 		ApplyCruiseSpeed(state, m_fApproachSpeedKmh);
@@ -764,49 +768,37 @@ class EEF_CheckpointComponent : ScriptComponent
 				case EEF_ECheckpointVehicleState.QUEUED:
 				case EEF_ECheckpointVehicleState.AT_FRONT:
 				{
-					// #23 redesign: the vehicle is retargeted (EnterQueue / ResumeTowardFront) straight
-					// to its own gate's on-road point with a tight completion radius, so it stops there
-					// on its own - this just detects that arrival to drive the state machine. Checking
-					// against the same point the vehicle is actually driving to (rather than a
-					// perpendicular line crossing on a route aimed elsewhere) means it can't be
-					// satisfied early by a generous radius or missed because the AI stopped short.
+					// #23 redesign, section 12: the vehicle drives ONE continuous route toward the real
+					// end point the whole way through (never retargeted per-gate) and is halted exactly
+					// where it is the instant it crosses its currently assigned gate's perpendicular
+					// line - a geometric test on the vehicle's own position, independent of whatever the
+					// AI's own waypoint-arrival logic decides to do. Self-limiting: once stopped, both
+					// sides of the crossing test read "past the gate" on every later poll, so this can't
+					// re-fire once it has fired.
 					EEF_CheckpointQueueGate gate = GetQueueGate(state.m_iQueueSlot);
 					if (!gate)
 						break;
 
-					if (HasArrivedWithin(vehiclePos, gate.m_Point, m_fQueueGateCompletionRadius))
+					if (HasCrossedAssignedGate(state, vehiclePos))
 					{
-						// HasWaypoints guards this so it only fires once per arrival: a non-front slot
-						// stays QUEUED (no state change) while it holds, so without this guard the check
-						// above would keep being true and this block would re-fire every poll for as
-						// long as the vehicle sits there. Mirrors the same idiom already used in
-						// EnterQueue's "lane full" branch. A fresh retarget (ResumeTowardFront) always
-						// hands it a new waypoint, so HasWaypoints goes true again the moment it matters.
-						if (HasWaypoints(state.m_OccupantGroup))
-						{
-							ClearWaypoints(state.m_OccupantGroup);
+						ClearWaypoints(state.m_OccupantGroup);
 
-							if (state.m_iQueueSlot == 0)
-							{
-								SetState(state, EEF_ECheckpointVehicleState.HELD);
-								DebugLog("Front vehicle reached the stop line - HELD, awaiting release.");
-								BeginHold(state);
-							}
-							else
-							{
-								DebugLog(string.Format("Vehicle reached queue slot %1 - holding.", state.m_iQueueSlot));
-							}
+						if (state.m_iQueueSlot == 0)
+						{
+							SetState(state, EEF_ECheckpointVehicleState.HELD);
+							DebugLog("Front vehicle reached the stop line - HELD, awaiting release.");
+							BeginHold(state);
+						}
+						else
+						{
+							DebugLog(string.Format("Vehicle reached queue slot %1 - holding.", state.m_iQueueSlot));
 						}
 					}
 					else if (m_bDebugLog && now - state.m_fLastStallLogTime >= CHECKPOINT_STALL_LOG_INTERVAL)
 					{
-						// Diagnostic (#23, second live-test round): a promoted vehicle has been seen to
-						// take a very long time - occasionally exceeding m_fMaxVehicleLifetime entirely -
-						// to reach a gate it was already retargeted to, most likely single-lane pathing
-						// contention with the vehicle(s) still parked ahead of it. Sample every 10s while
-						// still short of the gate so a real stall (requestCompleted stuck at 1, or many
-						// path nodes that never shrink) is visible in the console instead of just "it
-						// never arrived".
+						// Diagnostic: still useful even with crossing-detection - shows whether a vehicle
+						// that hasn't crossed its gate yet is making real progress (distance shrinking, a
+						// live path) or has stalled for some other reason (e.g. genuinely blocked).
 						state.m_fLastStallLogTime = now;
 						LogQueueProgress(state, gate, vehiclePos);
 					}
@@ -829,6 +821,8 @@ class EEF_CheckpointComponent : ScriptComponent
 				// HELD: parked at the front, waiting to be released - nothing to poll.
 				// SPAWNING / DESPAWNED: handled elsewhere (seat poll / removal).
 			}
+
+			state.m_LastPolledPos = vehiclePos;
 		}
 	}
 
@@ -870,10 +864,11 @@ class EEF_CheckpointComponent : ScriptComponent
 	// line advances.
 	//------------------------------------------------------------------------------------------------
 
-	//! Transition an APPROACHING vehicle into the queue: claim the lowest free slot, retarget it
-	//! straight to that gate's own on-road point, and set QUEUED (or AT_FRONT if it took slot 0). If
-	//! the lane is full it stays APPROACHING and retries on the next tick (a slot frees when the front
-	//! vehicle departs).
+	//! Transition an APPROACHING vehicle into the queue: claim the lowest free slot and set QUEUED (or
+	//! AT_FRONT if it took slot 0). No retargeting (#23 redesign, section 12) - it keeps driving its
+	//! existing route toward the real end point; ArrivalTick's gate-crossing check halts it at the
+	//! right spot. If the lane is full it stays APPROACHING and retries on the next tick (a slot frees
+	//! when the front vehicle departs).
 	protected void EnterQueue(EEF_CheckpointVehicleState state)
 	{
 		int slot = AssignQueueSlot();
@@ -897,17 +892,11 @@ class EEF_CheckpointComponent : ScriptComponent
 		// until the vehicle is released.
 		ApplyCruiseSpeed(state, m_fZoneSpeedKmh);
 
-		// #23 redesign (section 11 fix): retarget straight to this slot's own gate - a distinct,
-		// on-road, correctly-oriented point - with a tight completion radius. This is still "the same
-		// road, in the direction of travel", so heading stays correct; it's what stops every queued
-		// vehicle converging on the single far-away checkpoint origin, where the generous approach
-		// completion radius let the AI call itself "arrived" without reaching (or even crossing) its
-		// actual gate, and a trailing vehicle would treat the one ahead as an obstacle blocking its
-		// shared destination and swerve around it off-road.
-		EEF_CheckpointQueueGate gate = GetQueueGate(slot);
-		if (gate)
-			AssignMoveWaypoint(state.m_OccupantGroup, gate.m_Point, m_fQueueGateCompletionRadius);
-
+		// #23 redesign, section 12: no retargeting here. The vehicle is already driving toward the
+		// real end point on its original Dispatch() waypoint - ArrivalTick's gate-crossing check halts
+		// it the instant it reaches its assigned gate. Continuing the same route the whole way keeps
+		// its heading correct instead of retasking it toward a separate stop point, and keeps the
+		// AI's own arrival behaviour irrelevant to when it actually stops.
 		if (slot == 0)
 		{
 			SetState(state, EEF_ECheckpointVehicleState.AT_FRONT);
@@ -1020,18 +1009,14 @@ class EEF_CheckpointComponent : ScriptComponent
 		list.Insert(state);
 	}
 
-	//! Get a halted queued vehicle moving again after a promotion (#23 redesign, section 11 fix): it
-	//! was stopped in place (ClearWaypoints) at its previous (now-vacated) gate, so retarget it
-	//! straight to its newly assigned, closer gate - a fresh on-road point, not the shared checkpoint
-	//! origin, so it can't stall on the AI's own generous arrival radius or start avoiding a vehicle
-	//! still ahead of it in the lane.
+	//! Get a halted queued vehicle moving again after a promotion (#23 redesign, section 12). It was
+	//! stopped in place (ClearWaypoints) when it crossed its previous gate, with no waypoint left to
+	//! retarget - reissuing the same "drive toward the real end point" order resumes it without ever
+	//! tasking it toward an off-road point. ArrivalTick's gate-crossing check picks up its (now closer)
+	//! assigned gate on the next poll and halts it there in turn.
 	protected void ResumeTowardFront(EEF_CheckpointVehicleState state)
 	{
-		EEF_CheckpointQueueGate gate = GetQueueGate(state.m_iQueueSlot);
-		if (!gate)
-			return;
-
-		AssignMoveWaypoint(state.m_OccupantGroup, gate.m_Point, m_fQueueGateCompletionRadius);
+		AssignMoveWaypoint(state.m_OccupantGroup, m_DespawnPoint.GetOrigin(), m_fWaypointCompletionRadius);
 	}
 
 	//------------------------------------------------------------------------------------------------
@@ -1333,6 +1318,32 @@ class EEF_CheckpointComponent : ScriptComponent
 		result[1] = a[1] + (b[1] - a[1]) * t;
 		result[2] = a[2] + abz * t;
 		return result;
+	}
+
+	//! True exactly once, the poll tick a queued vehicle's position crosses from the approach side of
+	//! its assigned gate to the far side (#23 redesign, section 12). Horizontal-only, matching
+	//! HasArrivedWithin. Self-limiting: once the vehicle has stopped past the gate, both sides of the
+	//! comparison read "at or past it" on every later poll, so this only ever fires on the actual
+	//! crossing - independent of the AI's own waypoint-arrival radius, which measured data showed is
+	//! not a reliable proxy for "has this vehicle actually reached this point".
+	protected bool HasCrossedAssignedGate(EEF_CheckpointVehicleState state, vector currPos)
+	{
+		EEF_CheckpointQueueGate gate = GetQueueGate(state.m_iQueueSlot);
+		if (!gate)
+			return false;
+
+		float dPrev = SignedDistanceAlongGate(state.m_LastPolledPos, gate);
+		float dCurr = SignedDistanceAlongGate(currPos, gate);
+		return dPrev < 0 && dCurr >= 0;
+	}
+
+	//! Horizontal-only signed distance of pos along gate.m_Forward from gate.m_Point. Negative = still
+	//! approaching the gate, >= 0 = at or past it.
+	protected float SignedDistanceAlongGate(vector pos, EEF_CheckpointQueueGate gate)
+	{
+		float dx = pos[0] - gate.m_Point[0];
+		float dz = pos[2] - gate.m_Point[2];
+		return dx * gate.m_Forward[0] + dz * gate.m_Forward[2];
 	}
 
 	//! True if the vehicle position is inside the checkpoint zone (trigger sphere).

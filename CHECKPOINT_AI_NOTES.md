@@ -529,6 +529,92 @@ diagnosis possible and should keep running on every future test.
 **Not yet re-tested** - the spacing/radius/speed recalibration above has not
 had a live Workbench pass yet.
 
+## §12. Fourth live test: recalibration disproven, reverted to gate-crossing detection (2026-08-18)
+
+The recalibrated numbers from the entry above made things *worse*: at 18m
+spacing / 6m completion radius / 8 km/h zone speed, all vehicles stopped
+7.19m-7.22m short of their gate (worse than the previous test's 3.48m-4.31m,
+at a *tighter* effective ratio too), still outside the new 6m radius, so
+HELD still never fired and the run was stopped manually before a 4th vehicle
+even entered. The user's screenshot showed the stopped vehicles' spacing was
+inconsistent with what the gate math intended.
+
+This is the conclusive data point across three tuning rounds: the AI's own
+stopping precision for a car, measured against a requested waypoint, is not
+a fixed constant we can converge on by raising the completion radius -
+3.5m, 4.3m, 7.2m across three tests, moving in the *wrong* direction after
+the spacing/speed changes that should have helped. Treating "how close can
+the AI get to a point" as a tunable number was the wrong model of the
+problem from the start.
+
+**Correction (from the user, restating the original pre-section-11
+design):** vehicles should path continuously toward the real END POINT
+(the despawn/exit marker) - not the checkpoint's own origin, which is what
+the original section 9/10 implementation actually aimed at - and a queued
+vehicle is halted by our OWN geometric test: the instant its position
+crosses the perpendicular line through its assigned gate (point + forward,
+already computed by `ComputeQueueGates()`), independent of whatever the
+AI's own waypoint-arrival/completion-radius logic thinks. This decouples
+"did the vehicle reach its slot" from "does the AI consider its drive
+request complete" entirely - the second thing has now been shown three
+times over to be unpredictable, so nothing should depend on it for
+correctness.
+
+**Why this isn't just re-trying something already proven broken:**
+`HasCrossedAssignedGate` / `SignedDistanceAlongGate` existed in the original
+section 9/10 implementation and were removed in section 11 - but section
+11's own diagnosis of *why* that design failed its first live test says
+plainly: the drive target back then was `GetOwner().GetOrigin()` (the
+checkpoint itself) with the generous `m_fWaypointCompletionRadius` (15m at
+the time) - larger than the 12m gate spacing. That let the AI silently
+"arrive" and stop somewhere inside the queue zone on its own, before ever
+crossing a gate line, which desynced the crossing test from what the
+vehicle was actually doing (it never saw a crossing because the vehicle
+had already stopped short of one) - not a flaw in the crossing test itself.
+The fix this time is aiming the shared route at the actual despawn/exit
+point instead: far enough past every gate that the AI's own completion
+radius can never be satisfied anywhere near the queue zone, so it keeps
+truly driving (real forward momentum, real path) all the way through, and
+the crossing test - which only fires on an actual position crossing - is
+the only thing that ever halts it. This should also structurally prevent
+the original section 11 symptom (a trailing vehicle swerving off-road
+around the one ahead): each vehicle's own gate sits further back than the
+one ahead of it, so the crossing test halts it well before it gets
+physically close enough to treat the parked vehicle ahead as an obstacle.
+
+**What changed in code:**
+- `EEF_CheckpointVehicleState.m_LastPolledPos` restored (needed by the
+  crossing test's prev/curr sign-flip comparison), set at the end of every
+  `ArrivalTick()` poll for every vehicle.
+- `Dispatch()` and `ResumeTowardFront()` now aim `AssignMoveWaypoint` at
+  `m_DespawnPoint.GetOrigin()` (the real end point) instead of
+  `GetOwner().GetOrigin()` (section 9/10's original target) or a per-gate
+  point (section 11's target).
+- `EnterQueue()` no longer retargets at all - matches section 9/10's "no
+  retargeting" behaviour, now safe because the shared target is genuinely
+  far away.
+- `ArrivalTick()`'s QUEUED/AT_FRONT case checks `HasCrossedAssignedGate`
+  instead of an arrival-radius test. The crossing test is naturally
+  idempotent (both sides read "past the gate" forever after it fires), so
+  the `HasWaypoints()` re-fire guard added earlier in this same round is no
+  longer needed there and was dropped.
+- `m_fQueueGateCompletionRadius` attribute removed entirely (no longer
+  meaningful - nothing checks a radius against a gate point anymore).
+- `m_fQueueSlotSpacing` (18m) and `m_fZoneSpeedKmh` (8 km/h) from the
+  disproven recalibration are left as-is for now (they still provide some
+  margin for real braking overshoot after a crossing, which is a much
+  smaller and more bounded error source than the AI's own arrival
+  imprecision was) - not re-tuned again in the same round as a mechanism
+  change, to keep this test isolated to one variable.
+- `LogQueueProgress()` (the stall diagnostic) is retained unchanged and
+  still fires on "not yet crossed" - still useful for confirming a queued
+  vehicle is making real progress toward its gate.
+
+**Not yet re-tested** - this is a mechanism change back to gate-crossing
+detection, with the specific defect from its first attempt (checkpoint
+origin + radius large enough to mask a crossing) corrected. Needs a live
+Workbench pass.
+
 **Rejected explicitly - do not revisit:** direct transform heading-snap
 ("100% immersion breaking") and per-slot authored headings (mission-maker
 authoring burden). See section 9.
