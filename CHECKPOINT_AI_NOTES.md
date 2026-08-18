@@ -346,6 +346,76 @@ elsewhere in this file, though `Math.RandomFloat`/`Math.RandomInt` already
 are). Standard enough on a Math class across Bohemia engines that this
 wasn't treated as a fourth blocker, unlike the `RoadNetworkManager` accessor.
 
+## §11. First live test: shared-target bug found and fixed (2026-08-18)
+
+First in-Workbench test of the §10 implementation, after the `RoadNetworkManager`
+accessor fix. Observed (no debug/hardcoding, pure observation):
+- Spawn, dispatch, approach, zone entry, and slow-down all worked as expected.
+- Vehicle 1 drove the curve smoothly and stopped roughly at the front stop
+  point, as intended.
+- As each following vehicle (2, 3, 4) approached the one stopped ahead of it,
+  the stopped vehicle would move forward and pull off-road before stopping
+  again. This repeated down the line.
+- The four vehicles did not visibly end up spaced ~12m apart along the road.
+- No move/resume was observed following release.
+
+**Log evidence that pinpointed it:** `ComputeQueueGates()` logged "Computed 4
+of 4 requested queue gate(s)" - gate math itself was fine. But the log line
+for the front vehicle reaching HELD ("Front vehicle reached the stop line -
+HELD, awaiting release") never appeared, even though it visibly stopped. No
+front vehicle ever transitions to HELD, so `BeginHold()`'s auto-release timer
+never even starts - there was never a real release/resume to observe.
+
+**Root cause:** §10's implementation kept every queued vehicle's AI waypoint
+aimed at the single, shared, far-away checkpoint origin the whole time (a
+deliberate design choice at the time: "no retargeting - it keeps driving this
+exact waypoint the whole way through the queue"), relying purely on a
+perpendicular-line crossing test (`HasCrossedAssignedGate`) to notice when a
+vehicle passed its calculated gate. Two things broke this:
+1. `AssignMoveWaypoint()`'s completion radius on that shared approach
+   waypoint is `m_fWaypointCompletionRadius` (15m default, deliberately
+   generous per its own doc comment) - *larger* than the 12m default gate
+   spacing. The AI's own arrival logic could therefore call the drive request
+   "complete" and stop the vehicle without it ever crossing the exact gate
+   line the crossing test was watching for. This is exactly what happened to
+   vehicle 1: it stopped (satisfying the AI's own generous radius) short of
+   / without crossing gate 0's line, so `HasCrossedAssignedGate` never fired.
+2. Every vehicle's real AI destination was the *same* far-away point. A
+   vehicle behind one that had already stopped had no reason (from the AI's
+   perspective) to stop before reaching that shared target - it treated the
+   stopped vehicle ahead as an obstacle blocking its route to that target and
+   steered around it, off-road, exactly matching "moved forward and pulled
+   off road" repeating down the line.
+
+**Fix:** retarget each vehicle directly to its own assigned gate's exact
+on-road point (fresh `AssignMoveWaypoint`, same mechanism already proven safe
+in `ReleaseVehicle()`), using a new, deliberately tight
+`m_fQueueGateCompletionRadius` (3m default) instead of the generous general
+radius. This is still "the same road, in the direction of travel" - not an
+off-road marker and not a heading-snap - so the property that actually fixed
+#23 (heading comes from driving the real road) is unaffected. It just makes
+each gate a real, distinct, near destination instead of an invisible
+tripwire on a route aimed somewhere else, which is what:
+- Makes the AI's own arrival and our arrival check agree (they now test the
+  same point), so HELD/promotion/release actually fire.
+- Gives each queued vehicle a nearer stopping point than the vehicle ahead
+  of it, so it has no reason to try to drive past/around it.
+
+`EnterQueue()` and `ResumeTowardFront()` now both retarget to
+`GetQueueGate(slot).m_Point`. `ArrivalTick()`'s QUEUED/AT_FRONT case now
+checks `HasArrivedWithin(vehiclePos, gate.m_Point, m_fQueueGateCompletionRadius)`
+instead of the old signed-crossing test. `HasCrossedAssignedGate()`,
+`SignedDistanceAlongGate()`, and the `m_LastPolledPos` poll-pairing field
+they depended on are removed as dead code - a plain arrival-radius check
+against the vehicle's actual destination replaces them entirely. `m_Forward`
+on the gate class is kept: `ComputeQueueGates()` now logs every computed
+gate's point + heading, so gate placement can be sanity-checked in the
+Workbench console against where vehicles actually stop - a low-effort stand-in
+for the debug visualisation asked about in section 9 (no in-world debug-draw
+API was found/needed).
+
+**Not yet re-tested** - this fix has not had a live Workbench pass yet.
+
 **Rejected explicitly - do not revisit:** direct transform heading-snap
 ("100% immersion breaking") and per-slot authored headings (mission-maker
 authoring burden). See section 9.
