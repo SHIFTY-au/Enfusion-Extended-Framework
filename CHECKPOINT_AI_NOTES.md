@@ -702,3 +702,53 @@ is a no-op-safe change until that's confirmed.
 **Not yet re-tested** - needs a live Workbench pass focused on: (a) do queued
 vehicles actually stop and stay put at their gates, and (b) does a released
 vehicle now drive straight off from the stop line with no reverse/turn-around.
+
+### §13a. Live result (2026-08-28): `SetCruiseSpeed(0)` is NOT a stop — confirmed
+
+The flagged unknown resolved the bad way: **`AICarMovementComponent.SetCruiseSpeed(0)`
+does not stop the car.** The vehicle keeps driving, so with the current build
+cars blow straight through the gates and never queue. The hold-in-place
+*architecture* is unaffected and stays (one `AssignMoveWaypoint` in `Dispatch`;
+gate-stop/promotion/release go through hold/resume, never clear+re-add) — only
+the halt *primitive* inside `HoldVehicle()` is wrong and needs replacing.
+
+**Do not re-attempt as a stop:** `SetCruiseSpeed(0)` / any `<= 0` cruise value
+(the engine ignores it or treats it as unset).
+
+**Candidate real-halt levers to confirm in Workbench autocomplete before coding
+(don't guess-compile — one bad name burns a build):**
+1. `AICarMovementComponent` members — a dedicated `Stop()` / `Halt()` /
+   `SetWantedSpeed(0)` / brake-request call that pauses motion WITHOUT clearing
+   the group's waypoint (the whole point is to keep the order live).
+2. `SCR_CarControllerComponent` (already sampled in the diagnostic trace for
+   gear) — a **persistent handbrake** setter (Reforger parks empty/AI vehicles
+   with the handbrake on; likely something like `SetPersistentHandBrake(bool)`
+   on the controller or the vehicle's wheeled-simulation component). A handbrake
+   hold is ideal: it physically stops the car while the AI driver keeps its
+   order and path, so release is just releasing the brake — exactly the
+   "resume the same order, no replan" property we need.
+3. A hold/wait waypoint type (e.g. an `AIWaypoint_Defend`/wait prefab) inserted
+   *ahead of* the move waypoint rather than replacing it, if the group processes
+   waypoints in order and resumes the move waypoint when the wait one is removed.
+
+Preferred order: (2) handbrake, then (1), then (3). Whichever exists, it drops
+straight into `HoldVehicle()` (halt) and its inverse into the resume path
+(`ApplyCruiseSpeed`/`ReleaseVehicle`/`ResumeTowardFront`) — no other structural
+change.
+
+### §13b. New symptom to diagnose (2026-08-28): periodic Workbench freeze
+
+Every few minutes the play test freezes and Workbench opens the script editor at
+`CleanupDeadVehicles()` (the reverse loop that deletes an orphaned
+`m_OccupantGroup` and removes the state when `!state.m_Vehicle`). Reads as a
+runtime script break, not a plain hang.
+
+**Leading theory (unconfirmed - needs the console error text):** when a vehicle
+is destroyed externally (stuck/piled-up/blown), its seated driver dies with it,
+the now-empty `SCR_AIGroup` auto-deletes itself, and the next `SpawnTick`'s
+`CleanupDeadVehicles` then calls `SCR_EntityHelper.DeleteEntityAndChildren(state.m_OccupantGroup)`
+on that group. If the reference isn't auto-nulled, that's a delete on a freed
+entity. The §13a bug makes this MORE frequent: cars that don't queue drive around
+chaotically and get destroyed abnormally more often, so the latent cleanup path
+runs more often. **Need from Workbench:** the exact console error line at the
+freeze, and whether the `for` line actually carries a user breakpoint.

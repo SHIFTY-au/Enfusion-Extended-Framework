@@ -1465,6 +1465,12 @@ class EEF_CheckpointComponent : ScriptComponent
 			return;
 		}
 
+		// TODO(#23): SetCruiseSpeed(0) is confirmed by live test to NOT stop the car (notes §13a) -
+		// the engine ignores a zero/negative cruise value, so cars currently blow through the gates.
+		// This needs a real halt that keeps the drive order live (handbrake on SCR_CarControllerComponent,
+		// or an AICarMovementComponent stop/SetWantedSpeed(0) call) - see notes §13a for the candidate
+		// list to confirm in Workbench autocomplete. The surrounding "never clear the order" structure
+		// stays; only this line changes. Left as-is (not guessed) to avoid a non-compiling build.
 		movement.SetCruiseSpeed(0);
 		state.m_bHeld = true;
 	}
