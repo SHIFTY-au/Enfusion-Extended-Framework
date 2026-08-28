@@ -751,4 +751,59 @@ on that group. If the reference isn't auto-nulled, that's a delete on a freed
 entity. The §13a bug makes this MORE frequent: cars that don't queue drive around
 chaotically and get destroyed abnormally more often, so the latent cleanup path
 runs more often. **Need from Workbench:** the exact console error line at the
-freeze, and whether the `for` line actually carries a user breakpoint.
+freeze, and whether the `for` line actually carries a user breakpoint. (§13c's
+real halt should also cut the pile-ups that trigger this, so it may become rare
+on its own - but still get the error line so we can fix the actual crash.)
+
+### §13c. Halt implemented via physics simulation state (2026-08-28)
+
+User pulled the engine's own generated script headers from `addons/core/data.pak`
+(`Scripts/Core/Physics/{ActiveState,SimulationState,Physics}.c`) and confirmed the
+exact API. Decisive facts:
+- `IEntity.GetPhysics()` → `Physics` with `SetActive(ActiveState)`,
+  `ChangeSimulationState(SimulationState)`, `SetVelocity/SetAngularVelocity`,
+  `SetLinearFactor`, etc.
+- `enum ActiveState { INACTIVE (sleeps), ACTIVE, ALWAYS_ACTIVE }`.
+- `enum SimulationState { NONE (not in collision world), COLLISION (in collision
+  world but NOT simulated), SIMULATION (dynamic, simulated) }`.
+- Vanilla hierarchy wrapper: `SCR_PhysicsHelper.ChangeSimulationState(IEntity ent,
+  SimulationState simState, bool recursively = false)`.
+
+**Chosen mechanism: `SimulationState.COLLISION` as the hold.** It is exactly
+right for a queue stop - the body stays a solid obstacle (the car behind stops
+against it) but is not dynamically simulated, so it can neither creep from AI
+throttle (the §13a `SetCruiseSpeed(0)` failure) nor be shoved by a contact (the
+"nudge forward when the next car arrives" from §11). `SetActive(INACTIVE)` was
+rejected: it only sleeps the body, and a contact wakes it → shove. The waypoint
+and computed path live in the AI components, not physics, so they survive the
+freeze; release is `ChangeSimulationState(SIMULATION)` and the AI drives the SAME
+order onward from a correct pose - never the fresh-waypoint-from-a-stop that the
+final trace pinned as the ~130° reverse jank.
+
+**Code (`EEF_CheckpointComponent.c`):**
+- `HoldVehicle()` - zero linear+angular velocity, then
+  `SCR_PhysicsHelper.ChangeSimulationState(vehicle, SimulationState.COLLISION)`.
+  Idempotent via `m_bHeld`. Non-recursive (chassis only, not occupants).
+- `ResumeVehicle()` - `ChangeSimulationState(vehicle, SimulationState.SIMULATION)`,
+  clears `m_bHeld`. Idempotent.
+- Every hold site (gate crossing, lane-full) now calls `HoldVehicle`; every resume
+  site (promotion `ResumeTowardFront`, release `ReleaseVehicle`, and a
+  lane-full-then-slotted vehicle in `EnterQueue`) calls `ResumeVehicle` then
+  `ApplyCruiseSpeed`. `ApplyCruiseSpeed` no longer touches `m_bHeld` - Hold/Resume
+  own it, since they own the physics state.
+- Still exactly one `AssignMoveWaypoint` per vehicle (in `Dispatch`); nothing
+  clears or re-adds it. The architecture is unchanged - only the halt primitive
+  went from the no-op `SetCruiseSpeed(0)` to the physics-state freeze.
+
+**One knob if a live test still shows movement while held:** switch the two
+`ChangeSimulationState` calls to `recursively = true` (freezes child bodies too,
+e.g. the wheeled sim) - noted inline on `HoldVehicle`.
+
+**Watch on the next test:** (a) queued cars stop dead at their gates and stay put
+even as the next car pulls up behind (no creep, no shove); (b) a released car
+drives straight off from the stop line with no reverse/turn-around; (c) the
+transition into COLLISION at ~8 km/h isn't visibly too abrupt; (d) after release,
+re-entering SIMULATION cleanly re-hands control to the AI driver (the order
+survived).
+
+**Not yet re-tested.**

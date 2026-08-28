@@ -89,7 +89,7 @@ class EEF_CheckpointVehicleState
 	bool m_bReleasePending;							//! True once a release has been scheduled/requested for this vehicle, so it fires once (Stage 2 #18)
 	float m_fLastStallLogTime;						//! World time (s) LogQueueProgress last fired for this vehicle - throttles the stall diagnostic (#23)
 	vector m_LastPolledPos;							//! Vehicle position at the previous ArrivalTick poll - gate-crossing detection needs the pair (#23 redesign, restored - see notes section 12)
-	bool m_bHeld;									//! True while halted in place by the cruise governor (SetCruiseSpeed 0) with the drive order still live - never cleared/re-issued, so release is a pure speed change, not a replan from a dead stop (#23 fix, notes section 13)
+	bool m_bHeld;									//! True while halted in place by taking the physics body out of dynamic simulation (SimulationState.COLLISION) with the drive order still live - never cleared/re-issued, so release just re-enters simulation, not a replan from a dead stop (#23 fix, notes section 13c)
 
 	void EEF_CheckpointVehicleState(IEntity vehicle, SCR_AIGroup group, float spawnTime, bool hasContraband)
 	{
@@ -783,11 +783,12 @@ class EEF_CheckpointComponent : ScriptComponent
 
 					if (HasCrossedAssignedGate(state, vehiclePos))
 					{
-						// #23 fix (notes section 13): halt in place via the cruise governor at 0 km/h
-						// WITHOUT clearing the group's waypoint. The drive order toward the far despawn
-						// point - and the road-tangent path the AI already computed for it while moving -
-						// stays live, so promotion/release is a pure speed change, never a fresh order to
-						// a stopped car. Live tracing pinned "fresh waypoint from a dead stop -> ~3.75s
+						// #23 fix (notes section 13c): halt in place by taking the physics body out of
+						// dynamic simulation (SimulationState.COLLISION) WITHOUT clearing the group's
+						// waypoint. The drive order toward the far despawn point - and the road-tangent
+						// path the AI already computed for it while moving - stays live, so
+						// promotion/release just re-enters simulation, never issues a fresh order to a
+						// stopped car. Live tracing pinned "fresh waypoint from a dead stop -> ~3.75s
 						// stall -> ~130-degree turn-around into reverse" as the actual release jank; not
 						// clearing the order removes that path entirely.
 						HoldVehicle(state);
@@ -883,11 +884,11 @@ class EEF_CheckpointComponent : ScriptComponent
 		int slot = AssignQueueSlot();
 		if (slot < 0)
 		{
-			// Lane full - hold position here and retry once a slot frees. #23 fix (notes section 13):
-			// halt via the cruise governor at 0 km/h, keeping the drive order live, instead of
-			// clearing it - so when a slot frees the vehicle resumes with a speed change, not a fresh
-			// order to a stopped car. Guarded by m_bHeld so it only acts (and logs) once, not every
-			// tick.
+			// Lane full - hold position here and retry once a slot frees. #23 fix (notes section 13c):
+			// halt by taking the physics body out of dynamic simulation, keeping the drive order live,
+			// instead of clearing it - so when a slot frees the vehicle resumes by re-entering
+			// simulation, not with a fresh order to a stopped car. Guarded by m_bHeld so it only acts
+			// (and logs) once, not every tick.
 			if (!state.m_bHeld)
 			{
 				DebugLog("Checkpoint zone entered but the queue is full - holding position (increase max concurrent vehicles or reduce queue slot spacing so more gates fit).");
@@ -898,9 +899,11 @@ class EEF_CheckpointComponent : ScriptComponent
 
 		state.m_iQueueSlot = slot;
 
-		// Hard slow-down the instant it enters the zone so it eases up to its slot instead of
-		// braking hard behind the queue. Persists (SetCruiseSpeed is sticky) through any promotion
-		// until the vehicle is released.
+		// Unfreeze first if this vehicle was held at the zone edge waiting for a slot (no-op otherwise).
+		// Then hard slow-down the instant it enters the zone so it eases up to its slot instead of
+		// braking hard behind the queue. Cruise speed persists (SetCruiseSpeed is sticky) through any
+		// promotion until the vehicle is released.
+		ResumeVehicle(state);
 		ApplyCruiseSpeed(state, m_fZoneSpeedKmh);
 
 		// #23 redesign, section 12: no retargeting here. The vehicle is already driving toward the
@@ -1020,14 +1023,16 @@ class EEF_CheckpointComponent : ScriptComponent
 		list.Insert(state);
 	}
 
-	//! Get a halted queued vehicle moving again after a promotion (#23 fix, notes section 13). It was
-	//! halted in place by HoldVehicle (cruise 0) when it crossed its previous gate, with its drive
-	//! order toward the far despawn point STILL LIVE - so resuming is purely lifting the speed cap back
-	//! to the in-zone speed. No fresh waypoint, no replan: the vehicle just starts driving its existing
-	//! path forward again from a correct, road-tangent pose. ArrivalTick's gate-crossing check picks up
-	//! its (now closer) assigned gate on the next poll and halts it there in turn.
+	//! Get a halted queued vehicle moving again after a promotion (#23 fix, notes section 13c). It was
+	//! halted in place by HoldVehicle (physics body taken out of dynamic simulation) when it crossed its
+	//! previous gate, with its drive order toward the far despawn point STILL LIVE - so resuming is
+	//! re-entering simulation (ResumeVehicle) plus re-applying the in-zone cruise speed. No fresh
+	//! waypoint, no replan: the vehicle just starts driving its existing path forward again from a
+	//! correct, road-tangent pose. ArrivalTick's gate-crossing check picks up its (now closer) assigned
+	//! gate on the next poll and halts it there in turn.
 	protected void ResumeTowardFront(EEF_CheckpointVehicleState state)
 	{
+		ResumeVehicle(state);
 		ApplyCruiseSpeed(state, m_fZoneSpeedKmh);
 	}
 
@@ -1088,10 +1093,11 @@ class EEF_CheckpointComponent : ScriptComponent
 
 		SetState(state, EEF_ECheckpointVehicleState.DEPARTING);
 
-		// Lift the hold and the in-zone slow-down in one step - depart at the (controlled) approach
-		// speed. The vehicle's original drive order toward the despawn point was never cleared, so this
-		// alone resumes it: it drives its existing, already-computed path forward from a road-tangent
-		// pose. No fresh waypoint is issued (#23 fix - see the method doc comment above).
+		// Unfreeze the physics body (lift the hold) and depart at the (controlled) approach speed. The
+		// vehicle's original drive order toward the despawn point was never cleared, so putting it back
+		// into simulation is enough to resume it: it drives its existing, already-computed path forward
+		// from a road-tangent pose. No fresh waypoint is issued (#23 fix - see the method doc above).
+		ResumeVehicle(state);
 		ApplyCruiseSpeed(state, m_fApproachSpeedKmh);
 
 		DebugLog("Vehicle released - departing toward the exit.");
@@ -1430,49 +1436,55 @@ class EEF_CheckpointComponent : ScriptComponent
 		}
 
 		if (kmh > 0)
-		{
 			movement.SetCruiseSpeed(kmh);
-			// Any positive cruise speed lifts a hold - the vehicle is being resumed. The drive order
-			// was never cleared, so it simply starts moving along its existing path again (#23 fix).
-			state.m_bHeld = false;
-		}
 		else
 			movement.ResetCruiseSpeed();
 	}
 
-	//! True halt of a queued/held vehicle via the AI cruise governor at 0 km/h. Deliberately does NOT
-	//! clear or replace the group's waypoint: the drive order toward the far despawn point, and the
-	//! road-tangent path the AI already computed for it while moving, stay live. This is the #23
-	//! linchpin (notes section 9, item 4; finally applied in section 13). Live tracing on #23 pinned
-	//! the release jank precisely to a fresh waypoint being issued to a vehicle at a dead stop
-	//! (ClearWaypoints + AddWaypoint) - the AI stalled ~3.75s then swung ~130 degrees into reverse to
-	//! "re-enter" a freshly planned path, even with the target legitimately straight ahead. Holding in
-	//! place instead means release/promotion is only ever ApplyCruiseSpeed() lifting the cap - the AI
-	//! resumes the same order from a correct, road-tangent pose (the one case testing proved always
-	//! works cleanly: "the same car follows the same curve fine once it is already moving"), never
-	//! replanning from a stop. Idempotent - safe to call every poll while a vehicle stays held.
+	//! True halt of a queued/held vehicle by taking its physics body OUT of dynamic simulation while
+	//! leaving the drive order and computed path untouched (#23 fix, notes section 13c). SetCruiseSpeed(0)
+	//! was confirmed by live test NOT to stop the car; this does, and keeps every property the
+	//! hold-in-place design needs:
+	//!   - SimulationState.COLLISION = the body is still in the collision world (a solid obstacle the
+	//!     vehicle behind it stops against) but is no longer dynamically simulated, so it can neither
+	//!     creep from AI throttle nor be shoved by a contact - the two failures the earlier attempts
+	//!     (cruise 0, and SetActive(INACTIVE) which merely sleeps and wakes on contact) both hit.
+	//!   - The waypoint and the AI's already-computed, road-tangent path live in the AI components, not
+	//!     in physics, so they survive the freeze. Release (ResumeVehicle) puts the body back into
+	//!     SIMULATION and the AI drives the SAME order onward from a correct pose - never the fresh
+	//!     waypoint from a dead stop that live tracing pinned as the ~130-degree reverse jank.
+	//! Zeroes velocity first so no stored momentum snaps back on release. Idempotent via m_bHeld.
+	//! NOTE: non-recursive - freezes the vehicle's own chassis body, not its occupants. If a live test
+	//! shows the wheeled simulation still nudges the car, switch the call to
+	//! SCR_PhysicsHelper.ChangeSimulationState(state.m_Vehicle, SimulationState.COLLISION, true).
 	protected void HoldVehicle(EEF_CheckpointVehicleState state)
 	{
-		if (!state || !state.m_Vehicle)
+		if (!state || !state.m_Vehicle || state.m_bHeld)
 			return;
 
-		AICarMovementComponent movement = AICarMovementComponent.Cast(
-			state.m_Vehicle.FindComponent(AICarMovementComponent)
-		);
-		if (!movement)
+		Physics phys = state.m_Vehicle.GetPhysics();
+		if (phys)
 		{
-			DebugLog("Vehicle has no AICarMovementComponent - cannot hold in place.");
-			return;
+			phys.SetVelocity(vector.Zero);
+			phys.SetAngularVelocity(vector.Zero);
 		}
 
-		// TODO(#23): SetCruiseSpeed(0) is confirmed by live test to NOT stop the car (notes §13a) -
-		// the engine ignores a zero/negative cruise value, so cars currently blow through the gates.
-		// This needs a real halt that keeps the drive order live (handbrake on SCR_CarControllerComponent,
-		// or an AICarMovementComponent stop/SetWantedSpeed(0) call) - see notes §13a for the candidate
-		// list to confirm in Workbench autocomplete. The surrounding "never clear the order" structure
-		// stays; only this line changes. Left as-is (not guessed) to avoid a non-compiling build.
-		movement.SetCruiseSpeed(0);
+		SCR_PhysicsHelper.ChangeSimulationState(state.m_Vehicle, SimulationState.COLLISION);
 		state.m_bHeld = true;
+	}
+
+	//! Reverse of HoldVehicle: put the vehicle's physics body back into dynamic SIMULATION so the AI
+	//! resumes driving its still-live order from where it was frozen. Callers pair this with
+	//! ApplyCruiseSpeed() to set the resume speed (zone speed for a promotion, approach speed for a
+	//! release). Idempotent via m_bHeld - a no-op on a vehicle that was never frozen (e.g. a fresh
+	//! arrival taking a free slot).
+	protected void ResumeVehicle(EEF_CheckpointVehicleState state)
+	{
+		if (!state || !state.m_Vehicle || !state.m_bHeld)
+			return;
+
+		SCR_PhysicsHelper.ChangeSimulationState(state.m_Vehicle, SimulationState.SIMULATION);
+		state.m_bHeld = false;
 	}
 
 	//------------------------------------------------------------------------------------------------
