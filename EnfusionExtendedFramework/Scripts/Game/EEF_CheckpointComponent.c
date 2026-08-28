@@ -89,6 +89,7 @@ class EEF_CheckpointVehicleState
 	bool m_bReleasePending;							//! True once a release has been scheduled/requested for this vehicle, so it fires once (Stage 2 #18)
 	float m_fLastStallLogTime;						//! World time (s) LogQueueProgress last fired for this vehicle - throttles the stall diagnostic (#23)
 	vector m_LastPolledPos;							//! Vehicle position at the previous ArrivalTick poll - gate-crossing detection needs the pair (#23 redesign, restored - see notes section 12)
+	bool m_bHeld;									//! True while halted in place by the cruise governor (SetCruiseSpeed 0) with the drive order still live - never cleared/re-issued, so release is a pure speed change, not a replan from a dead stop (#23 fix, notes section 13)
 
 	void EEF_CheckpointVehicleState(IEntity vehicle, SCR_AIGroup group, float spawnTime, bool hasContraband)
 	{
@@ -105,6 +106,7 @@ class EEF_CheckpointVehicleState
 		m_bReleasePending = false;
 		m_fLastStallLogTime = spawnTime;
 		m_LastPolledPos = vehicle.GetOrigin();
+		m_bHeld = false;
 	}
 }
 
@@ -781,7 +783,14 @@ class EEF_CheckpointComponent : ScriptComponent
 
 					if (HasCrossedAssignedGate(state, vehiclePos))
 					{
-						ClearWaypoints(state.m_OccupantGroup);
+						// #23 fix (notes section 13): halt in place via the cruise governor at 0 km/h
+						// WITHOUT clearing the group's waypoint. The drive order toward the far despawn
+						// point - and the road-tangent path the AI already computed for it while moving -
+						// stays live, so promotion/release is a pure speed change, never a fresh order to
+						// a stopped car. Live tracing pinned "fresh waypoint from a dead stop -> ~3.75s
+						// stall -> ~130-degree turn-around into reverse" as the actual release jank; not
+						// clearing the order removes that path entirely.
+						HoldVehicle(state);
 
 						if (state.m_iQueueSlot == 0)
 						{
@@ -874,13 +883,15 @@ class EEF_CheckpointComponent : ScriptComponent
 		int slot = AssignQueueSlot();
 		if (slot < 0)
 		{
-			// Lane full - hold position here and retry once a slot frees. Clearing the waypoints
-			// stops the vehicle where it is instead of letting it plough into the checkpoint. Only
-			// do this once (when it still has an approach waypoint) to avoid re-clearing every tick.
-			if (HasWaypoints(state.m_OccupantGroup))
+			// Lane full - hold position here and retry once a slot frees. #23 fix (notes section 13):
+			// halt via the cruise governor at 0 km/h, keeping the drive order live, instead of
+			// clearing it - so when a slot frees the vehicle resumes with a speed change, not a fresh
+			// order to a stopped car. Guarded by m_bHeld so it only acts (and logs) once, not every
+			// tick.
+			if (!state.m_bHeld)
 			{
 				DebugLog("Checkpoint zone entered but the queue is full - holding position (increase max concurrent vehicles or reduce queue slot spacing so more gates fit).");
-				ClearWaypoints(state.m_OccupantGroup);
+				HoldVehicle(state);
 			}
 			return;
 		}
@@ -1009,14 +1020,15 @@ class EEF_CheckpointComponent : ScriptComponent
 		list.Insert(state);
 	}
 
-	//! Get a halted queued vehicle moving again after a promotion (#23 redesign, section 12). It was
-	//! stopped in place (ClearWaypoints) when it crossed its previous gate, with no waypoint left to
-	//! retarget - reissuing the same "drive toward the real end point" order resumes it without ever
-	//! tasking it toward an off-road point. ArrivalTick's gate-crossing check picks up its (now closer)
-	//! assigned gate on the next poll and halts it there in turn.
+	//! Get a halted queued vehicle moving again after a promotion (#23 fix, notes section 13). It was
+	//! halted in place by HoldVehicle (cruise 0) when it crossed its previous gate, with its drive
+	//! order toward the far despawn point STILL LIVE - so resuming is purely lifting the speed cap back
+	//! to the in-zone speed. No fresh waypoint, no replan: the vehicle just starts driving its existing
+	//! path forward again from a correct, road-tangent pose. ArrivalTick's gate-crossing check picks up
+	//! its (now closer) assigned gate on the next poll and halts it there in turn.
 	protected void ResumeTowardFront(EEF_CheckpointVehicleState state)
 	{
-		AssignMoveWaypoint(state.m_OccupantGroup, m_DespawnPoint.GetOrigin(), m_fWaypointCompletionRadius);
+		ApplyCruiseSpeed(state, m_fZoneSpeedKmh);
 	}
 
 	//------------------------------------------------------------------------------------------------
@@ -1059,11 +1071,13 @@ class EEF_CheckpointComponent : ScriptComponent
 			ReleaseVehicle(front);
 	}
 
-	//! Send a held vehicle on its way: leave the queue and drive to the exit. Uses a FRESH waypoint
-	//! (clear + add) rather than retargeting the slot waypoint. At the front the car's movement request
-	//! has already completed (it braked to a stop of its own accord), so merely moving the waypoint
-	//! origin issues no new drive order - the vehicle sits with requestCompleted=1 and twitches. A
-	//! fresh waypoint forces the group to re-task the driver with a new order.
+	//! Send a held vehicle on its way: leave the queue and drive to the exit. #23 fix (notes section
+	//! 13): does NOT issue a fresh waypoint. The vehicle was halted by HoldVehicle (cruise 0) with its
+	//! original drive order toward the despawn point still live and its path still computed, so release
+	//! is only ApplyCruiseSpeed() lifting the cap - it resumes the same order and drives its existing
+	//! path forward from a correct, road-tangent pose. This is the whole point: a fresh clear+add
+	//! waypoint to a stopped car is exactly what live tracing pinned as the release jank (a ~3.75s
+	//! stall then a ~130-degree turn into reverse); never re-tasking a stopped car removes that path.
 	protected void ReleaseVehicle(EEF_CheckpointVehicleState state)
 	{
 		if (!state || !state.m_Vehicle)
@@ -1074,15 +1088,16 @@ class EEF_CheckpointComponent : ScriptComponent
 
 		SetState(state, EEF_ECheckpointVehicleState.DEPARTING);
 
-		// Lift the in-zone slow-down - depart at the (controlled) approach speed rather than flooring
-		// it away from the checkpoint.
+		// Lift the hold and the in-zone slow-down in one step - depart at the (controlled) approach
+		// speed. The vehicle's original drive order toward the despawn point was never cleared, so this
+		// alone resumes it: it drives its existing, already-computed path forward from a road-tangent
+		// pose. No fresh waypoint is issued (#23 fix - see the method doc comment above).
 		ApplyCruiseSpeed(state, m_fApproachSpeedKmh);
 
-		AssignMoveWaypoint(state.m_OccupantGroup, m_DespawnPoint.GetOrigin(), m_fWaypointCompletionRadius);
 		DebugLog("Vehicle released - departing toward the exit.");
 
-		// Diagnostic: confirm the fresh order actually took (requestCompleted should now read 0 while
-		// it drives). Sampled a few times across the departure.
+		// Diagnostic: confirm the resumed order is actually driving (requestCompleted should read 0 and
+		// the vehicle should hold its road-tangent heading - no turn-around). Sampled across departure.
 		if (m_bDebugLog)
 		{
 			GetGame().GetCallqueue().CallLater(DumpDeparturePath, 300, false, state);
@@ -1415,9 +1430,43 @@ class EEF_CheckpointComponent : ScriptComponent
 		}
 
 		if (kmh > 0)
+		{
 			movement.SetCruiseSpeed(kmh);
+			// Any positive cruise speed lifts a hold - the vehicle is being resumed. The drive order
+			// was never cleared, so it simply starts moving along its existing path again (#23 fix).
+			state.m_bHeld = false;
+		}
 		else
 			movement.ResetCruiseSpeed();
+	}
+
+	//! True halt of a queued/held vehicle via the AI cruise governor at 0 km/h. Deliberately does NOT
+	//! clear or replace the group's waypoint: the drive order toward the far despawn point, and the
+	//! road-tangent path the AI already computed for it while moving, stay live. This is the #23
+	//! linchpin (notes section 9, item 4; finally applied in section 13). Live tracing on #23 pinned
+	//! the release jank precisely to a fresh waypoint being issued to a vehicle at a dead stop
+	//! (ClearWaypoints + AddWaypoint) - the AI stalled ~3.75s then swung ~130 degrees into reverse to
+	//! "re-enter" a freshly planned path, even with the target legitimately straight ahead. Holding in
+	//! place instead means release/promotion is only ever ApplyCruiseSpeed() lifting the cap - the AI
+	//! resumes the same order from a correct, road-tangent pose (the one case testing proved always
+	//! works cleanly: "the same car follows the same curve fine once it is already moving"), never
+	//! replanning from a stop. Idempotent - safe to call every poll while a vehicle stays held.
+	protected void HoldVehicle(EEF_CheckpointVehicleState state)
+	{
+		if (!state || !state.m_Vehicle)
+			return;
+
+		AICarMovementComponent movement = AICarMovementComponent.Cast(
+			state.m_Vehicle.FindComponent(AICarMovementComponent)
+		);
+		if (!movement)
+		{
+			DebugLog("Vehicle has no AICarMovementComponent - cannot hold in place.");
+			return;
+		}
+
+		movement.SetCruiseSpeed(0);
+		state.m_bHeld = true;
 	}
 
 	//------------------------------------------------------------------------------------------------

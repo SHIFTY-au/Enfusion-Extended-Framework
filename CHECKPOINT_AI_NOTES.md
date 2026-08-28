@@ -1,7 +1,8 @@
 # BUG: AI vehicle driver janks throughout the checkpoint zone (#18 blocker)
 
-**Status:** OPEN — sole blocker to completing Stage 2 (#18).
-**Branch:** `claude/issue-16-epic-tp3hy5`
+**Status:** FIX IMPLEMENTED (section 13) — awaiting a live Workbench pass. Sole
+blocker to completing Stage 2 (#18).
+**Branch:** `claude/arma-ai-driving-workaround-imfeex`
 
 ---
 
@@ -618,3 +619,86 @@ Workbench pass.
 **Rejected explicitly - do not revisit:** direct transform heading-snap
 ("100% immersion breaking") and per-slot authored headings (mission-maker
 authoring burden). See section 9.
+
+## §13. Root cause pinned, fixed by holding in place instead of re-tasking (2026-08-28)
+
+The final diagnostic trace posted to issue #23 (2026-08-18 09:47) is the
+breakthrough this whole thread was missing. Instrumenting the release path
+(250ms samples of position/yaw/gear/navlink/path-node-count) established, from
+live data rather than theory:
+
+- The stalling vehicle is **on the navmesh** (correction < ~0.1m throughout) and
+  **has a real computed path** (39-87 nodes) once actually driving.
+- `SCR_AIGroupUtilityComponent.m_OnMoveFailed` **never fires**, even on a run
+  where a released vehicle physically rammed the one behind it.
+- **The concrete failure:** for ~3.75s immediately after `ReleaseVehicle()`,
+  the vehicle sits at an *unchanged* position with `0 path node(s)` and
+  `requestCompleted=1`, then swings its heading ~130°+, **drops into reverse**
+  (gear 0, confirmed by engine audio), and ends up 1-2m from where it started -
+  i.e. it turns around near the stop line before driving off. This happened
+  **identically on two vehicles at very different separations** (10m vs 34m
+  apart), and with the despawn marker legitimately straight ahead down a road
+  that curves only ~6° over the gate spacing. So it is **not** collision
+  avoidance, **not** a misplaced target, **not** a hairpin, and **not**
+  off-navmesh.
+
+The one thing all of that leaves is the mechanism sections 2/3/9 already named
+and section 10 then talked itself out of: **the engine AI replanning a path
+from a dead stop.** `ReleaseVehicle()` (and, on the current HEAD, every
+gate-stop and every promotion) did `ClearWaypoints()` then a fresh
+`AssignMoveWaypoint()` on a stationary car. The AI treats "re-enter the start
+of my freshly-planned path" from a standstill as needing a turn-around, and
+reverses to do it. This is the exact same "fresh order from a dead stop" that
+§3 ruled out for approach and §2 contrasted against "the same car follows the
+same curve fine once it is already moving" - it was simply never removed from
+the *stop/resume* path, only from the *approach* path.
+
+**§9 item 4 already had the right fix ("the linchpin"): halt the vehicle in
+place WITHOUT cancelling its order, and resume the SAME order.** §10 dropped
+that requirement ("stop-and-cancel acceptable"), which is precisely what put
+the jank back. §13 restores it, using the lever §9 item 4 flagged to check:
+
+**What changed in `EEF_CheckpointComponent.c`:**
+- New `HoldVehicle(state)` - a true halt via `AICarMovementComponent.SetCruiseSpeed(0)`
+  that **does not touch the group's waypoint**. The drive order toward the far
+  despawn point, and the road-tangent path already computed for it while
+  moving, stay live; the car is just speed-capped to a stop. New `m_bHeld` flag
+  on the state tracks this (idempotent hold, and lets `ApplyCruiseSpeed()` clear
+  it on resume).
+- The whole component now issues **exactly one** `AssignMoveWaypoint()` per
+  vehicle, in `Dispatch()`, aimed at the despawn/exit point. Nothing clears or
+  re-adds it ever again:
+  - Gate crossing (`ArrivalTick` QUEUED/AT_FRONT) → `HoldVehicle()` instead of
+    `ClearWaypoints()`.
+  - Lane-full on zone entry (`EnterQueue`) → `HoldVehicle()` instead of
+    `ClearWaypoints()`.
+  - Promotion (`ResumeTowardFront`) → `ApplyCruiseSpeed(zone)` (lift the cap)
+    instead of a fresh `AssignMoveWaypoint()`.
+  - Release (`ReleaseVehicle`) → the `ApplyCruiseSpeed(approach)` it already did
+    now *is* the resume; the fresh `AssignMoveWaypoint()` is deleted.
+- Gate math, `HasCrossedAssignedGate`/`SignedDistanceAlongGate`, the far-target
+  routing from section 12, spacing/speed constants, and all diagnostics are
+  unchanged. This is purely "stop by governing speed, not by cancelling the
+  order" - the minimal change that removes the dead-stop replan from every
+  phase.
+
+Why this should hold where three rounds of radius/spacing tuning failed:
+resuming is now a pure speed change from a pose that is correct by construction
+(the car was mid-route on the real road when it was capped), which is the one
+case testing has *always* shown works cleanly. The AI is never handed a fresh
+order from a standstill, so it has nothing to turn around for.
+
+**The one remaining unknown - directly testable, not a compile blocker:**
+whether `SetCruiseSpeed(0)` genuinely *holds* a car at zero, versus being
+clamped to a minimum or treated as "unset." The pre-existing `ApplyCruiseSpeed`
+mapped `kmh <= 0` to `ResetCruiseSpeed()` (prefab default) purely for attribute
+semantics, so `SetCruiseSpeed(0)` itself was never actually exercised. If a live
+test shows held vehicles creep forward instead of stopping, the fix is a real
+halt call on `AICarMovementComponent` (check autocomplete for a `Stop`/`Halt`/
+`SetWantedSpeed(0)`-style method) swapped into `HoldVehicle()` - the surrounding
+"never clear the order" structure stays exactly as-is. Everything compiles and
+is a no-op-safe change until that's confirmed.
+
+**Not yet re-tested** - needs a live Workbench pass focused on: (a) do queued
+vehicles actually stop and stay put at their gates, and (b) does a released
+vehicle now drive straight off from the stop line with no reverse/turn-around.
