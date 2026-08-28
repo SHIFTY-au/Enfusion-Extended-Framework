@@ -1454,6 +1454,10 @@ class EEF_CheckpointComponent : ScriptComponent
 	//!     SIMULATION and the AI drives the SAME order onward from a correct pose - never the fresh
 	//!     waypoint from a dead stop that live tracing pinned as the ~130-degree reverse jank.
 	//! Zeroes velocity first so no stored momentum snaps back on release. Idempotent via m_bHeld.
+	//! Also DEACTIVATES the occupant AI (see SetGroupAIActive): the physics freeze holds the car, but on
+	//! its own it leaves the driver's behaviour tree running an unsatisfiable move order, so the AI
+	//! decides it is stuck and revs / tries to reverse out (visible/audible even though the frozen body
+	//! can't actually move). DeactivateAI() stops the tree issuing throttle, so the driver sits quietly.
 	//! NOTE: non-recursive - freezes the vehicle's own chassis body, not its occupants. If a live test
 	//! shows the wheeled simulation still nudges the car, switch the call to
 	//! SCR_PhysicsHelper.ChangeSimulationState(state.m_Vehicle, SimulationState.COLLISION, true).
@@ -1470,21 +1474,57 @@ class EEF_CheckpointComponent : ScriptComponent
 		}
 
 		SCR_PhysicsHelper.ChangeSimulationState(state.m_Vehicle, SimulationState.COLLISION);
+		SetGroupAIActive(state, false);
 		state.m_bHeld = true;
 	}
 
-	//! Reverse of HoldVehicle: put the vehicle's physics body back into dynamic SIMULATION so the AI
-	//! resumes driving its still-live order from where it was frozen. Callers pair this with
-	//! ApplyCruiseSpeed() to set the resume speed (zone speed for a promotion, approach speed for a
-	//! release). Idempotent via m_bHeld - a no-op on a vehicle that was never frozen (e.g. a fresh
-	//! arrival taking a free slot).
+	//! Reverse of HoldVehicle: put the vehicle's physics body back into dynamic SIMULATION, THEN
+	//! reactivate the occupant AI so it drives on. Order matters - the body must be dynamic again before
+	//! the driver's tree wakes and commands throttle. Callers pair this with ApplyCruiseSpeed() to set
+	//! the resume speed (zone speed for a promotion, approach speed for a release). Idempotent via
+	//! m_bHeld - a no-op on a vehicle that was never frozen (e.g. a fresh arrival taking a free slot).
+	//!
+	//! Reactivation RESTARTS the driver's behaviour (BT OnEnter re-issues the move request → the path is
+	//! recomputed), so this is technically a replan - but the group move waypoint was never cleared, so
+	//! the driver rebuilds intent straight back onto it, and it does so from the exact road-tangent pose
+	//! the freeze held it at mid-route. That clean pose is the whole point: the original #23 jank was a
+	//! replan from a BAD pose (arrived-imprecise / retasked); a replan from a mid-route tangent pose is
+	//! the "same car follows the same curve fine once moving" case. If a live test still shows a hitch
+	//! on release, the next lever is to also re-issue the move waypoint here explicitly.
 	protected void ResumeVehicle(EEF_CheckpointVehicleState state)
 	{
 		if (!state || !state.m_Vehicle || !state.m_bHeld)
 			return;
 
 		SCR_PhysicsHelper.ChangeSimulationState(state.m_Vehicle, SimulationState.SIMULATION);
+		SetGroupAIActive(state, true);
 		state.m_bHeld = false;
+	}
+
+	//! Activate or deactivate the AI of every occupant agent in the group (AIAgent.ActivateAI() /
+	//! DeactivateAI(), confirmed on the shipped headers). Deactivated agents suspend their behaviour
+	//! trees - the driver stops issuing throttle/steer, so a held vehicle sits quietly instead of
+	//! revving against the frozen body. The plan/order survives (it lives on the group + script AI
+	//! components, not the activation state), so reactivation rebuilds intent from the still-present
+	//! group waypoint. Deactivating the whole crew (not just the driver) avoids having to identify the
+	//! pilot agent and keeps the group from reacting to a partially-disabled roster.
+	protected void SetGroupAIActive(EEF_CheckpointVehicleState state, bool active)
+	{
+		if (!state || !state.m_OccupantGroup)
+			return;
+
+		array<AIAgent> agents = {};
+		state.m_OccupantGroup.GetAgents(agents);
+		foreach (AIAgent agent : agents)
+		{
+			if (!agent)
+				continue;
+
+			if (active)
+				agent.ActivateAI();
+			else
+				agent.DeactivateAI();
+		}
 	}
 
 	//------------------------------------------------------------------------------------------------

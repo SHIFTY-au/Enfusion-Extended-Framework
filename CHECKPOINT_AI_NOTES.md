@@ -799,11 +799,46 @@ final trace pinned as the ~130° reverse jank.
 `ChangeSimulationState` calls to `recursively = true` (freezes child bodies too,
 e.g. the wheeled sim) - noted inline on `HoldVehicle`.
 
-**Watch on the next test:** (a) queued cars stop dead at their gates and stay put
-even as the next car pulls up behind (no creep, no shove); (b) a released car
-drives straight off from the stop line with no reverse/turn-around; (c) the
-transition into COLLISION at ~8 km/h isn't visibly too abrupt; (d) after release,
-re-entering SIMULATION cleanly re-hands control to the AI driver (the order
-survived).
+**Live result (2026-08-28): the freeze works** - queued cars stop dead at their
+gates and stay put, no creep, no shove. ONE issue left (see §13d).
+
+### §13d. Occupant AI deactivated while held (2026-08-28)
+
+The freeze holds the car, but the driver's AI is still running an unsatisfiable
+move order, so it decides it's stuck and revs / tries to reverse out - visible and
+audible even though the frozen body can't move. Needed to quiet the driver.
+
+User pulled the shipped headers again (`data007.pak`). Decisive facts:
+- `AIControlComponent` / `AIAgent` both expose `ActivateAI(bool forced = true)` /
+  `DeactivateAI()` / `IsAIActivated()`. (The MCP/BIKI `void ActivateAI()` is stale;
+  the header wins.)
+- **Reactivation RESTARTS the behaviour, it does not resume.** Movement requests
+  are issued in BT task `OnEnter` (`SCR_AIFollowEntityPath` etc.), not held as a
+  durable command, so when the tree runs again the request is re-issued and the
+  path recomputed. Vanilla (`SCR_ChimeraAIAgent.OnLifeStateChanged`) even calls
+  `comms.ClearOrders()` on reactivate and rebuilds intent from GROUP messages -
+  "crucial to resume to group orders." So the **order survives** (it's a group
+  waypoint) but the **path is replanned**.
+- `AICarMovementComponent` has NO enable/disable/stop/output-mute - only
+  `SetCruiseSpeed`/`ResetCruiseSpeed` (and `SetCruiseSpeed(0)` is already confirmed
+  §13a not to stop the car). So there is no way to keep the AI active AND quiet;
+  quieting it requires deactivation, which implies a replan on release.
+- Handbrake (`CarControllerComponent.SetPersistentHandBrake` +
+  `VehicleWheeledSimulation.SetBreak`) holds the car but the AI keeps commanding
+  throttle into it (still revs) and can trip `SCR_AIRemoveStuckVehicle`. Rejected.
+
+**Chosen: keep the physics freeze AND `DeactivateAI()` the whole crew while held;
+on release unfreeze THEN `ActivateAI()`.** New `SetGroupAIActive(state, active)`
+iterates the occupant group's agents. Wired into `HoldVehicle` (deactivate after
+freezing) and `ResumeVehicle` (reactivate after unfreezing). This accepts the
+replan on release that we spent §13 avoiding - but bets it is now harmless
+*because the freeze guarantees a clean, road-tangent, mid-route pose* to replan
+from, which is exactly the "same car follows the same curve fine once moving" case
+(§2) rather than the bad arrived-imprecise/retasked pose the original jank hit.
+
+**Watch on the next test:** (a) the held driver now sits quietly (no rev/reverse);
+(b) on release it pulls straight away with no turn-around. If (b) still hitches,
+the next lever is to also re-issue the move waypoint explicitly in `ResumeVehicle`
+(reactivation replans anyway, so it costs nothing) or a short forward-point prime.
 
 **Not yet re-tested.**
