@@ -842,3 +842,59 @@ the next lever is to also re-issue the move waypoint explicitly in `ResumeVehicl
 (reactivation replans anyway, so it costs nothing) or a short forward-point prime.
 
 **Not yet re-tested.**
+
+## §14. Dressing props (cones/guardrails) and AI avoidance (2026-08-29)
+
+Placing a Game Master traffic cone in the lane made the AI drive erratically
+around it. Full investigation and the resolution:
+
+**Dead ends (confirmed, do not re-attempt):**
+- **No script lever to relax AI obstacle avoidance.** `AIPathfindingComponent`
+  exposes only `RayTrace`, `SetAreaCosts(ResourceName)`, `GetNavmeshComponent`,
+  `GetClosestPositionOnNavmesh` - no filter/flag setter. The BT nodes
+  `AITaskSetPathfindingFilters`/`AITaskResetPathfindingFilters` are native `Node`
+  subclasses; the filter work is engine-side, not bound to Enforce. So the
+  `RelaxVehicleObstacleAvoidance()` scaffold (a pathfinding-filter relax) could
+  never work and was removed.
+- `SetCruiseSpeed(0)` does not stop a car (§13a); handbrake is fought by the AI
+  (§13d) - both already ruled out.
+
+**Root cause (confirmed via MCP attribute dump of AICarMovementComponent, 39
+attributes):** the AI's obstacle avoidance is a **two-stage detection cone**, not
+a constant-width one. Near the bumper it fans out much wider:
+- `DetectionAngle` - far-field forward cone half-width.
+- `MinRangeDetectionAngle` - a SECOND, WIDER angle used within close range.
+- `MinDetectionRange` - the close range inside which `MinRangeDetectionAngle`
+  replaces `DetectionAngle`.
+- `ObstacleAvoidanceCheckDist` - how far ahead the avoidance check reaches.
+- `ObstacleAvoidanceTimer` - reaction persistence / re-eval cadence.
+A cone sitting ~1 m off the driving line is outside the far-field `DetectionAngle`
+but inside the wide near-field `MinRangeDetectionAngle`, so the car reacts to
+something visibly not on its path.
+
+**Fix (config, not code): a checkpoint vehicle prefab variant.** None of the 39
+attributes have runtime setters, so this cannot be done from script at spawn - it
+is a prefab-side change. Tune, in order:
+1. Reduce `MinRangeDetectionAngle` (drops off-axis close objects like the cone,
+   while the vehicle ahead in the queue - dead ahead, low angle - stays detected).
+2. Then `MinDetectionRange` if needed.
+3. Do NOT shrink `ObstacleAvoidanceCheckDist` / `Min Prediction Distance` - those
+   cut reaction to the car in front and would undo the queue spacing tuned via
+   `m_fQueueSlotSpacing`.
+`Collision detection layers` / `...preset` is the surgical alternative if the prop
+sits on a droppable collision layer.
+Point the checkpoint vehicle pool at the tuned variant(s). Curated variants
+instead of arbitrary base prefabs is the accepted cost.
+
+**Other useful attributes noted for later:**
+- `CruiseVehicleSpeedKmh` - the prefab default that `SetCruiseSpeed` overrides and
+  `ResetCruiseSpeed` restores.
+- `StopDistanceCoefficient` - scales computed stopping distance; a cleaner lever
+  for queue clearance than capping `m_fZoneSpeedKmh` at 8, worth trialling.
+- `Max Simple Steering Distance` - below this the car steers directly instead of
+  using a navmesh path (explains the occasional 0-node `GetCurrentPath`).
+
+**If curated variants are unacceptable (fully arbitrary pool required):** the only
+remaining route is script-driving the zone - deactivate the AI (already done for
+holds) and steer via `VehicleWheeledSimulation.SetThrottle/SetSteering/SetBreak`,
+bypassing engine avoidance entirely. Bigger build; not started.

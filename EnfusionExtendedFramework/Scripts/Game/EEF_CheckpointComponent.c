@@ -636,12 +636,6 @@ class EEF_CheckpointComponent : ScriptComponent
 		// Govern the approach speed so vehicles don't come in hot toward the queue.
 		ApplyCruiseSpeed(state, m_fApproachSpeedKmh);
 
-		// Relax obstacle avoidance for this vehicle's whole life in the checkpoint pipeline (#23, cone
-		// dressing). Checkpoint vehicles only ever exist between spawn and despawn inside the zone, so a
-		// permanent relax is correct - it lets them drive the authored lane and shove light dynamic
-		// props (GM-placed cones etc.) aside instead of refusing to path past them.
-		RelaxVehicleObstacleAvoidance(state);
-
 		DebugLog("Vehicle dispatched - approaching the checkpoint zone.");
 	}
 
@@ -1445,43 +1439,6 @@ class EEF_CheckpointComponent : ScriptComponent
 			movement.SetCruiseSpeed(kmh);
 		else
 			movement.ResetCruiseSpeed();
-	}
-
-	//! Relax obstacle avoidance so a checkpoint vehicle drives its authored lane and pushes light
-	//! dynamic props (GM-placed cones, etc.) aside instead of refusing to path past them (#23). The
-	//! cone is a runtime Game Master entity, so it can't be a baked static navmesh cut - it's a dynamic
-	//! obstacle, which is exactly what a per-vehicle pathfinding/avoidance relax can defeat.
-	//!
-	//! The pathfinding component is reached via the confirmed AICarMovementComponent.GetPathfindingComponent()
-	//! (AIBaseMovementComponent). The one remaining piece is the actual filter/avoidance setter + its
-	//! flag enum on AIPathfindingComponent - deliberately NOT guessed, because a wrong symbol fails the
-	//! whole mod's script compile and burns a Workbench cycle. Fill the marked line once the header is
-	//! confirmed; everything around it (retrieval, wiring into Dispatch, null-guards) is done.
-	protected void RelaxVehicleObstacleAvoidance(EEF_CheckpointVehicleState state)
-	{
-		if (!state || !state.m_Vehicle)
-			return;
-
-		AICarMovementComponent movement = AICarMovementComponent.Cast(
-			state.m_Vehicle.FindComponent(AICarMovementComponent)
-		);
-		if (!movement)
-		{
-			DebugLog("Vehicle has no AICarMovementComponent - cannot relax obstacle avoidance.");
-			return;
-		}
-
-		AIPathfindingComponent pathfinding = movement.GetPathfindingComponent();
-		if (!pathfinding)
-		{
-			DebugLog("Vehicle movement has no AIPathfindingComponent - cannot relax obstacle avoidance.");
-			return;
-		}
-
-		// TODO(#23): apply the obstacle-avoidance/pathfinding-filter relax here, e.g.
-		//   pathfinding.<SetFilters>( <flags that drop dynamic-obstacle avoidance / bias to road> );
-		// Waiting on the AIPathfindingComponent.c setter signature + flag enum. Confirmed reachable:
-		DebugLog("AIPathfindingComponent found - ready to relax obstacle avoidance once the setter is wired.");
 	}
 
 	//! True halt of a queued/held vehicle by taking its physics body OUT of dynamic simulation while
