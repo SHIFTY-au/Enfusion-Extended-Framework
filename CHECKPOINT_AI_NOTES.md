@@ -898,3 +898,22 @@ instead of arbitrary base prefabs is the accepted cost.
 remaining route is script-driving the zone - deactivate the AI (already done for
 holds) and steer via `VehicleWheeledSimulation.SetThrottle/SetSteering/SetBreak`,
 bypassing engine avoidance entirely. Bigger build; not started.
+
+### §14a. Concrete tuning target + gotchas (2026-08-29)
+
+Cleanest single change that needs no current-value readout: **set
+`MinRangeDetectionAngle` equal to `DetectionAngle`.** That collapses the two-stage
+cone into one uniform narrow forward cone - the near-field flare that catches an
+off-axis cone disappears, while the vehicle dead-ahead (low angle) stays detected
+so queue-following is preserved. If following degrades, nudge `MinRangeDetectionAngle`
+back up slightly; if the prop is still caught, then also shrink `MinDetectionRange`.
+
+Gotchas (from the MCP attribute dump / reference artifact):
+- Attribute strings mix conventions - spaced title case (`Min Prediction Distance`)
+  and camelCase (`ObstacleAvoidanceCheckDist`). Use each string EXACTLY as listed;
+  they are not interchangeable.
+- Enfusion MCP `wb_entity_modify`: `listProperties` needs `propertyPath`;
+  `setProperty` needs both `propertyPath` (e.g. "AICarMovementComponent") and
+  `propertyKey` (e.g. "MinRangeDetectionAngle"). No runtime setters exist, so
+  `setProperty` on a live entity is for TESTING only - the permanent change is an
+  inherited prefab variant overriding the nested AICarMovementComponent values.
