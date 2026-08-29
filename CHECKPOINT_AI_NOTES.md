@@ -1,7 +1,10 @@
 # BUG: AI vehicle driver janks throughout the checkpoint zone (#18 blocker)
 
-**Status:** FIX IMPLEMENTED (section 13) — awaiting a live Workbench pass. Sole
-blocker to completing Stage 2 (#18).
+**Status:** Driving jank FIXED (section 13, physics-hold + AI-deactivate). Prop
+failure ROOT-CAUSED (section 15) as runtime **navmesh carving** by placed props,
+not a driving bug — fix is asset/composition-side (author the lane, or dress with
+non-carving props), no EEF_CheckpointComponent.c change required. Sole remaining
+blocker to Stage 2 (#18) is authoring the checkpoint composition's drive lane.
 **Branch:** `claude/arma-ai-driving-workaround-imfeex`
 
 ---
@@ -917,3 +920,59 @@ Gotchas (from the MCP attribute dump / reference artifact):
   `propertyKey` (e.g. "MinRangeDetectionAngle"). No runtime setters exist, so
   `setProperty` on a live entity is for TESTING only - the permanent change is an
   inherited prefab variant overriding the nested AICarMovementComponent values.
+
+### §15. ROOT CAUSE of the prop failure: navmesh carving (2026-08-29)
+
+Two Workbench debug screenshots (navmesh + AI-path overlay) settled what the
+detection-cone theory could not:
+- **Clean road, no prop:** the road nav-path runs straight down the road surface.
+- **The instant ANY object is dropped on the road surface:** the navmesh boundary
+  (blue) pulls inward around the object and the generated AI path bends OFF the
+  road - out into the grass/verge - to route around the carved hole. A single
+  traffic cone does this.
+- **Authored roadblock compositions do NOT:** they ship **hand-defined pathing**
+  (their own nav-links / carve baked so a drivable lane survives). AI threads them
+  cleanly.
+
+So the failure was never (only) the AICarMovementComponent detection cone. The
+dominant mechanism is **runtime navmesh carving**: a dynamically placed prop that
+carries a navmesh obstacle cuts the walkable/drivable navmesh, and if its carve
+footprint spans the lane it *severs* the lane, leaving the pathfinder no on-road
+route - it goes off-road or fails. This is why:
+- narrowing the detection cone (§14/§14a) helps only at the margin - it changes
+  how the car reacts to an obstacle it can still route past, but cannot restore a
+  navmesh route the carve deleted.
+- a cone "down the middle" broke pathing entirely: two carves from the sides plus
+  one in the middle sever every on-road corridor.
+
+**Consequence for any waypoint/corridor idea:** issuing our own chain of
+road-centreline waypoints (sampled from the same `road.GetPoints()` polyline
+ComputeQueueGates already builds) pins the car to the road line under *mild*
+navmesh perturbation, but it CANNOT drive through a *severed* lane - the car still
+pathfinds between our waypoints on the carved navmesh. Corridor waypoints are a
+robustness upgrade, not a fix for lane-severing carves. Do not sell them as one.
+
+**The two real fixes (both on the asset/composition side, matching how the base
+game solves it):**
+1. **Dress with non-carving props.** A prop only deforms the path if it carries a
+   navmesh obstacle / cut. Decorative props with no navmesh cutout (or a cutout
+   small enough to leave a drivable gap) can be placed freely. Full-obstacle cones
+   sever lanes; that is an asset property of the cone, not a driving bug. Pick
+   dressing whose navmesh footprint leaves the lane open, or place obstacle-props
+   off the driving lane.
+2. **Ship the checkpoint as a composition with authored nav** - hand-placed
+   nav-links / a baked navmesh cut that defines the serpentine drive lane, exactly
+   like the roadblock compositions in the screenshot. Then the player's cosmetic
+   dressing sits on top and the AI follows the authored lane regardless. This is
+   the durable, dressing-agnostic answer and is how BI ships driveable obstacle
+   layouts.
+
+Detection-cone tuning (§14/§14a) still stands as a *secondary* lever - it makes
+the car less twitchy around props it CAN route past - but it is no longer the
+headline fix. The headline is: **carving props sever navmesh lanes; author the
+lane (composition nav-links) or dress with non-carving props.**
+
+**Status header updated accordingly.** The EEF_CheckpointComponent.c driving/queue
+code is not implicated by this finding - it is a map-authoring / asset matter. No
+code change is required for the prop issue; the optional corridor-waypoint
+robustness upgrade is available on request but will not be built speculatively.
