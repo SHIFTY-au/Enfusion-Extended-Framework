@@ -972,6 +972,50 @@ the car less twitchy around props it CAN route past - but it is no longer the
 headline fix. The headline is: **carving props sever navmesh lanes; author the
 lane (composition nav-links) or dress with non-carving props.**
 
+### §16. CHOSEN DIRECTION: non-navmesh-affecting dressing (2026-08-30)
+
+Two further test results from the user closed off the other routes:
+- Confirmed: placing an object DOES adjust the navmesh at runtime - the road path
+  re-routes around it (not just avoidance). Carving is real and dynamic.
+- The pre-authored roadblock **composition is NOT reliable either** - the engine
+  vehicle AI still struggles to navigate it even with hand-defined pathing. So the
+  "author nav-links in a composition" route (§15 fix 2) is downgraded: authored
+  nav does not rescue the flaky low-speed vehicle brain in tight clutter.
+
+That leaves two viable ends:
+1. **Script-drive the zone** (deactivate AI in the corridor, pure-pursuit steer
+   along the road-centreline polyline via VehicleWheeledSimulation
+   SetThrottle/SetSteering/SetBrake). Fully immune to carving + the vehicle brain.
+   Bigger build; needs a Phase-1 proof-of-life first (does sim input apply with AI
+   off?). Documented, not built. Fallback if route 2 is insufficient.
+2. **Dress with non-navmesh-affecting props (USER'S CHOSEN DIRECTION).** If the
+   dressing doesn't carve, the road path stays intact and the AI drives the clean
+   line straight through - no reliance on pathing-through-clutter at all.
+
+**The design fork route 2 forces:** a prop cannot both "not affect navmesh" AND
+"be an obstacle the AI weaves around" - opposites. So, per prop:
+- Cosmetic (cones/signs/clutter) -> make it NOT affect navmesh. AI ignores it,
+  drives the clean road line. Realistic (a car drives over a cone).
+- Real barriers (guardrails/jersey walls) -> keep them OFF the drive lane; use them
+  to define the lane edges, not sever it. They may carve as long as a gap remains.
+
+**How to author a non-navmesh-affecting prop (confirm exact names in-editor;
+egress blocked here):** navmesh contribution follows the object's COLLISION, so:
+1. Strip the collider entirely -> pure-visual variant (best for cones; vehicles
+   pass through, nothing to carve).
+2. Move its collision to a physics/interaction layer that navmesh generation
+   ignores (still bumps players, doesn't carve).
+3. Remove an explicit navmesh-cut/obstacle component on the variant if present.
+Test rig already in hand: the navmesh debug overlay from the screenshots - drop
+the variant on the road, confirm the blue boundary doesn't move.
+Fastest path: overlay-test existing collision-light Reforger decorative props,
+keep the ones that don't shift the navmesh; only build stripped variants where
+needed.
+
+**EEF_CheckpointComponent.c is still not implicated** by route 2 - it remains a
+map-authoring/asset matter. Script-drive (route 1) is the only path that would add
+component code, and only if non-carving dressing proves insufficient in practice.
+
 **Status header updated accordingly.** The EEF_CheckpointComponent.c driving/queue
 code is not implicated by this finding - it is a map-authoring / asset matter. No
 code change is required for the prop issue; the optional corridor-waypoint
