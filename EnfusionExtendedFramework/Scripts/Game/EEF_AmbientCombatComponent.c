@@ -13,7 +13,7 @@
 //   - The server is the only brain. It never plays audio itself (dedicated).
 //   - Each burst / barrage is ONE unreliable broadcast RPC carrying: sound
 //     class index, world position, shot count, shot interval, a seed and a
-//     start time stamped slightly in the future (Replication.Time() + lead).
+//     start time stamped slightly in the future (server timestamp + lead).
 //   - Every client expands that RPC locally into individual shots against the
 //     replicated clock, so all players hear the same thing at the same time.
 //     Shot-to-shot jitter and scatter come from a tiny integer LCG seeded by the
@@ -44,7 +44,11 @@
 // Written without access to a Workbench compile. These API usages are from
 // documentation / memory and are the first things to check if it fails to
 // compile or behaves oddly:
-//   - Replication.Time()                       replicated clock used for sync
+//   - ChimeraWorld.GetServerTimestamp() + WorldTimestamp.PlusMilliseconds() /
+//     DiffMilliseconds()                       shared clock used for sync. (Replication.Time()
+//     does not exist in current builds - confirmed by a Workbench compile error.)
+//     A WorldTimestamp is passed as an RPC parameter; if that is rejected at runtime,
+//     fall back to sending a relative lead in ms (loses per-client latency equalisation).
 //   - RplSession.Mode() / RplMode.Dedicated    dedicated-server detection
 //   - [RplRpc(RplChannel.Unreliable, RplRcver.Broadcast)] with Rpc()
 //     Broadcast is assumed NOT to run on the sending authority, so the
@@ -614,7 +618,11 @@ class EEF_AmbientCombatComponent : ScriptComponent
 	//! non-dedicated host (listen server) the host is also a player, so it plays locally too.
 	protected void BroadcastPlay(int classIndex, vector pos, int count, int intervalMs, int seed, float scatter)
 	{
-		float startTime = Replication.Time() + SYNC_LEAD_MS;
+		ChimeraWorld world = ChimeraWorld.CastFrom(GetGame().GetWorld());
+		if (!world)
+			return;
+
+		WorldTimestamp startTime = world.GetServerTimestamp().PlusMilliseconds(SYNC_LEAD_MS);
 		Rpc(RpcDo_Play, classIndex, pos, count, intervalMs, seed, scatter, startTime);
 
 		if (RplSession.Mode() != RplMode.Dedicated)
@@ -626,9 +634,13 @@ class EEF_AmbientCombatComponent : ScriptComponent
 	//------------------------------------------------------------------------------------------------
 	//! CLIENT. Expands one burst/barrage into individual scheduled shots against the replicated clock.
 	[RplRpc(RplChannel.Unreliable, RplRcver.Broadcast)]
-	protected void RpcDo_Play(int classIndex, vector pos, int count, int intervalMs, int seed, float scatter, float startTime)
+	protected void RpcDo_Play(int classIndex, vector pos, int count, int intervalMs, int seed, float scatter, WorldTimestamp startTime)
 	{
 		if (RplSession.Mode() == RplMode.Dedicated)
+			return;
+
+		ChimeraWorld world = ChimeraWorld.CastFrom(GetGame().GetWorld());
+		if (!world)
 			return;
 
 		if (!m_aSoundClasses || classIndex < 0 || classIndex >= m_aSoundClasses.Count())
@@ -637,7 +649,8 @@ class EEF_AmbientCombatComponent : ScriptComponent
 		if (IsBeyondAudibleRange(pos))
 			return;
 
-		float baseDelayMs = startTime - Replication.Time();
+		// Milliseconds from "now" (on the shared server clock) until the burst's start stamp.
+		float baseDelayMs = startTime.DiffMilliseconds(world.GetServerTimestamp());
 		int state = seed;
 
 		for (int i = 0; i < count; i++)
