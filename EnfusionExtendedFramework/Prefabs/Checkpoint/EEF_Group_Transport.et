@@ -1,0 +1,5 @@
+SCR_AIGroup : "{000CD338713F2B5A}Prefabs/AI/Groups/Group_Base.et" {
+ ID "EEF0C0DE000A0002"
+ coords 0 0 0
+ m_faction "CIV"
+}

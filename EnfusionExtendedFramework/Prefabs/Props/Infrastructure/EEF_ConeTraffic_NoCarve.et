@@ -1,0 +1,7 @@
+GenericEntity : "{AEF9A26C2F0334B3}Prefabs/Props/Infrastructure/ConeTraffic/ConeTraffic_01_base.et" {
+ components {
+  RigidBody "{5872F0EB7DFB5A9D}" {
+   ModelGeometry 0
+  }
+ }
+}

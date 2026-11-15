@@ -1,0 +1,29 @@
+Vehicle : "{433436E250FC8C65}Prefabs/Vehicles/Wheeled/T601/T601_base.et" {
+ ID "BBCBA43A9778AE21"
+ components {
+  ActionsManagerComponent "{C97BE5489221AE18}" {
+   additionalActions {
+    EEF_ClearVehicleAction "{EEF0C0DE00001205}" {
+     ParentContextList {
+      "door_l01"
+     }
+     UIInfo SCR_ActionUIInfo "{EEF0C0DE00001208}" {
+      Name "Clear vehicle"
+      m_sIconName "use"
+     }
+     "Sort Priority" 1
+    }
+    EEF_DetainVehicleAction "{EEF0C0DE00001206}" {
+     ParentContextList {
+      "door_l01"
+     }
+     UIInfo SCR_ActionUIInfo "{EEF0C0DE00001209}" {
+      Name "Detain vehicle"
+      m_sIconName "use"
+     }
+     "Sort Priority" 2
+    }
+   }
+  }
+ }
+}

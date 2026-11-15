@@ -1,0 +1,9 @@
+GenericEntity : "{EEF0C0DE00000001}Prefabs/Checkpoint/EEF_Checkpoint_Base.et" {
+ ID "EEF0C0DE00002001"
+ {
+  GenericEntity : "{EEF0B10C0000A0C1}Prefabs/Props/Infrastructure/EEF_Roadblock_Small.et" {
+   ID "EEF0C0DE00002101"
+   coords 0 0 0
+  }
+ }
+}

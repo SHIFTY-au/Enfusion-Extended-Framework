@@ -1,0 +1,29 @@
+Vehicle : "{767D49C35F87DC1A}Prefabs/Vehicles/Wheeled/UAZ452/UAZ452_cargo_CIV_randomized.et" {
+ ID "BBCBA43A9778AE21"
+ components {
+  ActionsManagerComponent "{C97BE5489221AE18}" {
+   additionalActions {
+    EEF_ClearVehicleAction "{EEF0C0DE00001305}" {
+     ParentContextList {
+      "door_l01"
+     }
+     UIInfo SCR_ActionUIInfo "{EEF0C0DE00001308}" {
+      Name "Clear vehicle"
+      m_sIconName "use"
+     }
+     "Sort Priority" 1
+    }
+    EEF_DetainVehicleAction "{EEF0C0DE00001306}" {
+     ParentContextList {
+      "door_l01"
+     }
+     UIInfo SCR_ActionUIInfo "{EEF0C0DE00001309}" {
+      Name "Detain vehicle"
+      m_sIconName "use"
+     }
+     "Sort Priority" 2
+    }
+   }
+  }
+ }
+}

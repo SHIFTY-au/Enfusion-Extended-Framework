@@ -1,0 +1,29 @@
+Vehicle : "{5546E82A1C45233D}Prefabs/Vehicles/Wheeled/V2101/V2101_base.et" {
+ ID "BBCBA43A9778AE21"
+ components {
+  ActionsManagerComponent "{C97BE5489221AE18}" {
+   additionalActions {
+    EEF_ClearVehicleAction "{EEF0C0DE00001705}" {
+     ParentContextList {
+      "door_l01"
+     }
+     UIInfo SCR_ActionUIInfo "{EEF0C0DE00001708}" {
+      Name "Clear vehicle"
+      m_sIconName "use"
+     }
+     "Sort Priority" 1
+    }
+    EEF_DetainVehicleAction "{EEF0C0DE00001706}" {
+     ParentContextList {
+      "door_l01"
+     }
+     UIInfo SCR_ActionUIInfo "{EEF0C0DE00001709}" {
+      Name "Detain vehicle"
+      m_sIconName "use"
+     }
+     "Sort Priority" 2
+    }
+   }
+  }
+ }
+}

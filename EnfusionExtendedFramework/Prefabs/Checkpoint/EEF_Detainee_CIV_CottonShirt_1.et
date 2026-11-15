@@ -1,0 +1,50 @@
+SCR_ChimeraCharacter : "{8C7093AF368F496A}Prefabs/Characters/Factions/CIV/GenericCivilians/Character_CIV_CottonShirt_1.et" {
+ ID "EEF0C0DE000B0001"
+ components {
+  ActionsManagerComponent "{520EA1D2F659CE02}" {
+   additionalActions {
+    EEF_DetaineeRecruitAction "{EEF0C0DE000A1009}" {
+     ParentContextList {
+      "Head"
+     }
+     UIInfo SCR_ActionUIInfo "{EEF0C0DE000A2009}" {
+      Name "Take into squad"
+      m_sIconName "use"
+     }
+     "Sort Priority" 1
+    }
+    EEF_DetaineeDropAction "{EEF0C0DE000A100A}" {
+     ParentContextList {
+      "Head"
+     }
+     UIInfo SCR_ActionUIInfo "{EEF0C0DE000A200A}" {
+      Name "Drop unit"
+      m_sIconName "use"
+     }
+     "Sort Priority" 2
+    }
+    EEF_DetaineeSitAction "{EEF0C0DE000A1001}" {
+     ParentContextList {
+      "Head"
+     }
+     UIInfo SCR_ActionUIInfo "{EEF0C0DE000A2001}" {
+      Name "Stand up / sit down"
+      m_sIconName "use"
+     }
+     "Sort Priority" 3
+    }
+    EEF_DetaineeRoadsideAction "{EEF0C0DE000A1002}" {
+     ParentContextList {
+      "Head"
+     }
+     UIInfo SCR_ActionUIInfo "{EEF0C0DE000A2002}" {
+      Name "Send to roadside"
+      m_sIconName "use"
+     }
+     "Sort Priority" 4
+    }
+   }
+  }
+ }
+ coords 0 0 0
+}

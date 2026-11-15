@@ -1,0 +1,26 @@
+GenericEntity {
+ ID "EEF0B10C0000B001"
+ coords 0 0 0
+ {
+  GenericEntity : "{EEF0B10C0000D001}Prefabs/Props/Infrastructure/EEF_RoadblockPiece_Barrier.et" {
+   ID "EEF0B10C0000B101"
+   coords 2.2 0 0
+  }
+  GenericEntity : "{EEF0B10C0000D001}Prefabs/Props/Infrastructure/EEF_RoadblockPiece_Barrier.et" {
+   ID "EEF0B10C0000B102"
+   coords -4.4 0 0
+  }
+  GenericEntity : "{EEF0B10C0000D002}Prefabs/Props/Infrastructure/EEF_RoadblockPiece_Cone.et" {
+   ID "EEF0B10C0000B103"
+   coords -1.8 0 -4
+  }
+  GenericEntity : "{EEF0B10C0000D002}Prefabs/Props/Infrastructure/EEF_RoadblockPiece_Cone.et" {
+   ID "EEF0B10C0000B104"
+   coords -1.8 0 -8
+  }
+  GenericEntity : "{EEF0B10C0000D002}Prefabs/Props/Infrastructure/EEF_RoadblockPiece_Cone.et" {
+   ID "EEF0B10C0000B105"
+   coords -1.8 0 4
+  }
+ }
+}
