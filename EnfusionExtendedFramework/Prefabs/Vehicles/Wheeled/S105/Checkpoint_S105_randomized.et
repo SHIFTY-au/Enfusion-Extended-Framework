@@ -1,0 +1,96 @@
+Vehicle : "{DA79E34823120087}Prefabs/Vehicles/Wheeled/S105/S105_base.et" {
+ ID "BBCBA43A9778AE21"
+ components {
+  MeshObject "{51DAA09FEFBFC0E7}" {
+   Materials {
+    MaterialAssignClass "{6A3A4EDBE79ACE21}" {
+     SourceMaterial "S105Body_mat"
+     AssignedMaterial "{4856BEF97E6258E3}Assets/Vehicles/Wheeled/S105/Data/S105Body_mat_yellow.emat"
+    }
+    MaterialAssignClass "{6A3A4EDBE79ACE3D}" {
+     SourceMaterial "S105Body_mat_int_FC800CBC7671EDFD"
+     AssignedMaterial "{2DC77D820D9DDB24}Assets/Vehicles/Wheeled/S105/Data/S105Body_mat_yellow_int.emat"
+    }
+   }
+  }
+  SCR_EditableVehicleComponent "{50DEB7C26B5EB312}" {
+   m_UIInfo SCR_EditableVehicleUIInfo "{5298E609432D192D}" {
+    Name "#AR-Vehicle_Skoda105_Randomized_Name"
+    Icon "{C431FD61793AA13F}UI/Textures/Editor/EditableEntities/Characters/EditableEntity_Random.edds"
+    m_Image "{44A4AFCD015B61DC}UI/Textures/EditorPreviews/Vehicles/Wheeled/S105/S105_randomized.edds"
+    m_aAuthoredLabels {
+     TRAIT_RANDOMIZED ENTITYTYPE_VEHICLE FACTION_CIV TRAIT_PASSENGERS_SMALL VEHICLE_CAR TRAIT_SUPPLYSTORAGE_SMALL
+    }
+   }
+   m_VariantData SCR_EditableEntityVariantData "{6A3A4EDBE79ACE0B}" {
+    m_bRandomizeDefaultVariant 0
+    m_aVariants {
+     SCR_EditableEntityVariant "{6A3A4EDBE79ACE09}" {
+      m_sVariantPrefab "{54C3CC22DEBD57BE}Prefabs/Vehicles/Wheeled/S105/S105_beige.et"
+     }
+     SCR_EditableEntityVariant "{6A3A4EDBE79ACE0D}" {
+      m_sVariantPrefab "{9C3269FB43F989A3}Prefabs/Vehicles/Wheeled/S105/S105_darkblue.et"
+     }
+     SCR_EditableEntityVariant "{6A3A4EDBE79ACE02}" {
+      m_sVariantPrefab "{A1CD41DFE0C93CAD}Prefabs/Vehicles/Wheeled/S105/S105_darkbrown.et"
+     }
+     SCR_EditableEntityVariant "{6A3A4EDBE79ACE01}" {
+      m_sVariantPrefab "{8000A0F649FB4B0D}Prefabs/Vehicles/Wheeled/S105/S105_darkred.et"
+     }
+     SCR_EditableEntityVariant "{6A3A4EDBE79ACE06}" {
+      m_sVariantPrefab "{AD80FB47D868C775}Prefabs/Vehicles/Wheeled/S105/S105_green.et"
+     }
+     SCR_EditableEntityVariant "{6A3A4EDBE79ACE05}" {
+      m_sVariantPrefab "{8EB38BBD860DA06E}Prefabs/Vehicles/Wheeled/S105/S105_lightblue.et"
+     }
+     SCR_EditableEntityVariant "{6A3A4EDBE79ACE18}" {
+      m_sVariantPrefab "{321016E0F9361A22}Prefabs/Vehicles/Wheeled/S105/S105_lightgreen.et"
+     }
+     SCR_EditableEntityVariant "{6A3A4EDBE79ACE1E}" {
+      m_sVariantPrefab "{85F0BD6AF0F42D6D}Prefabs/Vehicles/Wheeled/S105/S105_red.et"
+     }
+     SCR_EditableEntityVariant "{6A3A4EDBE79ACE1F}" {
+      m_sVariantPrefab "{63880E311299A016}Prefabs/Vehicles/Wheeled/S105/S105_white.et"
+     }
+     SCR_EditableEntityVariant "{6A3A4EDBE79ACE1C}" {
+      m_sVariantPrefab "{A6B0D2923262E755}Prefabs/Vehicles/Wheeled/S105/S105_yellow.et"
+     }
+    }
+   }
+  }
+  ChimeraAIVehicleControlComponent "{61C2E46781A66E82}" {
+   components {
+    AICarMovementComponent "{61C2E46796C28D80}" {
+     "Collision detection layers" 0x142 0
+     ObstacleAvoidanceCheckDist 5
+     DetectionAngle 20
+     MinRangeDetectionAngle 30
+    }
+   }
+  }
+  ActionsManagerComponent "{C97BE5489221AE18}" {
+   additionalActions {
+    EEF_ClearVehicleAction "{EEF0C0DE00007005}" {
+     ParentContextList {
+      "door_l01"
+     }
+     UIInfo SCR_ActionUIInfo "{EEF0C0DE00007008}" {
+      Name "Clear vehicle"
+      m_sIconName "use"
+     }
+     "Sort Priority" 1
+    }
+    EEF_DetainVehicleAction "{EEF0C0DE00007006}" {
+     ParentContextList {
+      "door_l01"
+     }
+     UIInfo SCR_ActionUIInfo "{EEF0C0DE00007009}" {
+      Name "Detain vehicle"
+      m_sIconName "use"
+     }
+     "Sort Priority" 2
+    }
+   }
+  }
+ }
+}

@@ -1,0 +1,50 @@
+SCR_ChimeraCharacter : "{2CDFBF355F3410DD}Prefabs/Characters/Factions/CIV/Dockworker/Character_CIV_Dockworker_2.et" {
+ ID "EEF0C0DE000B0021"
+ components {
+  ActionsManagerComponent "{520EA1D2F659CE02}" {
+   additionalActions {
+    EEF_DetaineeRecruitAction "{EEF0C0DE000A1009}" {
+     ParentContextList {
+      "Head"
+     }
+     UIInfo SCR_ActionUIInfo "{EEF0C0DE000A2009}" {
+      Name "Take into squad"
+      m_sIconName "use"
+     }
+     "Sort Priority" 1
+    }
+    EEF_DetaineeDropAction "{EEF0C0DE000A100A}" {
+     ParentContextList {
+      "Head"
+     }
+     UIInfo SCR_ActionUIInfo "{EEF0C0DE000A200A}" {
+      Name "Drop unit"
+      m_sIconName "use"
+     }
+     "Sort Priority" 2
+    }
+    EEF_DetaineeSitAction "{EEF0C0DE000A1001}" {
+     ParentContextList {
+      "Head"
+     }
+     UIInfo SCR_ActionUIInfo "{EEF0C0DE000A2001}" {
+      Name "Stand up / sit down"
+      m_sIconName "use"
+     }
+     "Sort Priority" 3
+    }
+    EEF_DetaineeRoadsideAction "{EEF0C0DE000A1002}" {
+     ParentContextList {
+      "Head"
+     }
+     UIInfo SCR_ActionUIInfo "{EEF0C0DE000A2002}" {
+      Name "Send to roadside"
+      m_sIconName "use"
+     }
+     "Sort Priority" 4
+    }
+   }
+  }
+ }
+ coords 0 0 0
+}

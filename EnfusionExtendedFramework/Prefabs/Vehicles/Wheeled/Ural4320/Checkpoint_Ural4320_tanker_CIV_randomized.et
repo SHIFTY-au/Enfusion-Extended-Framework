@@ -1,0 +1,29 @@
+Vehicle : "{DCAF0585D17B917A}Prefabs/Vehicles/Wheeled/Ural4320/Ural4320_tanker_CIV_randomized.et" {
+ ID "BBCBA43A9778AE21"
+ components {
+  ActionsManagerComponent "{C97BE5489221AE18}" {
+   additionalActions {
+    EEF_ClearVehicleAction "{EEF0C0DE00001605}" {
+     ParentContextList {
+      "door_l01"
+     }
+     UIInfo SCR_ActionUIInfo "{EEF0C0DE00001608}" {
+      Name "Clear vehicle"
+      m_sIconName "use"
+     }
+     "Sort Priority" 1
+    }
+    EEF_DetainVehicleAction "{EEF0C0DE00001606}" {
+     ParentContextList {
+      "door_l01"
+     }
+     UIInfo SCR_ActionUIInfo "{EEF0C0DE00001609}" {
+      Name "Detain vehicle"
+      m_sIconName "use"
+     }
+     "Sort Priority" 2
+    }
+   }
+  }
+ }
+}

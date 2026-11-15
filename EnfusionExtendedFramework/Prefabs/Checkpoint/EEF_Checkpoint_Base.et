@@ -1,0 +1,21 @@
+GenericEntity {
+ ID "EEF0C0DE00001001"
+ components {
+  EEF_CheckpointComponent "{EEF0C0DE0000C001}" {
+   m_fSpawnIntervalMin 12
+   m_fSpawnIntervalMax 20
+   m_iMaxConcurrent 4
+  }
+ }
+ coords 0 0 0
+ {
+  EEF_CheckpointSpawnMarker : "{EEF0C0DE00000005}Prefabs/Checkpoint/EEF_Checkpoint_SpawnMarker.et" {
+   ID "EEF0C0DE00001101"
+   coords 0 0 -150
+  }
+  EEF_CheckpointDespawnMarker : "{EEF0C0DE00000006}Prefabs/Checkpoint/EEF_Checkpoint_DespawnMarker.et" {
+   ID "EEF0C0DE00001102"
+   coords 0 0 150
+  }
+ }
+}
