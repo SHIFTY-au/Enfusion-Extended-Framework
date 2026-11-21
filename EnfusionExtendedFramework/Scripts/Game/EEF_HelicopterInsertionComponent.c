@@ -418,16 +418,20 @@ class EEF_HelicopterInsertionComponent : ScriptComponent
 				return;
 			}
 
-			// Since game 1.9, SCR_AIGroup no longer creates its members inside SpawnEntityPrefab.
-			// They are materialised later by SCR_AIWorld's spawn queue (possibly one member per
-			// queue tick), and SCR_AIGroup.IsInitializing() now always returns false. So an empty
-			// group here is normal, not a misconfiguration. Hook the completion event (the queue
-			// still fires it) and also poll every tick, seating members as soon as they appear so
-			// nobody is left standing in mid-air under an IN_AIR helicopter.
+			// The group was spawned empty (see SpawnCargoGroup). Spawn its members ourselves, straight into
+			// CARGO seats. Since game 1.9 a group's own members are materialised later by SCR_AIWorld's queue
+			// on the terrain or water under the group, which for an IN_AIR helicopter is the sea.
 			m_mBoardOrderTime.Clear();
-			m_CargoGroup.GetOnAllDelayedEntitySpawned().Insert(OnGroupReadyToBoard);
-			DebugLog("Cargo group spawned - waiting for its members to materialise.");
-			SeatNewMembersAndCheckComplete();
+			int spawnedMembers = SpawnAndSeatCargoMembers();
+			if (spawnedMembers == 0)
+			{
+				Print("[EEF Helicopter] ERROR: Cargo group prefab has no unit prefab slots to spawn. Aborting.", LogLevel.ERROR);
+				AbortToIdle();
+				return;
+			}
+
+			DebugLog(string.Format("Cargo group: spawned %1 member(s) directly into CARGO seats.", spawnedMembers));
+			m_bBoardingInitiated = true;
 			return;
 		}
 
@@ -663,7 +667,12 @@ class EEF_HelicopterInsertionComponent : ScriptComponent
 		Math3D.MatrixIdentity4(spawnParams.Transform);
 		spawnParams.Transform[3] = GetOwner().GetOrigin();
 
+		// Spawn the group without its members - SpawnAndSeatCargoMembers creates them at the helicopter.
+		// Same pattern as SCR_ScenarioFrameworkSlotAI. The flag is consumed by the group's EOnInit;
+		// reset it anyway so it can never leak to the next group spawned elsewhere.
+		SCR_AIGroup.IgnoreSpawning(true);
 		IEntity spawned = GetGame().SpawnEntityPrefab(groupResource, GetGame().GetWorld(), spawnParams);
+		SCR_AIGroup.IgnoreSpawning(false);
 		SCR_AIGroup group = SCR_AIGroup.Cast(spawned);
 		if (!group)
 		{
@@ -673,6 +682,65 @@ class EEF_HelicopterInsertionComponent : ScriptComponent
 
 		DebugLog("Cargo group spawned at helicopter origin.");
 		return group;
+	}
+
+	//! Spawns the cargo group's unit prefabs directly into free CARGO seats with vanilla
+	//! BaseCompartmentSlot.SpawnCharacterInCompartment (the default-crew spawner), which seats each one with a
+	//! synchronous GetInVehicle and adds it to the cargo group. MoveInVehicle is not usable here: it is a request
+	//! the character carries out itself. Either way a character spawned kilometres from any player is
+	//! deactivated by the AI LOD system and never completes the get-in, so each one is pinned to LOD 0
+	//! (PinAgentLOD). Units beyond the free seats are not spawned.
+	//! Returns the number of members seated.
+	protected int SpawnAndSeatCargoMembers()
+	{
+		if (!m_CargoGroup || !m_CargoGroup.m_aUnitPrefabSlots)
+			return 0;
+
+		SCR_BaseCompartmentManagerComponent compMgr = FindCompartmentManager();
+		if (!compMgr)
+			return 0;
+
+		array<BaseCompartmentSlot> freeSlots = {};
+		compMgr.GetFreeCompartmentsOfType(freeSlots, ECompartmentType.CARGO);
+
+		// Register the helicopter as this group's vehicle (as SCR_AIGroup.AddVehiclesStatic does), so the
+		// group's vehicle logic treats the cargo seats as its own rather than ordering the members out.
+		SCR_AIGroupUtilityComponent utility = SCR_AIGroupUtilityComponent.Cast(m_CargoGroup.FindComponent(SCR_AIGroupUtilityComponent));
+		IEntity vehicleUsageOwner;
+		SCR_AIVehicleUsageComponent vehicleUsage = SCR_AIVehicleUsageComponent.FindOnNearestParent(GetOwner(), vehicleUsageOwner);
+		if (utility && utility.m_VehicleMgr && vehicleUsage)
+			utility.m_VehicleMgr.TryAddVehicle(vehicleUsage);
+		else
+			DebugLog("Could not register the helicopter as the cargo group's vehicle.");
+
+		// Keep the group (and so its members) from being treated as low-priority while far from players.
+		m_CargoGroup.SetImportance(SCR_EAISpawnImportance.CRITICAL);
+
+		int spawned = 0;
+		int seatIndex = 0;
+		foreach (ResourceName unitPrefab : m_CargoGroup.m_aUnitPrefabSlots)
+		{
+			if (seatIndex >= freeSlots.Count())
+			{
+				Print(string.Format("[EEF Helicopter] WARNING: Cargo group has more units than the %1 free CARGO seat(s) - the rest are not spawned.", freeSlots.Count()), LogLevel.WARNING);
+				break;
+			}
+
+			AIGroup group = m_CargoGroup;
+			IEntity member = freeSlots[seatIndex].SpawnCharacterInCompartment(unitPrefab, group);
+			seatIndex++;
+			if (!member)
+			{
+				Print("[EEF Helicopter] WARNING: Could not spawn cargo unit into its seat: " + unitPrefab, LogLevel.WARNING);
+				continue;
+			}
+
+			PinAgentLOD(member);
+			m_mBoardOrderTime.Set(member, GetCurrentTime());
+			spawned++;
+		}
+
+		return spawned;
 	}
 
 	//! Seat each member of the group in CARGO. Excess units beyond cargo capacity are
@@ -737,8 +805,18 @@ class EEF_HelicopterInsertionComponent : ScriptComponent
 			if (chimera && vector.Distance(character.GetOrigin(), heliTransform[3]) > 5.0)
 				chimera.Teleport(heliTransform);
 
+			PinAgentLOD(character);
+
 			// MoveInVehicle is the seat-teleport path - instant placement, no walk-and-enter.
-			access.MoveInVehicle(GetOwner(), ECompartmentType.CARGO);
+			bool ordered = access.MoveInVehicle(GetOwner(), ECompartmentType.CARGO);
+			if (m_mBoardOrderTime.Contains(character))
+			{
+				ChimeraCharacter chimeraChar = ChimeraCharacter.Cast(character);
+				bool inVehicle = chimeraChar && chimeraChar.IsInVehicle();
+				DebugLog(string.Format("Re-ordering %1 into CARGO: inVehicle=%2 dist=%3 m orderAccepted=%4 LOD=%5 pinned=%6 active=%7.",
+					character, inVehicle, vector.Distance(character.GetOrigin(), heliTransform[3]), ordered,
+					agent.GetLOD(), agent.GetPermanentLOD(), agent.IsAIActivated()));
+			}
 			m_mBoardOrderTime.Set(character, GetCurrentTime());
 			boarded++;
 		}
@@ -913,6 +991,24 @@ class EEF_HelicopterInsertionComponent : ScriptComponent
 		DebugLog("Engine stopped.");
 	}
 
+	//! Pins a crew or cargo character's AI agent to LOD 0 so it stays simulated however far it is from the
+	//! players. AI agents step up a LOD level per ~100 m from the nearest observer and are deactivated at max
+	//! LOD (about 1000 m); a deactivated character never completes a get-in and hangs where it spawned. Vanilla
+	//! SCR_TransportUnitComponent pins its truck crews the same way.
+	protected void PinAgentLOD(IEntity character)
+	{
+		if (!character)
+			return;
+
+		AIControlComponent control = AIControlComponent.Cast(character.FindComponent(AIControlComponent));
+		if (!control)
+			return;
+
+		AIAgent agent = control.GetControlAIAgent();
+		if (agent)
+			agent.SetPermanentLOD(0);
+	}
+
 	//! Spawn a pilot from m_sPilotPrefab and seat them in the first PILOT compartment.
 	//! Called via CallLater 1s after OnPostInit so the vehicle entity is fully initialised.
 	protected void SpawnCrew()
@@ -920,35 +1016,32 @@ class EEF_HelicopterInsertionComponent : ScriptComponent
 		if (m_sPilotPrefab.IsEmpty())
 			return;
 
-		Resource pilotResource = Resource.Load(m_sPilotPrefab);
-		if (!pilotResource || !pilotResource.IsValid())
+		// Spawn the pilot directly into the PILOT seat with vanilla BaseCompartmentSlot.SpawnCharacterInCompartment
+		// (the default-crew spawner), pinned to AI LOD 0 so it stays simulated far from the players (see PinAgentLOD).
+		SCR_BaseCompartmentManagerComponent compMgr = FindCompartmentManager();
+		if (!compMgr)
 		{
-			Print("[EEF Helicopter] WARNING: Could not load pilot prefab: " + m_sPilotPrefab, LogLevel.WARNING);
+			Print("[EEF Helicopter] WARNING: No compartment manager - cannot seat the pilot.", LogLevel.WARNING);
 			return;
 		}
 
-		EntitySpawnParams spawnParams = new EntitySpawnParams();
-		spawnParams.TransformMode = ETransformMode.WORLD;
-		Math3D.MatrixIdentity4(spawnParams.Transform);
-		spawnParams.Transform[3] = GetOwner().GetOrigin();
+		array<BaseCompartmentSlot> pilotSlots = {};
+		compMgr.GetFreeCompartmentsOfType(pilotSlots, ECompartmentType.PILOT);
+		if (pilotSlots.IsEmpty())
+		{
+			Print("[EEF Helicopter] WARNING: No free PILOT seat for the pilot.", LogLevel.WARNING);
+			return;
+		}
 
-		IEntity pilot = GetGame().SpawnEntityPrefab(pilotResource, GetGame().GetWorld(), spawnParams);
+		AIGroup pilotGroup;
+		IEntity pilot = pilotSlots[0].SpawnCharacterInCompartment(m_sPilotPrefab, pilotGroup);
 		if (!pilot)
 		{
-			Print("[EEF Helicopter] WARNING: Failed to spawn pilot entity.", LogLevel.WARNING);
+			Print("[EEF Helicopter] WARNING: Could not spawn the pilot into the PILOT seat: " + m_sPilotPrefab, LogLevel.WARNING);
 			return;
 		}
 
-		SCR_CompartmentAccessComponent access = SCR_CompartmentAccessComponent.Cast(
-			pilot.FindComponent(SCR_CompartmentAccessComponent)
-		);
-		if (!access)
-		{
-			Print("[EEF Helicopter] WARNING: Pilot entity missing SCR_CompartmentAccessComponent.", LogLevel.WARNING);
-			return;
-		}
-
-		access.MoveInVehicle(GetOwner(), ECompartmentType.PILOT);
+		PinAgentLOD(pilot);
 		DebugLog("Pilot spawned and seated.");
 	}
 
