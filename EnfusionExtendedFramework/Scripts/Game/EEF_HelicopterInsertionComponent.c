@@ -168,6 +168,7 @@ class EEF_HelicopterInsertionComponent : ScriptComponent
 	protected SCR_AIGroup m_CargoGroup;		//! The group we spawned and will hand off.
 	protected bool m_bTickRunning;			//! Whether our periodic Tick() is currently scheduled.
 	protected bool m_bBoardingInitiated;	//! True once we've issued MoveInVehicle for this insertion's cargo.
+	protected ref map<IEntity, float> m_mBoardOrderTime = new map<IEntity, float>();	//! When MoveInVehicle was last issued per member.
 	protected bool m_bHandoffDone;			//! True once we've handed the group off to the receiver. Disembark continues afterwards.
 
 	// Flight controller state.
@@ -187,6 +188,9 @@ class EEF_HelicopterInsertionComponent : ScriptComponent
 
 	//! Fixed periodic tick interval for state polling (boarding, disembark). EOnFrame handles flight.
 	protected const float TICK_INTERVAL_SECONDS = 0.5;
+
+	//! Seconds to wait for a MoveInVehicle order to take effect before issuing it again.
+	protected const float BOARD_REISSUE_SECONDS = 2.0;
 
 	//! Vertical tolerance (m) used for hover-altitude arrival check.
 	protected const float FLIGHT_VERTICAL_ARRIVAL_TOLERANCE = 1.0;
@@ -414,32 +418,16 @@ class EEF_HelicopterInsertionComponent : ScriptComponent
 				return;
 			}
 
-			// SCR_AIGroup spawns its members across multiple frames via EOnFrame. Until that
-			// finishes, GetAgents() will return an empty array and MoveInVehicle has nothing
-			// to seat. The group's OnAllDelayedEntitySpawned event fires exactly once when
-			// delayed spawning completes - we hook it and wait.
-			if (m_CargoGroup.IsInitializing())
-			{
-				m_CargoGroup.GetOnAllDelayedEntitySpawned().Insert(OnGroupReadyToBoard);
-				DebugLog("Cargo group spawning members - hooked OnAllDelayedEntitySpawned, waiting.");
-				return;
-			}
-
-			// Not initializing. Either the group spawned synchronously (rare) or the prefab
-			// has no members configured (m_aUnitPrefabSlots empty / m_bSpawnImmediately false).
-			// The latter is misconfig - no agents will ever appear and no event will fire.
-			array<AIAgent> agents = {};
-			m_CargoGroup.GetAgents(agents);
-			if (agents.IsEmpty())
-			{
-				Print("[EEF Helicopter] ERROR: Cargo group prefab has no members configured (or SpawnImmediately is false). Aborting.", LogLevel.ERROR);
-				AbortToIdle();
-				return;
-			}
-
-			// Synchronous spawn path - board immediately.
-			BoardGroupMembers(m_CargoGroup);
-			m_bBoardingInitiated = true;
+			// Since game 1.9, SCR_AIGroup no longer creates its members inside SpawnEntityPrefab.
+			// They are materialised later by SCR_AIWorld's spawn queue (possibly one member per
+			// queue tick), and SCR_AIGroup.IsInitializing() now always returns false. So an empty
+			// group here is normal, not a misconfiguration. Hook the completion event (the queue
+			// still fires it) and also poll every tick, seating members as soon as they appear so
+			// nobody is left standing in mid-air under an IN_AIR helicopter.
+			m_mBoardOrderTime.Clear();
+			m_CargoGroup.GetOnAllDelayedEntitySpawned().Insert(OnGroupReadyToBoard);
+			DebugLog("Cargo group spawned - waiting for its members to materialise.");
+			SeatNewMembersAndCheckComplete();
 			return;
 		}
 
@@ -452,18 +440,36 @@ class EEF_HelicopterInsertionComponent : ScriptComponent
 
 		if (!m_bBoardingInitiated)
 		{
+			SeatNewMembersAndCheckComplete();
+			if (m_bBoardingInitiated)
+				return;
+
 			if (elapsed > m_fDisembarkTimeout)
 			{
-				Print(string.Format("[EEF Helicopter] ERROR: Cargo group did not finish initializing within %1s. Aborting.", elapsed), LogLevel.ERROR);
+				if (m_CargoGroup.GetAgentsCount() > 0)
+				{
+					Print(string.Format("[EEF Helicopter] WARNING: Cargo group still incomplete after %1s - departing with the %2 member(s) spawned so far.", elapsed, m_CargoGroup.GetAgentsCount()), LogLevel.WARNING);
+					m_bBoardingInitiated = true;
+					return;
+				}
+
+				Print(string.Format("[EEF Helicopter] ERROR: Cargo group has no members after %1s - check the group prefab's unit slots (m_aUnitPrefabSlots) and Spawn Immediately. Aborting.", elapsed), LogLevel.ERROR);
 				AbortToIdle();
 			}
 			return;
 		}
 
+		// Keep seating anyone still outside - orders are re-sent after BOARD_REISSUE_SECONDS.
+		BoardGroupMembers(m_CargoGroup);
 		int occupants = GetCargoOccupantCount();
+		int wanted = m_CargoGroup.GetAgentsCount();
 
-		if (occupants > 0)
+		// Leave once the whole group is aboard. Leaving at the first seated member stranded the rest of the
+		// fireteam whose MoveInVehicle orders were still in flight. At the timeout, leave with whoever made it.
+		if (occupants > 0 && (occupants >= wanted || elapsed > m_fDisembarkTimeout))
 		{
+			if (occupants < wanted)
+				Print(string.Format("[EEF Helicopter] WARNING: Only %1 of %2 cargo member(s) seated after %3s - departing without the rest.", occupants, wanted, elapsed), LogLevel.WARNING);
 			DebugLog(string.Format("Boarding complete - %1 occupant(s) seated after %2s.", occupants, elapsed));
 
 			// Build the waypoint path and enter FLYING.
@@ -507,9 +513,29 @@ class EEF_HelicopterInsertionComponent : ScriptComponent
 			return;
 		}
 
+		if (m_bBoardingInitiated)
+			return;
+
 		DebugLog("Cargo group ready - issuing MoveInVehicle.");
 		BoardGroupMembers(m_CargoGroup);
 		m_bBoardingInitiated = true;
+	}
+
+	//! Seats any members that have materialised but are not aboard yet, and marks boarding as
+	//! initiated once the group has spawned all of its members (SCR_AIGroup.IsExpandComplete).
+	//! Called every boarding tick, because since game 1.9 members can arrive over several ticks.
+	protected void SeatNewMembersAndCheckComplete()
+	{
+		if (!m_CargoGroup || m_CargoGroup.GetAgentsCount() == 0)
+			return;
+
+		BoardGroupMembers(m_CargoGroup);
+
+		if (m_CargoGroup.IsExpandComplete())
+		{
+			DebugLog(string.Format("Cargo group complete - %1 member(s).", m_CargoGroup.GetAgentsCount()));
+			m_bBoardingInitiated = true;
+		}
 	}
 
 	// --------------------------------------------------------
@@ -663,6 +689,9 @@ class EEF_HelicopterInsertionComponent : ScriptComponent
 		array<AIAgent> agents = {};
 		group.GetAgents(agents);
 
+		vector heliTransform[4];
+		GetOwner().GetWorldTransform(heliTransform);
+
 		int boarded = 0;
 		int orphaned = 0;
 
@@ -675,12 +704,6 @@ class EEF_HelicopterInsertionComponent : ScriptComponent
 			if (!character)
 				continue;
 
-			if (boarded >= freeSlots.Count())
-			{
-				orphaned++;
-				continue;
-			}
-
 			SCR_CompartmentAccessComponent access = SCR_CompartmentAccessComponent.Cast(
 				character.FindComponent(SCR_CompartmentAccessComponent)
 			);
@@ -691,12 +714,37 @@ class EEF_HelicopterInsertionComponent : ScriptComponent
 				continue;
 			}
 
+			// Already aboard from an earlier tick (members can materialise over several ticks).
+			if (access.IsInCompartment())
+				continue;
+
+			// Ordered recently and still settling - MoveInVehicle is RPC-based, and re-issuing it
+			// every tick can keep restarting it. Give it BOARD_REISSUE_SECONDS before trying again.
+			float orderedAt;
+			if (m_mBoardOrderTime.Find(character, orderedAt) && GetCurrentTime() - orderedAt < BOARD_REISSUE_SECONDS)
+				continue;
+
+			if (boarded >= freeSlots.Count())
+			{
+				orphaned++;
+				continue;
+			}
+
+			// Since game 1.9 members materialise on the terrain under the group, lifted to the water
+			// surface if there is water - for an in-air helicopter that is the ground or sea below it,
+			// where a swimming character cannot be seated. Bring them to the helicopter first.
+			ChimeraCharacter chimera = ChimeraCharacter.Cast(character);
+			if (chimera && vector.Distance(character.GetOrigin(), heliTransform[3]) > 5.0)
+				chimera.Teleport(heliTransform);
+
 			// MoveInVehicle is the seat-teleport path - instant placement, no walk-and-enter.
 			access.MoveInVehicle(GetOwner(), ECompartmentType.CARGO);
+			m_mBoardOrderTime.Set(character, GetCurrentTime());
 			boarded++;
 		}
 
-		DebugLog(string.Format("Boarding requested - %1 seated, %2 orphaned (no cargo slot).", boarded, orphaned));
+		if (boarded > 0 || orphaned > 0)
+			DebugLog(string.Format("Boarding requested - %1 seated, %2 orphaned (no cargo slot).", boarded, orphaned));
 
 		if (orphaned > 0)
 		{
@@ -1056,6 +1104,11 @@ class EEF_HelicopterInsertionComponent : ScriptComponent
 		vector target = m_aWaypoints[m_iCurrentWaypointIndex];
 		bool isFinalWaypoint = (m_iCurrentWaypointIndex >= m_aWaypoints.Count() - 1);
 
+		// The landing leg is the final waypoint of the inbound flight. The departure leg (POST_INSERTION) also
+		// has a single "final" waypoint, but it must not slow to approach speed, flare or "arrive" when low -
+		// it used to touch down again on the spot and loop between INSERTING and POST_INSERTION.
+		bool isLandingLeg = isFinalWaypoint && m_eState == EEF_EHelicopterInsertionState.FLYING;
+
 		vector mat[4];
 		GetOwner().GetWorldTransform(mat);
 		vector heliRight   = mat[0];
@@ -1076,8 +1129,13 @@ class EEF_HelicopterInsertionComponent : ScriptComponent
 		if (horizDist > 0.01)
 			horizDir = horizDelta * (1.0 / horizDist);
 
+		// Hold cruise altitude above the ground until within the approach radius of the LZ. Descending in a
+		// straight line from the last waypoint flew the helicopter into rising ground and trees short of the LZ.
+		if (isLandingLeg && horizDist > m_fApproachRadius)
+			target[1] = Math.Max(target[1], groundY + m_fCruiseAltitudeAGL);
+
 		float speed;
-		if (isFinalWaypoint)
+		if (isLandingLeg)
 			speed = m_fApproachSpeed;
 		else
 			speed = m_fCruiseSpeed;
@@ -1094,9 +1152,10 @@ class EEF_HelicopterInsertionComponent : ScriptComponent
 		}
 
 		// ─── Flare ─────────────────────────────────────────────────────────────
-		bool isFlare = isFinalWaypoint
+		bool isFlare = isLandingLeg
 			&& m_eLandingMode == EEF_EHelicopterLandingMode.FULL_LANDING
-			&& altAGL < FLIGHT_FLARE_AGL;
+			&& altAGL < FLIGHT_FLARE_AGL
+			&& horizDist < m_fApproachRadius;
 		if (isFlare)
 		{
 			velX = 0;
@@ -1118,7 +1177,10 @@ class EEF_HelicopterInsertionComponent : ScriptComponent
 		if (totalDist > 0.1)
 			normalizedDirY = (target[1] - here[1]) / totalDist;
 
-		float velY = normalizedDirY * FLIGHT_BASE_ROTOR_SCALE_0 * FLIGHT_ROTOR_FORCE_MUL_UP * m_fRotorForceMultiplier;
+		// normalizedDirY carries the direction (up/down); the rotor multiplier only scales how hard.
+		// Using its signed value made a descent (both negative) into a climb: the helicopter shot
+		// upward instead of descending to a lower waypoint or LZ.
+		float velY = normalizedDirY * FLIGHT_BASE_ROTOR_SCALE_0 * FLIGHT_ROTOR_FORCE_MUL_UP * Math.AbsFloat(m_fRotorForceMultiplier);
 		if (isFlare)
 			velY = Math.Clamp(velY, -FLIGHT_FLARE_DESCENT_SPEED, 0);
 
@@ -1133,13 +1195,13 @@ class EEF_HelicopterInsertionComponent : ScriptComponent
 			return;
 		}
 
-		if (isFinalWaypoint)
+		if (isLandingLeg)
 		{
 			bool arrived = false;
 			if (m_eLandingMode == EEF_EHelicopterLandingMode.HOVER_LANDING)
 				arrived = horizDist < 4.0 && Math.AbsFloat(here[1] - target[1]) < FLIGHT_VERTICAL_ARRIVAL_TOLERANCE;
 			else
-				arrived = altAGL < m_fTouchdownAltitudeThreshold;
+				arrived = altAGL < m_fTouchdownAltitudeThreshold && horizDist < m_fApproachRadius;
 
 			if (arrived)
 			{
@@ -1151,7 +1213,7 @@ class EEF_HelicopterInsertionComponent : ScriptComponent
 
 		// ─── Angular velocity ──────────────────────────────────────────────────
 		float refSpeed;
-		if (isFinalWaypoint)
+		if (isLandingLeg)
 			refSpeed = Math.Max(m_fApproachSpeed, 10.0);
 		else
 			refSpeed = Math.Max(m_fCruiseSpeed, 10.0);
