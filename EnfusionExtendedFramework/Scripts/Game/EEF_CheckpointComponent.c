@@ -3550,6 +3550,25 @@ class EEF_CheckpointComponent : ScriptComponent
 		if (!bestPts && AppendJunctionRoad(roads, line, towardPos, visited, end))
 			return true;
 
+		// Last resort: jump a short gap straight ahead. Vehicles parked on the road (typically the players' own,
+		// left near the checkpoint) carve the runtime navmesh and delete the short connector pieces between road
+		// segments, which used to stop the chain dead at the checkpoint and strand every cleared car.
+		if (!bestPts)
+		{
+			bool bridgeFromStart;
+			float bridgeGap;
+			BaseRoad bridge = FindGapBridgeRoad(roadMgr, end, dirEnd, toToward, visited, bridgeFromStart, bridgeGap);
+			if (bridge)
+			{
+				bestPts = new array<vector>();
+				bridge.GetPoints(bestPts);
+				bestFromStart = bridgeFromStart;
+				bestNearDist = bridgeGap;
+				bestWidth = bridge.GetWidth();
+				DebugLog(string.Format("RoadLine: bridged a %1 m gap at %2 - a road piece is missing there (a vehicle parked on the road cuts it out of the navmesh).", bridgeGap, end));
+			}
+		}
+
 		if (!bestPts)
 		{
 			DebugLog(string.Format("RoadLine: chain stopped at %1 (heading %2) - %3 road(s) in range, none continues it:", end, dirEnd, roads.Count()));
@@ -3605,6 +3624,94 @@ class EEF_CheckpointComponent : ScriptComponent
 		}
 
 		return added > 0;
+	}
+
+	//! Max gap (m) the road chain will jump when the connector piece ahead is missing (see FindGapBridgeRoad).
+	protected const float ROAD_GAP_BRIDGE_MAX = 30.0;
+
+	//! The bridged road's near end must lie close to straight ahead: cos of the max angle off the heading (~14 deg).
+	protected const float ROAD_GAP_BRIDGE_MIN_AHEAD = 0.97;
+
+	//! Gap bridge: no road piece continues the line within 15 m, typically because a parked vehicle carved the
+	//! runtime navmesh and deleted the short connector pieces between two road segments. Finds an unused road
+	//! whose near end lies up to ROAD_GAP_BRIDGE_MAX m almost straight ahead of the line and which runs the same
+	//! way, preferring the closest, best-aligned, widest one. Null if none.
+	protected BaseRoad FindGapBridgeRoad(RoadNetworkManager roadMgr, vector end, vector dirEnd, vector toToward, array<vector> visited, out bool fromStartOut, out float gapOut)
+	{
+		float range = ROAD_GAP_BRIDGE_MAX;
+		array<BaseRoad> roads = {};
+		roadMgr.GetRoadsInAABB(Vector(end[0] - range, end[1] - 30, end[2] - range), Vector(end[0] + range, end[1] + 30, end[2] + range), roads);
+
+		BaseRoad best = null;
+		float bestScore = -10;
+
+		foreach (BaseRoad candidate : roads)
+		{
+			if (!candidate)
+				continue;
+
+			array<vector> pts = {};
+			candidate.GetPoints(pts);
+			int n = pts.Count();
+			if (n < 2)
+				continue;
+
+			vector a = pts[0];
+			vector b = pts[n - 1];
+			if (IsRoadVisited(visited, a, b))
+				continue;
+
+			float dxA = a[0] - end[0];
+			float dzA = a[2] - end[2];
+			float dxB = b[0] - end[0];
+			float dzB = b[2] - end[2];
+			float distA = Math.Sqrt(dxA * dxA + dzA * dzA);
+			float distB = Math.Sqrt(dxB * dxB + dzB * dzB);
+			bool fromStart = distA <= distB;
+			float gap = Math.Min(distA, distB);
+			if (gap <= 15.0 || gap > range)
+				continue;	// closer ends were already judged by AppendNextRoad
+
+			vector nearPt = b;
+			if (fromStart)
+				nearPt = a;
+
+			// The near end must lie (almost) straight ahead of the line, not off to a side road.
+			vector toNear = nearPt - end;
+			toNear[1] = 0;
+			toNear.Normalize();
+			if (toNear[0] * dirEnd[0] + toNear[2] * dirEnd[2] < ROAD_GAP_BRIDGE_MIN_AHEAD)
+				continue;
+
+			// ...and the road must carry on the same way from there.
+			vector dirC;
+			if (fromStart)
+				dirC = pts[1] - pts[0];
+			else
+				dirC = pts[n - 2] - pts[n - 1];
+			dirC[1] = 0;
+			if (dirC.LengthSq() < 0.0001)
+				continue;
+			dirC.Normalize();
+
+			float align = dirC[0] * dirEnd[0] + dirC[2] * dirEnd[2];
+			if (align < 0.8)
+				continue;
+
+			float score = align + 0.5 * (dirC[0] * toToward[0] + dirC[2] * toToward[2]) - gap * 0.01;
+			if (candidate.GetWidth() < 4.0)
+				score -= 0.4;	// prefer a real road over a narrow track
+
+			if (score > bestScore)
+			{
+				bestScore = score;
+				best = candidate;
+				fromStartOut = fromStart;
+				gapOut = gap;
+			}
+		}
+
+		return best;
 	}
 
 	//! T-junction continuation: the line ends within 10 m of the SIDE of an unused road. Join that road at the
